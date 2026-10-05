@@ -103,6 +103,9 @@ const STATUS_BY_TAG = new Map<string, number>([
   ["FileNotFoundError", 404],
   ["PtyNotFoundError", 404],
   ["ShellNotFoundError", 404],
+  // LocationNotFoundError (the session's directory is gone) stays unmapped on
+  // purpose: callers read 404 as "this entity is settled or missing", and
+  // fetchPermission would then let auto-accept treat a live request as settled.
   ["ConflictError", 409],
   ["SessionBusyError", 409],
   ["FormAlreadySettledError", 409],
@@ -738,6 +741,15 @@ class OpencodeService {
 
   async getVcs(directory?: string | null): Promise<Vcs> {
     return call("vcs.get", () => this.clientFor(directory).vcs.get().then((r) => projectVcs(r.data)))
+  }
+
+  /**
+   * Runs `git init` in a directory that has no repository yet (OpenCode
+   * 2.0.23). OpenCode refreshes its own view of the directory; the caller
+   * refreshes the app's Git state.
+   */
+  async initializeGit(directory: string): Promise<void> {
+    return call("vcs.init", () => this.clientFor(directory).vcs.init())
   }
 
   // Get system information including home directory

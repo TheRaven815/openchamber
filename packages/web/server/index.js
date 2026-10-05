@@ -116,7 +116,7 @@ import { extensionsPersistPath } from './lib/guests/persist.js';
 import { createGuestSurfaceRuntime } from './lib/guests/surface.js';
 import { BROWSER_PROVIDER_IDLE_MS } from '@openchamber/sdk';
 import { createProjectConfigRuntime } from './lib/projects/project-config.js';
-import { migrateLegacyUserDirs } from './lib/data-dir-migration.js';
+import { ensureChatsDir, migrateLegacyUserDirs } from './lib/data-dir-migration.js';
 import { createProjectContextRuntime } from './lib/project-context/runtime.js';
 import { createAgentMemoryRuntime } from './lib/agent-memory/runtime.js';
 import { createAgentMemoryActions } from './lib/agent-memory/actions.js';
@@ -128,6 +128,7 @@ import { readIdleStopSetting, startIdleStop } from './lib/spaces/idle-stop.js';
 import { SPACE_IDLE_EXIT_CODE } from './lib/spaces/layout.js';
 import { createSwitchController, registerSpaceRoutes } from './lib/spaces/routes.js';
 import { resolvePrimaryWorktreeRoot } from './lib/git/service.js';
+import { createWorktreeBootstrapStore } from './lib/git/worktree-bootstrap-storage.js';
 import { createRemoteClientAuthRuntime } from './lib/client-auth/remote-clients.js';
 import { createClientPairingRuntime } from './lib/client-auth/pairing.js';
 import { attachRealtimeProxy } from './lib/realtime-proxy.js';
@@ -358,6 +359,10 @@ const CLIENT_PAIRING_SESSIONS_FILE_PATH = path.join(OPENCHAMBER_DATA_DIR, 'clien
 const CLOUDFLARE_MANAGED_REMOTE_TUNNELS_FILE_PATH = path.join(OPENCHAMBER_DATA_DIR, 'cloudflare-managed-remote-tunnels.json');
 const CLOUDFLARE_LEGACY_NAMED_TUNNELS_FILE_PATH = path.join(OPENCHAMBER_DATA_DIR, 'cloudflare-named-tunnels.json');
 const CLOUDFLARE_MANAGED_REMOTE_TUNNELS_VERSION = 1;
+const worktreeBootstrapStore = createWorktreeBootstrapStore({
+  filePath: path.join(OPENCHAMBER_DATA_DIR, 'git-worktree-bootstrap.json'),
+  fsImpl: fsPromises,
+});
 
 const managedTunnelConfigRuntime = createManagedTunnelConfigRuntime({
   fsPromises,
@@ -1604,6 +1609,8 @@ const openChamberSessionService = createOpenChamberSessionService({
   waitForOpenCodeReady,
   emitSessionCreatedEvent,
   sessionKnowledgeRuntime,
+  worktreeBootstrapStore,
+  hydrateWorktreeCheckout: featureRoutesRuntime.hydrateBoundCheckout,
   // OpenCode 2.x has no archive route, so the state is OpenChamber's own and
   // lives beside the instance it describes.
   dataDir: OPENCHAMBER_DATA_DIR,
@@ -1611,6 +1618,7 @@ const openChamberSessionService = createOpenChamberSessionService({
   persistSessionMetadata: persistSessionMetadataPatch,
   broadcastGlobalUiEvent: broadcastOpenChamberUiEvent,
   resolveAutoSelection: (input) => routingRuntime.resolveAutoSelection(input),
+  isAutoReady: async () => (await routingRuntime.describe()).autoReady,
 });
 // Browser actions are published to whichever OpenChamber clients are connected;
 // the one owning the browser panel answers. `emitRequest` returns the number of
@@ -1859,6 +1867,7 @@ async function main(options = {}) {
     readSettings: () => readSettingsFromDiskMigrated(),
     isAgentMemoryAvailable: isAgentMemoryFeatureAvailable,
   });
+  await ensureChatsDir({ fsPromises, chatsDir: OPENCHAMBER_CHATS_DIR, warn: (message) => console.warn(`[data-dir] ${message}`) });
 
   // Pairing transports advertised to the create-device dialog. LAN reachability is
   // derived from the SERVER's actual bind (a wildcard bind → the machine's LAN IP;
@@ -2409,6 +2418,12 @@ async function main(options = {}) {
     // Dev-server discovery must not offer OpenChamber's own listeners back to
     // the user as something to preview.
     getOwnPorts: () => [port, openCodePort].filter((value) => Number.isInteger(value) && value > 0),
+    getActivePort: () => {
+      const address = server?.address?.();
+      return address && Number.isInteger(address.port) ? address.port : null;
+    },
+    // A pipe listener reports a string here, which has no address to bind back to.
+    getActiveHost: () => server?.address?.()?.address ?? null,
     devServerScanner,
     buildAugmentedPath,
     projectConfigRuntime,
@@ -2424,7 +2439,9 @@ async function main(options = {}) {
     emitSessionCreatedEvent,
     getOpenChamberEventClients: () => uiOpenChamberEventClients,
     writeSseEvent,
+    globalEventHub: globalMessageStreamHub,
     permissionAutoAcceptRuntime,
+    worktreeBootstrapStore,
     messageQueueRuntime,
     routingRuntime,
   });
@@ -2464,6 +2481,13 @@ async function main(options = {}) {
     setupProxy,
     scheduleOpenCodeApiDetection,
     bootstrapOpenCodeAtStartup,
+    // Git's credential helper reaches the server through a file that names
+    // the port, so it is written once the port is known and before OpenCode,
+    // whose shells will use it, starts.
+    onListenerReady: async () => {
+      try { await featureRoutesRuntime.publishRepositoryCredentialEndpoint(); }
+      catch (error) { console.warn('Git credential helper endpoint was not published:', error instanceof Error ? error.message : String(error)); }
+    },
     triggerHealthCheck,
     staticRoutesRuntime,
     process,

@@ -32,7 +32,7 @@ import { useDeviceInfo } from '@/lib/device';
 import { usePwaDetection } from '@/hooks/usePwaDetection';
 import { loadDesktopSettings, updateDesktopSettings } from '@/lib/persistence';
 import { CODE_FONT_OPTIONS, DEFAULT_MONO_FONT, DEFAULT_UI_FONT, UI_FONT_OPTIONS, type MonoFontOption, type UiFontOption } from '@/lib/fontOptions';
-import { useI18n, type Locale } from '@/lib/i18n';
+import { useI18n } from '@/lib/i18n';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useEnterpriseMode } from '@/stores/useEnterprisePolicyStore';
 import { useFontPreferences } from '@/hooks/useFontPreferences';
@@ -312,7 +312,7 @@ const normalizeUserMessageRenderingMode = (mode: unknown): 'markdown' | 'plain' 
     return mode === 'markdown' ? 'markdown' : 'plain';
 };
 
-type VisibleSetting = 'sessionAssist' | 'sessionGoal' | 'theme' | 'windowControlsPosition' | 'pwaInstallName' | 'pwaOrientation' | 'mobileKeyboardMode' | 'timeFormat' | 'weekStart' | 'fontSize' | 'terminalFontSize' | 'terminalShell' | 'terminalLoginShell' | 'editorFontSize' | 'spacing' | 'scrollbars' | 'inputBarOffset' | 'mermaidRendering' | 'userMessageRendering' | 'chatRenderMode' | 'messageTransport' | 'activityRenderMode' | 'collapsibleUserMessages' | 'stickyUserHeader' | 'promptNavigatorEnabled' | 'wideChatLayout' | 'codeBlockLineWrap' | 'splitAssistantMessageActions' | 'subagentReadOnlyBanner' | 'diffLayout' | 'mobileStatusBar' | 'dotfiles' | 'fileViewerPreview' | 'reasoning' | 'showToolFileIcons' | 'showTurnChangedFiles' | 'expandedTools' | 'followUpBehavior' | 'inputHistoryScope' | 'inputHistoryLimit' | 'messageSearch' | 'terminalQuickKeys' | 'fileEditorKeymap' | 'persistDraft' | 'inputSpellcheck' | 'largeTextPaste' | 'enterToSend' | 'reportUsage' | 'autoSaveEnabled' | 'sessionTabs' | 'animatedActivityIndicators';
+type VisibleSetting = 'sessionAssist' | 'sessionGoal' | 'theme' | 'windowControlsPosition' | 'pwaInstallName' | 'pwaOrientation' | 'mobileKeyboardMode' | 'timeFormat' | 'weekStart' | 'fontSize' | 'terminalFontSize' | 'terminalShell' | 'terminalLoginShell' | 'editorFontSize' | 'spacing' | 'scrollbars' | 'inputBarOffset' | 'mermaidRendering' | 'userMessageRendering' | 'chatRenderMode' | 'messageTransport' | 'activityRenderMode' | 'collapsibleUserMessages' | 'stickyUserHeader' | 'promptNavigatorEnabled' | 'wideChatLayout' | 'codeBlockLineWrap' | 'tableCellWrap' | 'copyMessagesAsPlainText' | 'splitAssistantMessageActions' | 'subagentReadOnlyBanner' | 'diffLayout' | 'mobileStatusBar' | 'dotfiles' | 'fileViewerPreview' | 'reasoning' | 'showToolFileIcons' | 'showTurnChangedFiles' | 'expandedTools' | 'followUpBehavior' | 'inputHistoryScope' | 'inputHistoryLimit' | 'messageSearch' | 'terminalQuickKeys' | 'fileEditorKeymap' | 'persistDraft' | 'inputSpellcheck' | 'largeTextPaste' | 'enterToSend' | 'reportUsage' | 'autoSaveEnabled' | 'sessionTabs' | 'animatedActivityIndicators';
 
 const WINDOW_CONTROLS_POSITION_OPTIONS: Array<{ id: DesktopWindowControlsPosition; labelKey: string }> = [
     { id: 'left', labelKey: 'settings.openchamber.desktopNetwork.option.windowControlsLeft' },
@@ -352,6 +352,8 @@ export const OpenChamberVisualSettings: React.FC<OpenChamberVisualSettingsProps>
     const setStreamingAutoFollowEnabled = useUIStore(state => state.setStreamingAutoFollowEnabled);
     const collapsibleThinkingBlocks = useUIStore(state => state.collapsibleThinkingBlocks);
     const setCollapsibleThinkingBlocks = useUIStore(state => state.setCollapsibleThinkingBlocks);
+    const expandReasoningWhileStreaming = useUIStore(state => state.expandReasoningWhileStreaming);
+    const setExpandReasoningWhileStreaming = useUIStore(state => state.setExpandReasoningWhileStreaming);
     const animatedActivityIndicators = useSessionDisplayStore((s) => s.animatedActivityIndicators);
     const setAnimatedActivityIndicators = useSessionDisplayStore((s) => s.setAnimatedActivityIndicators);
 
@@ -371,6 +373,10 @@ export const OpenChamberVisualSettings: React.FC<OpenChamberVisualSettingsProps>
     const setWideChatLayoutEnabled = useUIStore(state => state.setWideChatLayoutEnabled);
     const codeBlockLineWrap = useUIStore(state => state.codeBlockLineWrap);
     const setCodeBlockLineWrap = useUIStore(state => state.setCodeBlockLineWrap);
+    const tableCellWrap = useUIStore(state => state.tableCellWrap);
+    const setTableCellWrap = useUIStore(state => state.setTableCellWrap);
+    const copyMessagesAsPlainText = useUIStore(state => state.copyMessagesAsPlainText);
+    const setCopyMessagesAsPlainText = useUIStore(state => state.setCopyMessagesAsPlainText);
     const chatRenderMode = useUIStore(state => state.chatRenderMode);
     const setChatRenderMode = useUIStore(state => state.setChatRenderMode);
     const activityRenderMode = useUIStore(state => state.activityRenderMode);
@@ -486,6 +492,15 @@ export const OpenChamberVisualSettings: React.FC<OpenChamberVisualSettingsProps>
         setReportUsage(enabled);
         void updateDesktopSettings({ reportUsage: enabled });
     }, [setReportUsage]);
+
+    // The server copy lets the language survive lost browser storage and reach
+    // the other clients of this instance.
+    const handleLocaleChange = React.useCallback((value: string) => {
+        const next = locales.find((candidate) => candidate === value);
+        if (!next) return;
+        setLocale(next);
+        void updateDesktopSettings({ locale: next });
+    }, [locales, setLocale]);
 
     const handleWindowControlsPositionChange = React.useCallback((value: DesktopWindowControlsPosition) => {
         setDesktopWindowControlsPosition(value);
@@ -724,6 +739,8 @@ export const OpenChamberVisualSettings: React.FC<OpenChamberVisualSettingsProps>
         || shouldShow('promptNavigatorEnabled')
         || shouldShow('wideChatLayout')
         || shouldShow('codeBlockLineWrap')
+        || shouldShow('tableCellWrap')
+        || shouldShow('copyMessagesAsPlainText')
         || shouldShow('splitAssistantMessageActions')
         || shouldShow('subagentReadOnlyBanner')
         || shouldShow('diffLayout')
@@ -756,6 +773,8 @@ export const OpenChamberVisualSettings: React.FC<OpenChamberVisualSettingsProps>
         || shouldShow('promptNavigatorEnabled')
         || shouldShow('wideChatLayout')
         || shouldShow('codeBlockLineWrap')
+        || shouldShow('tableCellWrap')
+        || shouldShow('copyMessagesAsPlainText')
         || shouldShow('splitAssistantMessageActions')
         || shouldShow('dotfiles')
         || shouldShow('fileViewerPreview')
@@ -1078,7 +1097,7 @@ export const OpenChamberVisualSettings: React.FC<OpenChamberVisualSettingsProps>
                                         info={t('settings.appearance.language.description')}
                                         settingsItem="appearance.language"
                                     >
-                                        <Select value={locale} onValueChange={(value) => setLocale(value as Locale)}>
+                                        <Select value={locale} onValueChange={handleLocaleChange}>
                                             <SelectTrigger aria-label={t('settings.appearance.language.select')} size={SETTINGS_SELECT_SIZE} className={SETTINGS_SELECT_TRIGGER_CLASS}>
                                                 <SelectValue>{label(locale)}</SelectValue>
                                             </SelectTrigger>
@@ -2008,6 +2027,16 @@ export const OpenChamberVisualSettings: React.FC<OpenChamberVisualSettingsProps>
                                                 ariaLabel={t('settings.openchamber.visual.field.collapsibleThinkingBlocksAria')}
                                             />
                                         )}
+                                        {/* Only a collapsible block can fold while it streams. */}
+                                        {showReasoningTraces && collapsibleThinkingBlocks && (
+                                            <SettingsCheckboxRow
+                                                checked={expandReasoningWhileStreaming}
+                                                onChange={setExpandReasoningWhileStreaming}
+                                                label={t('settings.openchamber.visual.field.expandReasoningWhileStreaming')}
+                                                ariaLabel={t('settings.openchamber.visual.field.expandReasoningWhileStreamingAria')}
+                                                info={t('settings.openchamber.visual.field.expandReasoningWhileStreamingInfo')}
+                                            />
+                                        )}
                                     </SettingsSection>
                                 )}
                                 <SettingsSection
@@ -2025,7 +2054,7 @@ export const OpenChamberVisualSettings: React.FC<OpenChamberVisualSettingsProps>
                                     />
                                 </SettingsSection>
 
-                                {(shouldShow('collapsibleUserMessages') || shouldShow('stickyUserHeader') || shouldShow('promptNavigatorEnabled') || shouldShow('wideChatLayout') || shouldShow('splitAssistantMessageActions') || shouldShow('codeBlockLineWrap')) && (
+                                {(shouldShow('collapsibleUserMessages') || shouldShow('stickyUserHeader') || shouldShow('promptNavigatorEnabled') || shouldShow('wideChatLayout') || shouldShow('splitAssistantMessageActions') || shouldShow('codeBlockLineWrap') || shouldShow('tableCellWrap') || shouldShow('copyMessagesAsPlainText')) && (
                                 <SettingsSection
                                     title={t('settings.openchamber.visual.section.messageAppearance')}
                                     settingsItem="chat.message-appearance"
@@ -2089,6 +2118,28 @@ export const OpenChamberVisualSettings: React.FC<OpenChamberVisualSettingsProps>
                                         label={t('settings.openchamber.visual.field.codeBlockLineWrap')}
                                         ariaLabel={t('settings.openchamber.visual.field.codeBlockLineWrapAria')}
                                         settingsItem="chat.code-block-line-wrap"
+                                    />
+                                )}
+
+                                {shouldShow('tableCellWrap') && (
+                                    <SettingsCheckboxRow
+                                        checked={tableCellWrap}
+                                        onChange={setTableCellWrap}
+                                        label={t('settings.openchamber.visual.field.tableCellWrap')}
+                                        ariaLabel={t('settings.openchamber.visual.field.tableCellWrapAria')}
+                                        info={t('settings.openchamber.visual.field.tableCellWrapInfo')}
+                                        settingsItem="chat.table-cell-wrap"
+                                    />
+                                )}
+
+                                {shouldShow('copyMessagesAsPlainText') && (
+                                    <SettingsCheckboxRow
+                                        checked={copyMessagesAsPlainText}
+                                        onChange={setCopyMessagesAsPlainText}
+                                        label={t('settings.openchamber.visual.field.copyMessagesAsPlainText')}
+                                        ariaLabel={t('settings.openchamber.visual.field.copyMessagesAsPlainTextAria')}
+                                        info={t('settings.openchamber.visual.field.copyMessagesAsPlainTextInfo')}
+                                        settingsItem="chat.copy-plain-text"
                                     />
                                 )}
                                 </SettingsSection>

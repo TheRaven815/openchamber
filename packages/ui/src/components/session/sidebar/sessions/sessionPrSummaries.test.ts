@@ -4,6 +4,7 @@ import type { LinkedSidebarIssue } from '@/lib/linkedIssues';
 import { buildSessionIssueItems, combineSessionPrSummaries, findLinkedPrsWithoutState, getPrStatusLabelKey } from './sessionPrSummaries';
 
 const summary = (number: number, visualState: string, overrides: Partial<PrVisualSummary> = {}): PrVisualSummary => ({
+  provider: 'github',
   number,
   visualState,
   prState: visualState === 'merged' || visualState === 'closed' ? visualState : 'open',
@@ -34,6 +35,11 @@ describe('combineSessionPrSummaries', () => {
   test('keeps PRs with the same number from different repositories apart', () => {
     const combined = combineSessionPrSummaries(null, [summary(7, 'open'), summary(7, 'open', { repo: { owner: 'acme', repo: 'web' } })]);
     expect(combined).toHaveLength(2);
+  });
+
+  test('keeps a GitHub PR and a GitLab merge request with the same path and number apart', () => {
+    const combined = combineSessionPrSummaries(null, [summary(7, 'open'), summary(7, 'open', { provider: 'gitlab' })]);
+    expect(combined.map((entry) => entry.provider)).toEqual(['github', 'gitlab']);
   });
 });
 
@@ -103,3 +109,21 @@ describe('buildSessionIssueItems', () => {
     expect(item).toMatchObject({ label: 'ENG-1', icon: 'linear', color: null, statusKey: null });
   });
 });
+
+describe('GitLab issues on a session row', () => {
+  test('take their colour from their own live state, in order', () => {
+    const ref = (number: number) => ({ key: `https://gitlab.com/team/app#${number}`, instance: 'https://gitlab.com', owner: 'team', repo: 'app', number, thread: 'issue' as const });
+    const items = buildSessionIssueItems([
+      { source: 'gitlab', key: 'a', ref: ref(1), identifier: '#1', url: 'u1', title: 'One' },
+      { source: 'gitlab', key: 'b', ref: ref(2), identifier: '#2', url: 'u2', title: 'Two' },
+    ], [], [], [
+      { owner: 'team', repo: 'app', number: 1, title: 'One', state: 'completed' },
+      { owner: 'team', repo: 'app', number: 2, title: 'Two', state: 'open' },
+    ]);
+    expect(items.map((item) => [item.label, item.color, item.statusKey])).toEqual([
+      ['#2', 'var(--pr-open)', 'sessions.sidebar.group.issue.status.open'],
+      ['#1', 'var(--pr-merged)', 'sessions.sidebar.group.issue.status.completed'],
+    ]);
+  });
+});
+

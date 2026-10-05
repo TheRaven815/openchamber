@@ -4,14 +4,13 @@ import { Icon } from '@/components/icon/Icon';
 import { useSkillsStore } from '@/stores/useSkillsStore';
 import { useMcpStore } from '@/stores/useMcpStore';
 import { useSession } from '@/sync/sync-context';
-import { getDistinctLinkedIssues, getLinkedGitHubPullRequests, getLinkedSidebarIssues, canOpenLinearIssueInContextPanel, getGitHubThreadRef, isLinkedChange } from '@/lib/linkedIssues';
-import { useLinkedIssueStates, useLinkedPrVisualSummaries } from '@/stores/useGitHubPrStatusStore';
-import { useGitHubAuthStore } from '@/stores/useGitHubAuthStore';
-import { useOpenPrSummarySync } from '@/hooks/useOpenPrSummarySync';
+import { getDistinctLinkedIssues, getLinkedGitHubPullRequests, getLinkedGitLabThreads, getLinkedSidebarIssues, canOpenLinearIssueInContextPanel, getGitHubThreadRef, getGitLabThreadRef, isLinkedChange } from '@/lib/linkedIssues';
+import type { PrVisualSummary } from '@/stores/useGitHubPrStatusStore';
+import { useTrackedIssueStates, useTrackedLinearStates, useTrackedPullVisualSummaries } from '@/stores/useTrackedItemsStore';
+import { useTrackedItems } from '@/lib/trackedItems/interest';
+import { githubThread, gitlabThread, linearIssue } from '@/lib/trackedItems/fromLinks';
 import { getPrStatusLabel } from '@/components/session/sidebar/prStatusLabel';
 import { getIssueStateLook, getLinearIssueStateLook } from '@/components/session/sidebar/sessions/sessionPrSummaries';
-import { useLinearIssueStateSync } from '@/hooks/useLinearIssueStateSync';
-import { useLinearIssueStates } from '@/stores/useLinearIssueStateStore';
 import { fetchSessionKnowledgeSummary, setSessionProjectContextPin, type SessionKnowledgeSummary } from '@/lib/sessionKnowledgeApi';
 import { useProjectContextStore } from '@/stores/useProjectContextStore';
 import { useAgentMemoryStore } from '@/stores/useAgentMemoryStore';
@@ -27,8 +26,8 @@ import { useUIStore } from '@/stores/useUIStore';
 import { WorkStatusCollapsibleSection, WorkStatusRow, WorkStatusValue } from './WorkStatusPrimitives';
 import { useReportWorkStatusPresence } from './presenceContext';
 import { resolveDraftPinnedKnowledge } from './draftKnowledge';
+import { changeRequestCopy } from '@/lib/source-control/changeRequestCopy';
 
-const EMPTY_KEYS: string[] = [];
 
 type Props = {
   sessionId: string | null;
@@ -46,7 +45,7 @@ type Props = {
  */
 export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory }) => {
   const { t } = useI18n();
-  const { linear, github } = useRuntimeAPIs();
+  const { linear } = useRuntimeAPIs();
   const linearConnected = useLinearAuthStore((state) => state.status?.connected === true);
   const mobileActions = useMobileAppActions();
   const openContextPanelTab = useUIStore((state) => state.openContextPanelTab);
@@ -163,28 +162,52 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
   const pinnedCount = visibleKnowledge.notes.length + visibleKnowledge.plans.length;
 
   const linked = React.useMemo(() => getDistinctLinkedIssues(session), [session]);
-  // Live state of the linked GitHub PRs and issues, from the same batched
-  // summaries the sidebar uses. This panel asks for its own session too: the
+  // Live state of the session's linked PRs, merge requests and issues, from
+  // the server's tracked items. This panel follows its own session too: the
   // session need not be on screen in the sidebar.
-  const githubConnected = useGitHubAuthStore((state) => Boolean(state.hasChecked && state.status?.connected));
   const linkedPrs = React.useMemo(() => getLinkedGitHubPullRequests(session), [session]);
-  const linkedPrRefs = React.useMemo(
-    () => linkedPrs.map((link) => ({ owner: link.owner, repo: link.repo, number: link.number })),
+  const linkedPullLinks = React.useMemo(
+    () => linkedPrs.map((link) => ({ item: githubThread('pull', link), url: link.url, title: link.title })),
     [linkedPrs],
   );
   const linkedIssueRefs = React.useMemo(
     () => getLinkedSidebarIssues(session).flatMap((issue) => (issue.source === 'github' ? [{ owner: issue.owner, repo: issue.repo, number: issue.number }] : [])),
     [session],
   );
-  useOpenPrSummarySync(EMPTY_KEYS, linkedPrRefs, linkedIssueRefs, github, githubConnected);
-  const linkedPrSummaries = useLinkedPrVisualSummaries(linkedPrs);
-  const linkedIssueStates = useLinkedIssueStates(linkedIssueRefs);
+  const linkedIssueItems = React.useMemo(() => linkedIssueRefs.map((ref) => githubThread('issue', ref)), [linkedIssueRefs]);
   const linkedLinearIdentifiers = React.useMemo(
     () => getLinkedSidebarIssues(session).flatMap((issue) => (issue.source === 'linear' ? [issue.identifier] : [])),
     [session],
   );
-  useLinearIssueStateSync(linkedLinearIdentifiers, linear);
-  const linkedLinearStates = useLinearIssueStates(linkedLinearIdentifiers);
+  const linkedLinearItems = React.useMemo(() => linkedLinearIdentifiers.map(linearIssue), [linkedLinearIdentifiers]);
+  const linkedGitLab = React.useMemo(() => getLinkedGitLabThreads(session), [session]);
+  const linkedGitLabChanges = React.useMemo(() => {
+    const byKey = new Map(linked.flatMap((entry) => {
+      const ref = getGitLabThreadRef(entry);
+      return ref ? [[ref.key, entry] as const] : [];
+    }));
+    return linkedGitLab.filter((ref) => ref.thread === 'pull')
+      .map((ref) => ({ ref, item: gitlabThread('pull', ref), url: byKey.get(ref.key)?.url ?? '', title: byKey.get(ref.key)?.title ?? '' }));
+  }, [linked, linkedGitLab]);
+  const linkedGitLabIssues = React.useMemo(() => linkedGitLab.filter((ref) => ref.thread === 'issue'), [linkedGitLab]);
+  const linkedGitLabIssueItems = React.useMemo(() => linkedGitLabIssues.map((ref) => gitlabThread('issue', ref)), [linkedGitLabIssues]);
+  const trackedItems = React.useMemo(() => [
+    ...linkedPullLinks.map((link) => link.item),
+    ...linkedIssueItems,
+    ...linkedLinearItems,
+    ...linkedGitLabChanges.map((link) => link.item),
+    ...linkedGitLabIssueItems,
+  ], [linkedGitLabChanges, linkedGitLabIssueItems, linkedIssueItems, linkedLinearItems, linkedPullLinks]);
+  useTrackedItems(trackedItems);
+  const linkedPullVisuals = useTrackedPullVisualSummaries(linkedPullLinks);
+  const linkedPrSummaries = React.useMemo(
+    () => linkedPullVisuals.filter((summary): summary is PrVisualSummary => summary !== null),
+    [linkedPullVisuals],
+  );
+  const linkedIssueStates = useTrackedIssueStates(linkedIssueItems);
+  const linkedLinearStates = useTrackedLinearStates(linkedLinearItems);
+  const gitlabChangeSummaries = useTrackedPullVisualSummaries(linkedGitLabChanges);
+  const gitlabIssueStates = useTrackedIssueStates(linkedGitLabIssueItems);
   // Entry id (`owner/repo#number`, lowercased) -> the coloured status line.
   const liveLookById = React.useMemo(() => {
     const looks = new Map<string, { color: string; text: string }>();
@@ -213,8 +236,23 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
         text: `${identifier} · ${state.state.name}`,
       });
     });
+    linkedGitLabChanges.forEach(({ ref }, index) => {
+      const summary = gitlabChangeSummaries[index];
+      if (!summary) return;
+      const label = getPrStatusLabel(summary, t);
+      looks.set(ref.key, {
+        color: `var(--pr-${summary.visualState})`,
+        text: label ? `!${ref.number} · ${label}` : `!${ref.number}`,
+      });
+    });
+    linkedGitLabIssues.forEach((ref, index) => {
+      const state = gitlabIssueStates[index];
+      if (!state) return;
+      const look = getIssueStateLook(state.state);
+      looks.set(ref.key, { color: look.color, text: `#${ref.number} · ${t(look.statusKey)}` });
+    });
     return looks;
-  }, [linkedIssueRefs, linkedIssueStates, linkedLinearIdentifiers, linkedLinearStates, linkedPrSummaries, t]);
+  }, [gitlabChangeSummaries, gitlabIssueStates, linkedGitLabChanges, linkedGitLabIssues, linkedIssueRefs, linkedIssueStates, linkedLinearIdentifiers, linkedLinearStates, linkedPrSummaries, t]);
   const openLinkedIssue = React.useCallback((entry: (typeof linked)[number]) => {
     if (
       entry.kind === 'linear'
@@ -252,7 +290,12 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
   // The heading names what is distinctive about this session when there is
   // something — an attached thread — and falls back to the ambient counts
   // when there is not. `1 · 33 · 2` said nothing without opening the section.
-  const prCount = linked.filter(isLinkedChange).length;
+  const linkedChanges = linked.filter(isLinkedChange);
+  const prCount = linkedChanges.length;
+  // GitLab's word only when every attached change is a GitLab merge request.
+  const changeProvider = linkedChanges.length > 0 && linkedChanges.every((entry) => getGitLabThreadRef(entry))
+    ? 'gitlab' as const
+    : 'github' as const;
   const issueCount = linked.length - prCount;
   const summaryParts: string[] = [];
   if (issueCount > 0) {
@@ -262,8 +305,8 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
   }
   if (prCount > 0) {
     summaryParts.push(prCount === 1
-      ? t('chat.workStatus.breakdown.prCountSingle', { count: prCount })
-      : t('chat.workStatus.breakdown.prCountPlural', { count: prCount }));
+      ? t(changeRequestCopy('chat.workStatus.breakdown.prCountSingle', changeProvider), { count: prCount })
+      : t(changeRequestCopy('chat.workStatus.breakdown.prCountPlural', changeProvider), { count: prCount }));
   }
   // Pinned knowledge outranks ambient counts because the user chose it for this session.
   if (summaryParts.length === 0 && pinnedCount > 0) {
@@ -293,12 +336,20 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
   const liveLookOf = (entry: (typeof linked)[number]) => {
     if (entry.kind === 'linear') return liveLookById.get(entry.id.toLowerCase());
     const ref = getGitHubThreadRef(entry);
-    return ref ? liveLookById.get(ref.key.toLowerCase()) : undefined;
+    if (ref) return liveLookById.get(ref.key.toLowerCase());
+    const gitlab = getGitLabThreadRef(entry);
+    return gitlab ? liveLookById.get(gitlab.key) : undefined;
+  };
+  const renderedIdentifier = (entry: (typeof linked)[number]) => {
+    const ref = getGitHubThreadRef(entry);
+    const gitlab = ref ? null : getGitLabThreadRef(entry);
+    return ref ? `#${ref.number}`
+      : gitlab ? `${gitlab.thread === 'pull' ? '!' : '#'}${gitlab.number}`
+        : entry.kind === 'linear' || entry.kind === 'guest' || entry.kind === 'external' ? entry.identifier : `#${entry.number}`;
   };
   const renderLinkedLabel = (entry: (typeof linked)[number]) => {
-    const ref = getGitHubThreadRef(entry);
     const look = liveLookOf(entry);
-    const identifier = ref ? `#${ref.number}` : entry.kind === 'linear' || entry.kind === 'guest' || entry.kind === 'external' ? entry.identifier : `#${entry.number}`;
+    const identifier = renderedIdentifier(entry);
     return (
       <>
         <span className="tabular-nums" style={look ? { color: look.color } : undefined}>{look ? look.text : identifier}</span>
@@ -321,13 +372,13 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
           key={entry.id}
           // The kind, never the author: an agent's link has no avatar, and a
           // mix of faces and icons hid which row was a PR.
+          // An issue reads as an issue wherever it lives — GitHub, GitLab, an
+          // agent's or an extension's link — as on a sidebar row.
           icon={isLinkedChange(entry)
             ? 'git-pull-request'
             : entry.kind === 'linear'
               ? 'linear'
-              : entry.kind === 'guest' || entry.kind === 'external'
-                ? 'attachment-2'
-                : 'record-circle'}
+              : 'record-circle'}
           // The state's colour on the icon too, as on a sidebar row.
           iconColor={liveLookOf(entry)?.color}
           label={renderLinkedLabel(entry)}
@@ -339,7 +390,9 @@ export const WorkStatusContextSection: React.FC<Props> = ({ sessionId, directory
             ? t('chat.workStatus.linkedIssues.openLinear', { identifier: entry.identifier })
             : entry.kind === 'guest' || entry.kind === 'external'
               ? t('chat.workStatus.linkedIssues.openGuest', { id: entry.identifier })
-              : t('chat.workStatus.linkedIssues.open', { number: entry.number })}
+              : getGitLabThreadRef(entry)
+                ? t('chat.workStatus.linkedIssues.openGitLab', { reference: renderedIdentifier(entry) })
+                : t('chat.workStatus.linkedIssues.open', { number: entry.number })}
         />
       ))}
 

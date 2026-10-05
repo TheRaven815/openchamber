@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import type { Session } from '@/lib/opencode/model';
-import { buildLinkedGuestIssue, buildLinkedIssue, buildLinkedIssueId, buildLinkedLinearIssue, canOpenLinearIssueInContextPanel, getDistinctLinkedIssues, getLinkedGitHubPullRequests, getLinkedIssues, getLinkedSidebarChanges, getLinkedSidebarIssues, withLinkedIssue, type LinkedIssue } from './linkedIssues';
+import type { SessionMetadataRecord } from './sessionReviewMetadata';
+import { buildLinkedGuestIssue, buildLinkedIssue, buildLinkedIssueId, buildLinkedLinearIssue, canOpenLinearIssueInContextPanel, getDistinctLinkedIssues, getGitLabThreadRef, getLinkedGitHubPullRequests, getLinkedGitLabThreads, getLinkedIssues, getLinkedSidebarChanges, getLinkedSidebarIssues, withLinkedIssue, type LinkedIssue } from './linkedIssues';
 
-type LinkedGitHubIssue = Extract<LinkedIssue, { kind: 'issue' | 'pull' }>;
+type LinkedRepositoryIssue = Extract<LinkedIssue, { kind: 'issue' | 'pull' }>;
 
-const issue = (overrides: Partial<LinkedGitHubIssue> = {}): LinkedGitHubIssue => ({
+const issue = (overrides: Partial<LinkedRepositoryIssue> = {}): LinkedRepositoryIssue => ({
   id: 'owner/repo#12',
   number: 12,
   title: 'Rail badge count',
@@ -53,6 +54,45 @@ describe('buildLinkedIssue', () => {
     expect(built.kind).toBe('pull');
   });
 
+  test('derives the id from a GitLab issue with nested groups', () => {
+    const built = buildLinkedIssue({
+      url: 'https://gitlab.example.com/platform/tools/repo/-/issues/9',
+      number: 9,
+      title: 'Fix',
+      kind: 'issue',
+      linkedAt: 5,
+    });
+    expect(built.id).toBe('gitlab.example.com:platform/tools/repo#9');
+  });
+
+  test('keeps the same path on different instances apart', () => {
+    const github = buildLinkedIssue({ url: 'https://github.com/team/repo/issues/12', number: 12, title: 'A', kind: 'issue', linkedAt: 1 });
+    const gitlab = buildLinkedIssue({ url: 'https://gitlab.com/team/repo/-/issues/12', number: 12, title: 'B', kind: 'issue', linkedAt: 2 });
+    const selfManaged = buildLinkedIssue({ url: 'https://git.example.com/team/repo/-/issues/12', number: 12, title: 'C', kind: 'issue', linkedAt: 3 });
+    const metadata = [github, gitlab, selfManaged].reduce<SessionMetadataRecord>((current, issue) => withLinkedIssue(current, issue, true), {});
+    // SAFETY: withLinkedIssue always writes openchamber.linked_issues as a LinkedIssue array.
+    expect((metadata.openchamber as { linked_issues: LinkedIssue[] }).linked_issues.map((entry) => entry.title)).toEqual(['A', 'B', 'C']);
+  });
+
+  test('re-linking a GitLab thread stored before ids carried the host replaces it', () => {
+    const legacy = { ...buildLinkedIssue({ url: 'https://gitlab.com/team/repo/-/issues/12', number: 12, title: 'Old', kind: 'issue', linkedAt: 1 }), id: 'team/repo#12' };
+    const fresh = buildLinkedIssue({ url: 'https://gitlab.com/team/repo/-/issues/12', number: 12, title: 'New', kind: 'issue', linkedAt: 2 });
+    const metadata = withLinkedIssue({ openchamber: { linked_issues: [legacy] } }, fresh, true);
+    // SAFETY: withLinkedIssue always writes openchamber.linked_issues as a LinkedIssue array.
+    expect((metadata.openchamber as { linked_issues: LinkedIssue[] }).linked_issues.map((entry) => entry.title)).toEqual(['New']);
+  });
+
+  test('keeps GitLab merge requests distinct from issues with the same number', () => {
+    const built = buildLinkedIssue({
+      url: 'https://gitlab.example.com/platform/tools/repo/-/merge_requests/9',
+      number: 9,
+      title: 'Fix',
+      kind: 'pull',
+      linkedAt: 5,
+    });
+    expect(built.id).toBe('https://gitlab.example.com/platform/tools/repo/-/merge_requests/9#9');
+  });
+
   test('falls back to a url-based id for an unparseable url', () => {
     const built = buildLinkedIssue({
       url: 'https://ghe.internal/x',
@@ -62,6 +102,17 @@ describe('buildLinkedIssue', () => {
       linkedAt: 5,
     });
     expect(built.id).toBe('https://ghe.internal/x#3');
+  });
+
+  test('falls back without throwing for a malformed url', () => {
+    const built = buildLinkedIssue({
+      url: 'not a url',
+      number: 3,
+      title: 'Internal',
+      kind: 'issue',
+      linkedAt: 5,
+    });
+    expect(built.id).toBe('not a url#3');
   });
 
   test('omits author fields when the flow has none', () => {
@@ -364,7 +415,36 @@ describe('getLinkedSidebarChanges', () => {
     ]);
     expect(getLinkedSidebarChanges(session)).toEqual([
       { key: 'guest:gitea:5', identifier: '5', url: 'https://gitea/x', title: 'Guest PR' },
-      { key: 'link:https://gitlab.com/a/b/-/merge_requests/42', identifier: '!42', url: 'https://gitlab.com/a/b/-/merge_requests/42', title: 'Fix' },
+      {
+        key: 'link:https://gitlab.com/a/b/-/merge_requests/42', identifier: '!42', url: 'https://gitlab.com/a/b/-/merge_requests/42', title: 'Fix',
+        gitlab: { key: 'https://gitlab.com/a/b!42', instance: 'https://gitlab.com', owner: 'a', repo: 'b', number: 42, thread: 'pull' },
+      },
+    ]);
+  });
+});
+
+describe('GitLab threads', () => {
+  test('reads the instance, subgroup path and number from the address, and leaves GitHub alone', () => {
+    const mergeRequest = issue({ id: 'https://gitlab.example.com/g/sub/app/-/merge_requests/3#3', number: 3, kind: 'pull', url: 'https://gitlab.example.com/g/sub/app/-/merge_requests/3' });
+    expect(getGitLabThreadRef(mergeRequest)).toEqual({
+      key: 'https://gitlab.example.com/g/sub/app!3', instance: 'https://gitlab.example.com', owner: 'g/sub', repo: 'app', number: 3, thread: 'pull',
+    });
+    const gitlabIssue = issue({ id: 'gitlab.com:team/app#8', number: 8, kind: 'issue', url: 'https://gitlab.com/team/app/-/issues/8' });
+    expect(getGitLabThreadRef(gitlabIssue)).toMatchObject({ owner: 'team', repo: 'app', number: 8, thread: 'issue' });
+    expect(getGitLabThreadRef(issue({ id: 'acme/app#7', number: 7, kind: 'pull', url: 'https://github.com/acme/app/pull/7' }))).toBeNull();
+    expect(getGitLabThreadRef(issue({ id: 'x', number: 1, kind: 'issue', url: 'https://example.com/not/a/thread' }))).toBeNull();
+  });
+
+  test('lists each linked merge request and issue once and gives sidebar issues their thread', () => {
+    const url = 'https://gitlab.com/team/app/-/issues/8';
+    const session = sessionWith([
+      issue({ id: 'gitlab.com:team/app#8', number: 8, kind: 'issue', url }),
+      { id: `link:${url}`, kind: 'external', thread: 'issue', identifier: '#8', title: 'Same issue', url, linkedAt: 2 },
+      issue({ id: 'mr', number: 3, kind: 'pull', url: 'https://gitlab.com/team/app/-/merge_requests/3' }),
+    ]);
+    expect(getLinkedGitLabThreads(session).map((ref) => ref.key)).toEqual(['https://gitlab.com/team/app#8', 'https://gitlab.com/team/app!3']);
+    expect(getLinkedSidebarIssues(session)).toMatchObject([
+      { source: 'gitlab', identifier: '#8', ref: { number: 8, thread: 'issue' } },
     ]);
   });
 });

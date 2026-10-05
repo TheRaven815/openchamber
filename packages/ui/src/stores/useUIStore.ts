@@ -948,6 +948,8 @@ interface UIStore {
   sessionGoalDefaultBudgetEnabled: boolean;
   sessionGoalDefaultBudget: number;
   collapsibleThinkingBlocks: boolean;
+  /** A collapsible reasoning block opens while its model thinks. Off: it stays folded to its header. */
+  expandReasoningWhileStreaming: boolean;
   chatRenderMode: ChatRenderMode;
   activityRenderMode: ActivityRenderMode;
   showDeletionDialog: boolean;
@@ -982,6 +984,8 @@ interface UIStore {
   collapsedModelProviders: string[];
   customProviderIcons: Record<string, CustomProviderIcon>;
   recentModels: Array<{ providerID: string; modelID: string }>;
+  /** `provider/model` last picked in a chat composer; a new session starts on it when nothing is configured. */
+  lastSelectedModel: string | undefined;
   recentAgents: string[];
   recentEfforts: Record<string, string[]>;
 
@@ -1085,6 +1089,8 @@ interface UIStore {
   enterToSendConfigured: boolean;
   wideChatLayoutEnabled: boolean;
   codeBlockLineWrap: boolean;
+  tableCellWrap: boolean;
+  copyMessagesAsPlainText: boolean;
   showToolFileIcons: boolean;
   showTurnChangedFiles: boolean;
   showExpandedBashTools: boolean;
@@ -1199,6 +1205,7 @@ interface UIStore {
   setSessionGoalDefaultBudgetEnabled: (value: boolean) => void;
   setSessionGoalDefaultBudget: (value: number) => void;
   setCollapsibleThinkingBlocks: (value: boolean) => void;
+  setExpandReasoningWhileStreaming: (value: boolean) => void;
   setChatRenderMode: (value: ChatRenderMode) => void;
   setActivityRenderMode: (value: ActivityRenderMode) => void;
   setShowDeletionDialog: (value: boolean) => void;
@@ -1242,6 +1249,7 @@ interface UIStore {
   setModelProvidersCollapsed: (providerIDs: string[], collapsed: boolean) => void;
   isFavoriteModel: (providerID: string, modelID: string) => boolean;
   addRecentModel: (providerID: string, modelID: string) => void;
+  setLastSelectedModel: (providerID: string, modelID: string) => void;
   addRecentAgent: (agentName: string) => void;
   addRecentEffort: (providerID: string, modelID: string, variant: string | undefined) => void;
   setDiffLayoutPreference: (mode: 'dynamic' | 'inline' | 'side-by-side') => void;
@@ -1305,6 +1313,8 @@ interface UIStore {
   setEnterToSendConfigured: (value: boolean) => void;
   setWideChatLayoutEnabled: (value: boolean) => void;
   setCodeBlockLineWrap: (value: boolean) => void;
+  setTableCellWrap: (value: boolean) => void;
+  setCopyMessagesAsPlainText: (value: boolean) => void;
   setShowToolFileIcons: (value: boolean) => void;
   setShowTurnChangedFiles: (value: boolean) => void;
   setShowExpandedBashTools: (value: boolean) => void;
@@ -1408,6 +1418,7 @@ export const useUIStore = create<UIStore>()(
         sessionGoalDefaultBudgetEnabled: false,
         sessionGoalDefaultBudget: 200_000,
         collapsibleThinkingBlocks: true,
+        expandReasoningWhileStreaming: false,
         chatRenderMode: 'live',
         activityRenderMode: 'summary',
         showDeletionDialog: true,
@@ -1437,6 +1448,7 @@ export const useUIStore = create<UIStore>()(
         collapsedModelProviders: [],
         customProviderIcons: {},
         recentModels: [],
+        lastSelectedModel: undefined,
         recentAgents: [],
         recentEfforts: {},
         diffLayoutPreference: 'inline',
@@ -1504,6 +1516,8 @@ export const useUIStore = create<UIStore>()(
         enterToSendConfigured: false,
         wideChatLayoutEnabled: false,
         codeBlockLineWrap: true,
+        tableCellWrap: false,
+        copyMessagesAsPlainText: true,
         showToolFileIcons: true,
         showTurnChangedFiles: false,
         showExpandedBashTools: false,
@@ -2348,6 +2362,10 @@ export const useUIStore = create<UIStore>()(
           set({ collapsibleThinkingBlocks: value });
         },
 
+        setExpandReasoningWhileStreaming: (value) => {
+          set({ expandReasoningWhileStreaming: value });
+        },
+
         setChatRenderMode: (value) => {
           set({ chatRenderMode: value });
         },
@@ -2773,6 +2791,12 @@ export const useUIStore = create<UIStore>()(
           });
         },
 
+        setLastSelectedModel: (providerID, modelID) => {
+          const next = `${providerID}/${modelID}`;
+          if (get().lastSelectedModel === next) return;
+          set({ lastSelectedModel: next });
+        },
+
         addRecentAgent: (agentName) => {
           const normalized = typeof agentName === 'string' ? agentName.trim() : '';
           if (!normalized) {
@@ -2977,6 +3001,12 @@ export const useUIStore = create<UIStore>()(
         },
         setCodeBlockLineWrap: (value) => {
           set({ codeBlockLineWrap: value });
+        },
+        setTableCellWrap: (value) => {
+          set({ tableCellWrap: value });
+        },
+        setCopyMessagesAsPlainText: (value) => {
+          set({ copyMessagesAsPlainText: value });
         },
         setShowToolFileIcons: (value) => {
           set({ showToolFileIcons: value });
@@ -3356,6 +3386,7 @@ export const useUIStore = create<UIStore>()(
           sessionGoalDefaultBudgetEnabled: state.sessionGoalDefaultBudgetEnabled,
           sessionGoalDefaultBudget: state.sessionGoalDefaultBudget,
           collapsibleThinkingBlocks: state.collapsibleThinkingBlocks,
+          expandReasoningWhileStreaming: state.expandReasoningWhileStreaming,
           chatRenderMode: state.chatRenderMode,
           activityRenderMode: state.activityRenderMode,
           showDeletionDialog: state.showDeletionDialog,
@@ -3383,6 +3414,7 @@ export const useUIStore = create<UIStore>()(
           collapsedModelProviders: state.collapsedModelProviders,
           customProviderIcons: state.customProviderIcons,
           recentModels: state.recentModels,
+          lastSelectedModel: state.lastSelectedModel,
           recentAgents: state.recentAgents,
           recentEfforts: state.recentEfforts,
           diffLayoutPreference: state.diffLayoutPreference,
@@ -3431,6 +3463,8 @@ export const useUIStore = create<UIStore>()(
           enterToSendConfigured: state.enterToSendConfigured,
           wideChatLayoutEnabled: state.wideChatLayoutEnabled,
           codeBlockLineWrap: state.codeBlockLineWrap,
+          tableCellWrap: state.tableCellWrap,
+          copyMessagesAsPlainText: state.copyMessagesAsPlainText,
           showToolFileIcons: state.showToolFileIcons,
           showTurnChangedFiles: state.showTurnChangedFiles,
           showExpandedBashTools: state.showExpandedBashTools,

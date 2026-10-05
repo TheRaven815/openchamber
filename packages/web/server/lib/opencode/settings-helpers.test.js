@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -69,6 +69,13 @@ const createTestHelpersWithRealSanitizers = () => {
 };
 
 describe('settings helpers', () => {
+  it('sanitizes the optional GitLab OAuth client ID', () => {
+    const helpers = createTestHelpers();
+    expect(helpers.sanitizeSettingsUpdate({ gitlabClientId: ' client-id ' })).toEqual({ gitlabClientId: 'client-id' });
+    expect(helpers.sanitizeSettingsUpdate({ gitlabClientId: '' })).toEqual({});
+    expect(helpers.sanitizeSettingsUpdate({ gitlabClientId: 42 })).toEqual({});
+  });
+
   it('round-trips section order and preserves it across unrelated writes', () => {
     const helpers = createTestHelpers();
     const changes = helpers.sanitizeSettingsUpdate({ workStatusSectionOrder: ['mcp', 'session', 'mcp', null, ''] });
@@ -113,6 +120,15 @@ describe('settings helpers', () => {
       execFileSync('tar', ['-xzf', join(packDir, tarballName), '-C', extractDir], {
         stdio: 'pipe',
       });
+      // An install resolves the package's declared dependencies (zod and the
+      // rest) from node_modules; only relative imports must stay inside it.
+      // Mirror the workspace layout: package-local modules first, then the
+      // hoisted root ones.
+      const linkModules = (from, to) => {
+        if (existsSync(from)) symlinkSync(from, to, 'dir');
+      };
+      linkModules(join(packagesWebDir, 'node_modules'), join(extractDir, 'package', 'node_modules'));
+      linkModules(join(packagesWebDir, '..', '..', 'node_modules'), join(extractDir, 'node_modules'));
 
       const extractedModule = await import(
         pathToFileURL(join(extractDir, 'package', 'server', 'lib', 'opencode', 'settings-helpers.js')).href
@@ -190,6 +206,25 @@ describe('settings helpers', () => {
       sidebarProjectSortOrder: 'random',
       sidebarShowRecentSection: 'false',
     })).toEqual({});
+  });
+
+  it('keeps every interface language and nothing else', () => {
+    const helpers = createTestHelpers();
+    // The server cannot import `packages/ui`, so its list is compared with the
+    // interface's own here: a language added there and not on the server would
+    // never be saved, and would quietly reset again after a restart.
+    const source = readFileSync(fileURLToPath(new URL('../../../../ui/src/lib/i18n/runtime.ts', import.meta.url)), 'utf8');
+    const match = source.match(/export const LOCALES = \[([^\]]*)\]/);
+    if (!match) throw new Error('Could not find LOCALES in the UI i18n runtime');
+    const interfaceLocales = match[1].split(',').map((entry) => entry.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean);
+
+    expect(interfaceLocales.length).toBeGreaterThan(1);
+    for (const locale of interfaceLocales) {
+      expect(helpers.sanitizeSettingsUpdate({ locale })).toEqual({ locale });
+    }
+    expect(helpers.sanitizeSettingsUpdate({ locale: 'xx' })).toEqual({});
+    expect(helpers.sanitizeSettingsUpdate({ locale: ['uk'] })).toEqual({});
+    expect(helpers.sanitizeSettingsUpdate({ locale: 1 })).toEqual({});
   });
 
   it('persists valid tool JSON view modes', () => {
@@ -770,13 +805,13 @@ describe('settings registry gate', () => {
   // stops accepting a key the registry still lists — that is the drift the
   // registry exists to end.
   const validValues = {
-    themeId: 'openchamber-dark', useSystemTheme: true, themeVariant: 'dark', lightThemeId: 'openchamber-light', darkThemeId: 'openchamber-dark',
+    themeId: 'openchamber-dark', locale: 'zh-CN', useSystemTheme: true, themeVariant: 'dark', lightThemeId: 'openchamber-light', darkThemeId: 'openchamber-dark',
     splashBgLight: '#fff', splashFgLight: '#000', splashBgDark: '#000', splashFgDark: '#fff',
     lastDirectory: '/home/testuser/project', homeDirectory: '/home/testuser', opencodeBinary: '/usr/local/bin/opencode',
     projects: [{ id: 'p', path: '/home/testuser/project' }], activeProjectId: 'p',
     securityScopedBookmarks: ['bookmark'], pinnedDirectories: ['/home/testuser/project'],
     desktopLanAccessEnabled: true, desktopKeepAwakeEnabled: true, desktopMinimizeToTrayEnabled: true, desktopMacMenuBarEnabled: true,
-    desktopUiPassword: 'secret', githubClientId: 'client', githubScopes: 'repo', skillCatalogs: [{ id: 'c', label: 'C', source: 'https://x' }],
+    desktopUiPassword: 'secret', githubClientId: 'client', githubScopes: 'repo', gitlabClientId: 'gitlab-client', skillCatalogs: [{ id: 'c', label: 'C', source: 'https://x' }],
     defaultGitIdentityId: 'global', permissionAutoAccept: { sessions: { s: true }, revision: 1 }, permissionDefaultMode: 'safety', messageSearchEnabled: true, messageSearchReasoningEnabled: true,
     agentControlToolEnabled: true, agentWebToolEnabled: true, browserProvider: 'builtin', agentMemoryToolEnabled: true, agentNotifyToolEnabled: true, agentToolsCodeMode: true, isolatedSpacesEnabled: true, isolatedSpacesIdleStop: { enabled: true, hours: 4 }, openCodeUpdateToastDismissedVersion: '1.0.0',
     autoDeleteEnabled: true, autoDeleteAfterDays: 30, sessionRetentionOnlyArchived: false, sessionRetentionAction: 'archive', mergedWorktreeCleanupEnabled: true, terminalShell: 'zsh', terminalLoginShells: ['zsh'],
@@ -786,10 +821,10 @@ describe('settings registry gate', () => {
     managedRemoteTunnelSelectedPresetId: 'a', managedRemoteTunnelPresetTokens: { a: 'token' },
     sidebarProjectDisplayMode: 'all', sidebarViewMode: 'timeline', sidebarProjectSortOrder: 'manual', sidebarWorktreeSortOrder: 'recent', sidebarShowRecentSection: true,
     workStatusPanelEnabled: true, workStatusHiddenSections: ['mcp'], workStatusHiddenSectionsExplicit: true, workStatusSectionOrder: ['mcp', 'session'],
-    showReasoningTraces: true, streamingAutoFollowEnabled: true, collapsibleThinkingBlocks: true, showTextJustificationActivity: true,
+    showReasoningTraces: true, streamingAutoFollowEnabled: true, collapsibleThinkingBlocks: true, expandReasoningWhileStreaming: true, showTextJustificationActivity: true,
     chatRenderMode: 'live', activityRenderMode: 'summary', mermaidRenderingMode: 'svg', userMessageRenderingMode: 'markdown', collapsibleUserMessages: true,
     stickyUserHeader: true, promptNavigatorEnabled: true, wideChatLayoutEnabled: true, showSplitAssistantMessageActions: true, showToolFileIcons: true,
-    codeBlockLineWrap: true, showTurnChangedFiles: true, showExpandedBashTools: true, showExpandedEditTools: true, toolJsonViewMode: 'raw',
+    codeBlockLineWrap: true, tableCellWrap: true, copyMessagesAsPlainText: true, showTurnChangedFiles: true, showExpandedBashTools: true, showExpandedEditTools: true, toolJsonViewMode: 'raw',
     timeFormatPreference: '24h', weekStartPreference: 'monday', messageStreamTransport: 'ws', diffLayoutPreference: 'inline', diffWrapLines: true,
     gitChangesViewMode: 'tree', gitmojiEnabled: true, defaultFileViewerPreview: true, directoryShowHidden: true, filesViewShowGitignored: true,
     fileEditorKeymap: 'vim', autoSaveEnabled: true, autoCreateWorktree: true, sessionTabsEnabled: true,
@@ -801,7 +836,7 @@ describe('settings registry gate', () => {
     defaultModel: 'anthropic/claude', defaultVariant: 'high', defaultAgent: 'build', smallModelUseDefault: false, smallModelOverride: 'anthropic/haiku',
     walkthroughModelOverride: 'anthropic/claude', zenModel: 'zen/model',
     favoriteModels: [{ providerID: 'anthropic', modelID: 'claude' }], hiddenModels: [{ providerID: 'openai', modelID: 'gpt' }], collapsedModelProviders: ['openai'],
-    recentModels: [{ providerID: 'anthropic', modelID: 'claude' }], recentAgents: ['build'], recentEfforts: { 'anthropic/claude': ['high'] }, providerOrder: ['anthropic'],
+    recentModels: [{ providerID: 'anthropic', modelID: 'claude' }], lastSelectedModel: 'anthropic/claude', recentAgents: ['build'], recentEfforts: { 'anthropic/claude': ['high'] }, providerOrder: ['anthropic'],
     sessionRecapEnabled: true, sessionSuggestionEnabled: true, sessionWorkEnabled: true, sessionWorkAutoOpen: true, sessionGoalEnabled: true, sessionGoalChecker: 'small-model', sessionGoalMaxAutoTurns: 50, sessionGoalDefaultBudgetEnabled: true, sessionGoalDefaultBudget: 5,
     summarizeLastMessage: true, summaryThreshold: 100, summaryLength: 50, maxLastMessageLength: 200, showDeletionDialog: true,
     nativeNotificationsEnabled: true, notificationMode: 'always', notifyOnSubtasks: true, notifyOnCompletion: true, notifyOnError: true, notifyOnQuestion: true,

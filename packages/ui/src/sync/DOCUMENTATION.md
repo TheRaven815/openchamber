@@ -92,7 +92,7 @@ Office and OpenDocument packages are metadata-validated before asynchronous extr
 
 The composer compares normalized attachment MIME types with the selected model's declared input modalities. It warns when a newly attached file or an existing attachment after a model change requires an unsupported modality, but does not block sending. Missing modality metadata remains unknown and does not produce a warning.
 
-Attachment drafts stay in memory for the page's lifetime, including composer remounts, independently of text persistence. `selectAttachmentDraft` saves the outgoing list and restores the rendered composer's runtime, directory, and session before paint. Switching cancels unfinished attachment reads. Send and queue recovery pass their captured draft identity so a late failure restores files to the source rather than the currently open session. Clearing or deleting a draft releases only its files. Opening a new-session draft leaves the outgoing session's files available for a return visit.
+Attachment drafts stay in memory for the page's lifetime, including composer remounts, independently of text persistence. `selectAttachmentDraft` saves the outgoing list and restores the rendered composer's runtime, directory, and session before paint. Switching cancels unfinished attachment reads. Send and queue recovery pass their captured draft identity so a late failure restores files to the source rather than the currently open session. Clearing or deleting a draft releases only its files. Opening a new-session draft leaves the outgoing session's files available for a return visit. With a chat pinned in the side panel two composers are on screen; each shows its own draft's files (`useDraftAttachedFiles`) and the selected slot follows the composer the user works in (composer documentation, *Pinned composer*).
 
 ## Catalog changes apply live
 
@@ -159,19 +159,25 @@ are re-read when selected or on the next `server.connected`. The pending
 permissions and forms OpenCode rejected on the way out and the turns it
 interrupted arrive as their own events.
 
-Every managed chat has its own directory, so each chat opened would keep its
-own set of MCP servers for that hour. `chat-location-release.ts` releases a
-chat directory's location (`DELETE /api/debug/location`, the route the
-worktree removal paths already use) 30 s after the selected directory moves
-away from it. It checks again at that moment and keeps the location while the
-chat is selected again, shown in a side panel, has a busy or retrying session,
-a pending permission or form, or a running background command; a busy chat is
-re-checked every 30 s until it settles or is selected. A directory without a
-store is left to OpenCode's own sweep. Project and worktree directories are never released this
-way. Another client still showing the chat gets `location.shutdown` and
-bootstraps it again, which restarts that chat's MCP servers. A failed release
-is ignored: OpenCode's own sweep still applies. VS Code has no managed chats,
-so nothing there qualifies.
+Every managed chat and every worktree has its own directory, so each one
+opened would keep its own set of MCP servers for that hour.
+`location-release.ts` releases such a directory's location
+(`DELETE /api/debug/location`, the route the worktree removal paths already
+use) after the selected directory moves away from it: 30 s for a chat, 5 min
+for a worktree, which the user comes back to through the day and where a
+return after a release waits for the MCP servers to start again. A worktree is
+a path listed in `availableWorktreesByProject` that is not a project root. It
+checks again at that moment and keeps the location while the directory is
+selected again, shown in a side panel, has a busy or retrying session, a
+pending permission or form, or a running background command; a busy directory
+is re-checked at its own delay until it settles or is selected. A directory
+without a store is left to OpenCode's own sweep. Project roots are never
+released this way: the user returns to them most, and the server's default
+scope reads the last-used one. Another client still showing the directory gets
+`location.shutdown` and bootstraps it again, which restarts its MCP servers. A
+failed release is ignored: OpenCode's own sweep still applies. The rule is the
+same on every surface; VS Code has no managed chats, so only worktrees it
+lists qualify there.
 
 ## Committing a revert
 
@@ -249,7 +255,7 @@ own record does.
 - The scheduler runs at most two directory bootstraps concurrently.
 - Selected session/current directory demand outranks active-project, expanded, visible, and background demand.
 - Demand is deduplicated by normalized directory and can be promoted while queued.
-- `useSessionListSync` is the only bootstrap-demand owner, and it publishes only the current directory and the selected session's directory. Known projects and worktrees are never bootstrapped for being known, shown, expanded, or restored as expanded: their rows and sessions come from the global session list, their live activity comes from the global status index, and their pending requests come from the cross-directory blocking-request index. On v2 every directory-scoped read makes OpenCode create and initialize a location, so publishing the whole topology created one location per project at startup. Sidebar notices still request bootstrap manually with `force`.
+- `useSessionListSync` publishes the current directory and the selected session's directory. The only other owner is a chat column pinned in the side panel, which publishes its own session's directory with selected priority while it is mounted (see *Pinned chat columns*). Known projects and worktrees are never bootstrapped for being known, shown, expanded, or restored as expanded: their rows and sessions come from the global session list, their live activity comes from the global status index, and their pending requests come from the cross-directory blocking-request index. On v2 every directory-scoped read makes OpenCode create and initialize a location, so publishing the whole topology created one location per project at startup. Sidebar notices still request bootstrap manually with `force`.
 - A directory that was never bootstrapped relies on the global list for sidebar readiness. Until a complete global snapshot arrives, its group shows loading or a retryable global failure. A directory bootstrap can establish active-list coverage for its own scope; it cannot establish archived coverage. Directory access and initialization failures remain scoped to directories the user selects.
 - A system-resume signal, including Capacitor foreground resume, refreshes pending forms and permissions only for the active materialized directory. The refresh is deduplicated while in flight, preserves existing state on fetch failure, and leaves unopened directories untouched; normal stream reconnect recovery remains the broader catch-up path.
 - When a materialized current turn contains a pending/running form tool but that session's pending form record is missing, the mounted chat performs a form-only recovery scoped to that session. It tries at most three times with delays of 0, 500, and 1,500 ms, stops when the chat unmounts or changes sessions, and guards every attempt against runtime changes. This closes cold-start races without adding requests to ordinary session opens or scanning unrelated sessions and directories.
@@ -319,7 +325,6 @@ then the normal cadence continues. Store error status, including a chats-root
 lookup failure, drives recovery because the loader returns retained data on
 failure. Runtime changes retire the old timer and start a fresh load immediately;
 late completions cannot restart the old timer or seed the new runtime.
-Embedded chats do not poll.
 The sidebar and tray consume the same store and must not start their own
 full-list timers. Surface-specific refreshes, such as opening the mobile session
 sheet or returning from suspension, may still request freshness at their
@@ -459,6 +464,7 @@ The active-session watchdog in `sync-context.tsx` sends status recovery through 
 
 Reconnect and watchdog candidates come from non-idle status, the viewed session, or unresolved materialized messages and tool parts. Only ancestors of those candidates join recovery. Parentage in cached session history alone starts no status polling, child discovery, or message materialization; an idle directory with only cached metadata does not scan its history.
 
+Visible sidebar change-request discovery is separate from child-store bootstrap demand. Worktree topology supplies directory ownership only. The sidebar acquires at most 50 unique demanded directories through the shared [repository binding owner](../lib/source-control/DOCUMENTATION.md), with cold reads behind the background-network gate, then asks the provider-neutral status store for one-shot status under each binding's primary provider account and revision. Binding publications refresh only the affected directory's status demand. Connected accounts outside the binding do not add requests. Hiding the sidebar or collapsing a project removes that demand; missing, unsupported, and failed binding reads issue no status request. A provider association must have ready endpoint authority; aggregate `needs-attention` on an unrelated provider or transport does not suppress it.
 The watchdog calls the stream stale after 20 s without stream activity. Stream activity is anything the event pipeline receives, reported through `onStreamActivity`: an event, a WebSocket frame, or a keepalive that carries no event. OpenCode 2 sends its heartbeat as an SSE comment and the WebSocket bridge sends `openchamber:heartbeat`, and neither becomes a delivered event. Counting delivered events alone made an idle viewed session look stale, so the stream reconnected and resynced every 15 to 20 s, as reported in #4062. Starting a connection attempt is not activity, so a stream that receives nothing still goes stale.
 
 Imperative cross-directory session lookups use the cached ID index from `getAllSyncSessionMap()`. The index is rebuilt only when a child store's `state.session` reference changes; permission lineage checks must reuse it instead of rebuilding a full session map per call.
@@ -497,6 +503,18 @@ covers the client cursor. The pipeline clears that cursor and the sync provider
 runs normal authoritative gap repair even during early boot. Ordinary reconnects
 retain their existing startup grace period.
 
+While `useAuthSessionStore` says the OpenChamber session is not usable
+(confirmed expiry, or a login in progress), the event pipeline and the
+OpenChamber control stream do not reconnect: every attempt would be refused
+with 401 (#3778). A stream that is still connected keeps running. The store
+returns to `ok` when a login succeeds, a confirm probe finds the session alive,
+or the session gate's status check answers 200, including the check behind the
+banner's "Log in" after the user already logged in from another tab. Then both
+streams reconnect at once, cutting short any backoff wait, and the normal
+reconnect callback repairs the gap. VS Code never reports an
+expired session, and native mobile clears it on the spot, so the pause applies
+where the session gate's banner and login exist.
+
 `SessionMessageLoader` is the shared authority for session message requests. Navigation, reactive chat loading, sidebar prefetch, pagination, reconnect/recovery, and optimistic reconciliation must delegate to it rather than issuing parallel initial requests.
 
 Rules:
@@ -510,7 +528,7 @@ Rules:
    Directory `sessionStatusReady` records successful status-snapshot authority independently of bootstrap's general readiness. Before that flag or an explicit session status arrives, telemetry treats an omitted status as unknown. Archiving invalidates status authority for that session alone: restoring it cannot inherit the directory's older snapshot as proof of idle. A live status event or a successful fresh status read clears the invalidation; a failed read leaves it unknown. Neither the flag nor invalidations are persisted.
 7. Pagination demand must carry the selected session's effective directory. It must not fall back to the sync provider directory because the visible session may belong to another worktree.
 8. The ref-stable loader is disposed only after the current task when its provider unmounts. This lets React Strict Mode's development setup → cleanup → setup probe retain a usable loader for child effects, while real disposal still invalidates the preceding lifecycle's work.
-9. Transcript arrays are chronological by `message.time.created`. Within one millisecond a `synthetic` record sorts before any other role, then message ID breaks the tie deterministically: composer context is admitted right before its prompt, often in the same millisecond, while the prompt's ID is minted earlier on the client. Sends mint context IDs before the prompt ID and show those synthetic records optimistically with the prompt's timestamp, so the context renders on the prompt from the first frame and the server records reconcile in place. Message IDs are identity and reconciliation keys, not chronology: OpenCode's fixed-width sortable timestamp prefix rolls over, so a newer `msg_000...` can follow an older `msg_fff...`. Fetch, pagination, materialization, optimistic insertion, events, reconnect inspection, rendering, and revert/undo/redo must preserve this contract.
+9. Transcript arrays are chronological by `message.time.created`. Within one millisecond a `synthetic` record sorts before any other role, then message ID breaks the tie deterministically: composer context is admitted right before its prompt, often in the same millisecond, while the prompt's ID is minted earlier on the client. Sends mint context IDs before the prompt ID and show those synthetic records optimistically with the prompt's timestamp, so the context renders on the prompt from the first frame and the server records reconcile in place. Optimistic records carry the client's clock, so a page that returns the server's copy of one replaces the client's copy outright, unless a live event already did; otherwise a remote client whose clock runs ahead keeps its prompt sorted after the reply. Message IDs are identity and reconciliation keys, not chronology: OpenCode's fixed-width sortable timestamp prefix rolls over, so a newer `msg_000...` can follow an older `msg_fff...`. Fetch, pagination, materialization, optimistic insertion, events, reconnect inspection, rendering, and revert/undo/redo must preserve this contract.
 10. Session-scoped ArrowUp and ArrowDown recall merges the visible transcript's user prompts (`useUserMessageHistory`) with the persisted input-history bucket for runtime + normalized directory + session identity. Revert markers hide prompts from the transcript source only; the persisted bucket still recalls them. Global scope reads the persisted runtime bucket alone.
 11. Part arrays preserve authoritative response/event order. Part IDs are identity keys and have the same rollover limitation; identity lookup/removal must not require a part array to be lexically ID-sorted.
 
@@ -991,6 +1009,32 @@ Nodes already transferred to the Markdown cache remain intact. This shared
 cleanup runs independently of animation frames across all chat runtimes.
 
 `bun run profile:switch` measures both moments; see `scripts/perf/DOCUMENTATION.md`.
+
+### Pinned chat columns
+
+A chat opened in the side panel ("Open in side panel", a subtask, a review
+session) is a second `ChatContainer` in the same app, pinned to its session
+(`pinnedSession`). It used to be an iframe that booted a whole second app per
+tab. The main chat follows the app's selection; a pinned column keeps its own
+and changes only through its own navigation (open a subtask in place, return
+to the parent), never the main chat's selection or draft.
+
+Everything inside a chat reads its session through `chatColumnSession.ts`:
+`useChatSessionSelection()` is the column's session inside a column and the
+live selection elsewhere (it does not subscribe to the selection inside one),
+`useEffectiveDirectory` resolves the column's session, and
+`useChatColumnActions()` routes what a chat does on its own behalf: open a
+session, open the timeline dialog, focus its composer. App-wide state the main
+chat drives stays the main chat's: the work-status panel and its flags, the
+prompt navigator's keyboard panel, the global timeline dialog, the expanded
+composer preference, and the new-session draft. A pinned column keeps local
+copies where it needs them and leaves the global ones untouched, including on
+mount and unmount. Double Escape stops the session of the column the key was
+pressed in: the column root names its session and whether it runs
+(`data-chat-column`, `data-chat-session-id`, `data-chat-working`).
+
+The composer's per-column state (model selection, attachments, pending text
+and context) is described in the composer documentation, *Pinned composer*.
 
 Select leaf values, not containers:
 

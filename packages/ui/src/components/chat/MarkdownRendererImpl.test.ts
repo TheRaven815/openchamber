@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'bun:test';
 
-import { localPathFromFileUrl, parseFileReference, type ParsedFileReference } from './fileReferenceParser';
+import { localPathFromFileUrl, normalizeReferencePath, parseFileReference, type ParsedFileReference } from './fileReferenceParser';
 
 const parse = (value: string): ParsedFileReference | null => parseFileReference(value);
 
@@ -184,6 +184,8 @@ const rendererUiState = {
     codeBlockLineWrap: false,
     mermaidRenderingMode: 'svg',
     setCodeBlockLineWrap: () => undefined,
+    tableCellWrap: false,
+    setTableCellWrap: () => undefined,
     openContextPreview: () => undefined,
 };
 
@@ -292,6 +294,7 @@ type TestDecorateContext = {
 mock.module('./markdown/decorate', () => ({
     attachMarkdownInteractions: () => () => undefined,
     applyMarkdownCodeBlockWrapState: () => undefined,
+    applyMarkdownTableWrapState: () => undefined,
     decorateMarkdown: (root: FakeElement, ctx: TestDecorateContext) => {
         decorateCalls += 1;
         if (root.getAttribute('data-test-decoration-marker') === 'true') return;
@@ -489,6 +492,17 @@ describe('localPathFromFileUrl', () => {
         expect(localPathFromFileUrl('https://example.com/report.html')).toBeNull();
         expect(localPathFromFileUrl('file://remote-host/share/report.html')).toBeNull();
         expect(localPathFromFileUrl('file:///tmp/bad%ZZpath')).toBeNull();
+    });
+});
+
+describe('bare Windows drive reference resolution', () => {
+    test('drops the leading slash a bare /C:/ markdown href carries', () => {
+        // The click resolver feeds a bare href through parseFileReference then
+        // normalizeReferencePath. Windows would otherwise read /C:/... as
+        // C:\C:\..., so the resolved path must lose the leading slash.
+        const parsed = parseFileReference('/C:/example/project/package.json');
+        expect(parsed).not.toBeNull();
+        expect(normalizeReferencePath(parsed!.path)).toBe('C:/example/project/package.json');
     });
 });
 

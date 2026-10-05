@@ -11,6 +11,7 @@
  * survives the expand.
  */
 
+import type { SourceControlProvider } from '@/lib/api/types';
 import React from 'react';
 
 import { SessionGoalButton, SessionGoalObjectiveCounter } from '@/components/chat/SessionGoalButton';
@@ -60,6 +61,8 @@ export interface ComposerFooterProps {
     onOpenSettings?: () => void;
     onPickLocalFiles: () => void;
     onOpenGitHubPicker: () => void;
+    /** The host the project's issues and change requests come from. */
+    repositoryProvider?: SourceControlProvider;
     showLinearPicker?: boolean;
     onOpenLinearPicker?: () => void;
     attachGuests?: readonly GuestAttachItem[];
@@ -79,6 +82,8 @@ export interface ComposerFooterProps {
     isBtw?: boolean;
     modelSessionId?: string | null;
     btwSelection: BtwSelection;
+    /** A pinned column's own model, agent and effort (see pinnedComposerSelection.ts). */
+    pinnedSelection?: BtwSelection | null;
     /** Offers "Run on several models" in the model picker (desktop). */
     onRunInParallel?: () => void;
     /** Set while the composer is in "Run in parallel" mode: the primary action launches the run. */
@@ -111,6 +116,7 @@ export function ComposerFooter(props: ComposerFooterProps) {
         onOpenSettings,
         onPickLocalFiles,
         onOpenGitHubPicker,
+        repositoryProvider,
         showLinearPicker,
         onOpenLinearPicker,
         attachGuests,
@@ -130,6 +136,7 @@ export function ComposerFooter(props: ComposerFooterProps) {
         isBtw = false,
         modelSessionId,
         btwSelection,
+        pinnedSelection = null,
         onRunInParallel,
         parallelRun = null,
     } = props;
@@ -161,6 +168,7 @@ export function ComposerFooter(props: ComposerFooterProps) {
                                 iconSizeClass={iconSizeClass}
                                 handlePickLocalFiles={onPickLocalFiles}
                                 openGitHubPicker={onOpenGitHubPicker}
+                                repositoryProvider={repositoryProvider}
                                 showLinearPicker={showLinearPicker}
                                 openLinearPicker={onOpenLinearPicker}
                                 onOpenSettings={isBtw ? undefined : onOpenSettings}
@@ -234,6 +242,7 @@ export function ComposerFooter(props: ComposerFooterProps) {
                             iconSizeClass={iconSizeClass}
                             handlePickLocalFiles={onPickLocalFiles}
                             openGitHubPicker={onOpenGitHubPicker}
+                            repositoryProvider={repositoryProvider}
                             showLinearPicker={showLinearPicker}
                             openLinearPicker={onOpenLinearPicker}
                             onOpenSettings={isBtw ? undefined : onOpenSettings}
@@ -266,7 +275,7 @@ export function ComposerFooter(props: ComposerFooterProps) {
                         {!isBtw ? <SessionGoalObjectiveCounter length={messageLength} /> : null}
                     </div>
                     <div className={cn('flex items-center flex-1 justify-end', footerGapClass, 'md:gap-x-3')}>
-                        {parallelRun ? <div className="flex-1" /> : isBtw ? <ModelControls className="flex-1 min-w-0 justify-end" sessionId={modelSessionId ?? null} selection={btwSelection} /> : <MemoModelControls className={cn('flex-1 min-w-0 justify-end')} onRunInParallel={onRunInParallel} />}
+                        {parallelRun ? <div className="flex-1" /> : isBtw ? <ModelControls className="flex-1 min-w-0 justify-end" sessionId={modelSessionId ?? null} selection={btwSelection} /> : pinnedSelection ? <ModelControls className="flex-1 min-w-0 justify-end" sessionId={currentSessionId} selection={pinnedSelection} agentSelectable /> : <MemoModelControls className={cn('flex-1 min-w-0 justify-end')} onRunInParallel={onRunInParallel} />}
                         {!isBtw ? <MemoComposerDictation
                             radius={chatInputRadius}
                             isMobile={isMobile}

@@ -8,6 +8,7 @@ import type { GitHubChecksSummary, GitHubReference, GitHubReferenceComment, GitH
 import { useI18n } from '@/lib/i18n';
 
 import type { CachedValue } from './referenceCache';
+import { getSourceControlProviderLabel } from '@/lib/source-control/identity';
 import { ReferenceComments, type ReferenceCommentItem } from './ReferenceComments';
 import { ChecksGlyph, ReferenceLabelChips } from './ReferencePickerRow';
 import {
@@ -17,6 +18,7 @@ import {
     linearStateLook,
     relativeTimeOf,
     type ReferencePickerItem,
+    referenceNumberLabel,
 } from './referencePickerItems';
 
 export type ReferencePreviewPurpose = 'attach' | 'worktree';
@@ -232,7 +234,7 @@ const GitHubPreview: React.FC<{
                 <div className="flex items-center gap-2">
                     <StatePill icon={look.icon} color={look.color} label={t(look.labelKey)} />
                     <span className="truncate typography-meta text-muted-foreground">
-                        {reference.sourceRepo.owner}/{reference.sourceRepo.repo} #{reference.number}
+                        {reference.sourceRepo.owner}/{reference.sourceRepo.repo} {referenceNumberLabel(reference)}
                     </span>
                     <a
                         href={reference.url}
@@ -240,7 +242,7 @@ const GitHubPreview: React.FC<{
                         rel="noopener noreferrer"
                         className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-md px-1.5 py-0.5 typography-meta text-muted-foreground hover:bg-interactive-hover hover:text-foreground"
                     >
-                        GitHub
+                        {getSourceControlProviderLabel(reference.provider ?? 'github')}
                         <Icon name="external-link" className="size-3.5" />
                     </a>
                 </div>

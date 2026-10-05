@@ -11,7 +11,7 @@ This module provides OpenCode server integration utilities for the web server ru
 - `packages/web/server/lib/opencode/cli-entry-runtime.js`: CLI entrypoint runtime that detects direct execution, parses CLI options, and starts server bootstrap.
 - `packages/web/server/lib/opencode/routes.js`: OpenCode/provider settings and auth-related route registration.
 - `packages/web/server/lib/opencode/v1-migration-topup.js`: re-arms OpenCode's own V1 -> V2 session import for V1 sessions changed by 1.x after the last completed import; runs only before a managed spawn. See "v1-migration-topup.js" below.
-- `packages/web/server/lib/opencode/lifecycle.js`: OpenCode process lifecycle runtime (startup, restart, readiness, health monitoring). After readiness it warms the last-used directory only (first entry of the `getWarmupDirectories` dep, best-effort) because OpenCode initializes each directory lazily on first request and that cost would otherwise be paid by the user's first interactive session open. It warms no other projects: on OpenCode 2 the first directory-scoped read boots that location's whole MCP fleet. The warmed directory (only directories that still exist are offered) is also `getDefaultOpenCodeDirectory()`, the scope for server-side reads that have no directory of their own (integrations in `auth.js`, the small model's model and provider lists, the agent check after a restart): v2 answers a location read without one for its own working directory, the user's home for a managed OpenCode, and would start an MCP fleet there.
+- `packages/web/server/lib/opencode/lifecycle.js`: OpenCode process lifecycle runtime (startup, restart, readiness, health monitoring). After readiness it warms the last-used directory only (first entry of the `getWarmupDirectories` dep, best-effort) because OpenCode initializes each directory lazily on first request and that cost would otherwise be paid by the user's first interactive session open. It warms no other projects: on OpenCode 2 the first directory-scoped read boots that location's whole MCP fleet. The warmed directory is also `getDefaultOpenCodeDirectory()`, the scope for server-side reads that have no directory of their own (integrations in `auth.js`, the small model's model and provider lists, the agent check after a restart): v2 answers a location read without one for its own working directory, the user's home for a managed OpenCode, and would start an MCP fleet there. The getter revalidates that directory on every read: once it is no longer a readable directory (deleted, moved, replaced by a file, or stripped of read/execute permission) it is never sent, and the lifecycle advances to another directory the warm pass validated or re-reads `getWarmupDirectories` (coalesced, with a short cooldown) so a currently-valid `lastDirectory` replaces the stale one. A stale cached path would otherwise make every directory-scoped read answer `500 FileSystem.realPath ... ENOENT` — the failure that took the quota credential read down with it.
 - `packages/web/server/lib/opencode/provider-env-aliases.js`: mirrors known provider credential env aliases into the managed OpenCode process environment (for example `GEMINI_API_KEY` → `GOOGLE_GENERATIVE_AI_API_KEY`) so OpenCode connection detection and the upstream AI SDK agree on the same key names. Canonical implementation shared by web lifecycle and the VS Code managed spawn path (`packages/vscode/src/provider-env-aliases.ts` re-exports this module).
 - `packages/web/server/lib/opencode/env-runtime.js`: OpenCode CLI/binary resolution and shell environment runtime.
 - `packages/web/server/lib/opencode/env-config.js`: OpenCode-related environment variable parsing and validation (host/port/hostname).
@@ -29,7 +29,7 @@ This module provides OpenCode server integration utilities for the web server ru
 - `packages/web/server/lib/opencode/npm-registry-config.js`: resolves npm package metadata requests from inherited npm registry settings or the user's `.npmrc`, including scoped registries and matching bearer/basic HTTP authentication.
 - `packages/web/server/lib/opencode/server-startup-runtime.js`: server listen/startup tunnel flow and process/signal handler orchestration runtime.
 - `packages/web/server/lib/opencode/static-routes-runtime.js`: static asset/SPA fallback route registration and manifest route wiring.
-- `packages/web/server/lib/opencode/feature-routes-runtime.js`: feature route composition runtime for dynamic import-backed config/skill/provider route registration.
+- `packages/web/server/lib/opencode/feature-routes-runtime.js`: feature route composition runtime for dynamic import-backed config/skill/provider route registration. Source-control provider registration is delegated to `lib/source-control/routes.js`. One exact persisted-credential resolver, including optional revision pinning, is shared by transport binding, clone planning, contributor transfer, execution, and safe HTTPS binding-read presentation. The managed SSH inventory supplies the matching verified-fingerprint projection without exposing its key record or path. Server composition supplies one durable worktree-bootstrap store to both Git and OpenChamber-session routes; the runtime exposes a lazy bound-checkout hydration adapter so session-created worktrees use the same local inspection and exact parent authority rules as Git-route worktrees.
 - `packages/web/server/lib/opencode/opencode-resolution-runtime.js`: OpenCode binary resolution snapshot runtime for settings routes and diagnostics.
 - `packages/web/server/lib/opencode/upgrade-capability.js`: authoritative upgrade ownership policy for the active OpenCode runtime. Bundled, external, and unresolved runtimes fail closed; only managed non-bundled runtimes delegate upgrades to OpenCode.
 - `packages/web/server/lib/opencode/tunnel-wiring-runtime.js`: tunnel service/routes composition runtime and active-port wiring for main server startup.
@@ -112,6 +112,14 @@ routes the same way, matched by `isCredentialListRequest` in
 generic proxy, in and out of enterprise mode: anyone signed in to the UI,
 over a tunnel or a paired phone too, would otherwise read every key. Renaming,
 switching and removing an account still reach OpenCode.
+
+`POST /api/vcs/init` (OpenCode 2.0.23, runs `git init`) answers 400 with an
+`InvalidRequestError` body when it would create a repository in the home
+directory, at a disk root, or in OpenCode's own working directory because no
+directory was named (`vcsInitRefusal` in `../git/repository-root.js`). Git
+surfaces ignore a repository there, so the user would get a repository that
+covers every file and a Git tab that still says "not a repository". The UI
+hides its Initialize Git button in the same places.
 
 Keys OpenCode takes from environment variables (`ZAI_API_KEY`, ...) are never
 stored and `/api/credential` does not list them; `GET /api/integration` names
@@ -795,6 +803,7 @@ headers }` or v1 `{ npm, options }`. The stored entry is always a
 - `createFeatureRoutesRuntime(dependencies)`: creates runtime for main feature route registration orchestration.
 - Returned API:
   - `registerRoutes(app, routeDependencies)`
+  - `hydrateBoundCheckout({ directory, parentDirectory, parentRemoteName })`: resolves the parent repository's current binding authority at call time, then delegates local inspection and any explicit hydration to the runtime's existing Git network-operation service.
 
 ## Public exports (opencode-resolution-runtime.js)
 - `createOpenCodeResolutionRuntime(dependencies)`: creates runtime for OpenCode binary/source snapshot resolution.
@@ -899,7 +908,10 @@ Git bootstrap must reach `git-ready` before OpenCode can cache a new worktree's
 project identity or config. Setup scripts may still be running; the optional UI
 setup wait remains separate. Failed or timed-out checkout returns 503 without
 forwarding. The shared draft creator keeps the project directory selected until
-creation returns, because preview paths have no bootstrap state.
+creation returns, because preview paths have no bootstrap state. A directory with
+no bootstrap state was never populated by this server and passes at once. The gate
+reads the in-memory state only: the durable bootstrap store takes a cross-process
+file lock per read, which must not sit on every proxied request.
 
 This server gate covers web, Electron, hosted mobile, and Capacitor connections.
 The VS Code extension owns its separate Git and proxy implementation.

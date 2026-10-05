@@ -1432,6 +1432,20 @@ html:not(.dark) .chat-scroll {
   color: var(--markdown-italic, var(--foreground));
 }
 
+/* Bold/italic inside a blockquote keeps the quote's muted color instead of
+   jumping to the full foreground (mirrors the reasoning-scope rules below). */
+.markdown-content blockquote strong,
+.markdown-content blockquote b,
+.markdown-content blockquote [data-markdown="strong"],
+.markdown-content blockquote [data-markdown="bold"] {
+  color: inherit;
+}
+
+.markdown-content blockquote em,
+.markdown-content blockquote i {
+  color: inherit;
+}
+
 .markdown-content del {
   color: var(--markdown-strikethrough, var(--muted-foreground));
 }
@@ -1734,6 +1748,25 @@ html:not(.dark) .chat-scroll {
 [data-markdown="mermaid-block"] [data-markdown="mermaid-scroll"] {
   overflow: auto;
   min-width: 0;
+}
+
+/* Like code-block actions: hidden until hover only where a pointer can
+   hover; on touch screens the zoom controls stay visible. */
+[data-markdown="mermaid-block"] [data-markdown="mermaid-toolbar"] {
+  transition: opacity 0.15s ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  [data-markdown="mermaid-block"] [data-markdown="mermaid-toolbar"] {
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  [data-markdown="mermaid-block"]:hover [data-markdown="mermaid-toolbar"],
+  [data-markdown="mermaid-block"]:focus-within [data-markdown="mermaid-toolbar"] {
+    opacity: 1;
+    pointer-events: auto;
+  }
 }
 
 [data-markdown="mermaid-block"][data-mermaid-render="svg"] [data-markdown="mermaid-scroll"] {

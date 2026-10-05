@@ -49,6 +49,7 @@ These are the most performance-sensitive.
 
 - `useGitStore.ts`
 - `useGitHubPrStatusStore.ts`
+- `useWalkthroughStore.ts`
 - `useFilesViewTabsStore.ts`
 
 These stores act like centralized keyed caches. UI should consume narrow slices from them instead of re-fetching the same data in multiple places.
@@ -103,13 +104,14 @@ Mobile requests only the active detail path and suspends reads while its
 keep-alive workspace pane is hidden.
 
 `usePullRequestSelectionStore.ts` shares session-only PR choices across desktop,
-mobile Changes and walkthrough, keyed by runtime, directory and checked-out
-branch. Explicit selection bounds remembered choices to 100 entries. A choice
+mobile Changes and walkthrough, keyed by runtime, directory, checked-out branch
+and bound repository, so a rebind to another repository starts without a choice. Explicit selection bounds remembered choices to 100 entries. A choice
 contains the PR number and its repository, so fork and upstream PRs with equal
 numbers remain distinct. `usePullRequestComparison` owns the searchable,
-paginated list while PR mode is active. The shared GitHub PR status store's
-fork/remote-aware resolver supplies the initial choice, independently of list
-pagination. An absent match requires selection. External walkthrough handoffs
+paginated list while PR mode is active and reads it through
+`SourceControlAPI.changeRequestsList` with the bound GitHub context. The shared
+status store, asked through that same context, supplies the initial choice,
+independently of list pagination. An absent match requires selection. External walkthrough handoffs
 apply once, and later picker changes
 remain authoritative when a retained panel becomes visible again.
 
@@ -122,15 +124,22 @@ Examples:
 
 These stores coordinate visible app state, navigation, selected context-panel tabs, dialogs, and lightweight feature flags. `useUIStore.activeSurface` selects the primary mobile view and the few desktop views that are promoted out of the context panel. It is not a desktop tab selection. Linear panel list filters (status, assignee, team, priority) live here too: the Linear rail surface remounts on switch, so those filters restore from this store rather than component state. `resetLinearIssueListFilters` restores those four defaults together; search stays local to the rail. The team filter is the one that is not a plain preference: a Linear team belongs to one workspace, and each OpenChamber instance has its own Linear login, so it is persisted per instance in `linearIssueListTeamIdByRuntime` and the flat `linearIssueListTeamId` is derived from it by `applyLinearIssueListFiltersForRuntime` — on an instance switch and when the rail mounts, since rehydration can run before the runtime endpoint is known. Carried across, a team id filters the new instance's list down to nothing. `linearIssueFocus` is a one-shot identifier so work-status can open a specific issue in that panel; it is not persisted. Opening a new browser tab with an address (`openContextPreview`, `openContextBrowser`, `openAgentBrowserTab`) notes it, keyed by directory and tab id, in the session-only set in `lib/browser/devServerWait.ts`; the tab's first mount reads and forgets it. Only a noted tab waits for its dev server on the first load. A tab restored from saved state, or remounted later, loads once and shows the failure. When those openers hit a tab that already exists, they send it a session-only load request instead. A mounted tab that shows a failure, or has not shown a page yet, loads the address the way a typed one loads, wait included, so a failure from launch does not stay up once a project action starts the server; a tab showing a working page ignores the request and is only focused, keeping what the person had on it.
 
-Context-panel session chats mount only the active chat iframe. After installing
-its message listener, the iframe requests its authoritative visibility from the
-parent. The parent accepts requests only from a currently mounted chat frame and
-answers from the current active tab. Do not rely only on a parent `onLoad`
-notification: it can arrive before the iframe listener exists and leave a
-visible chat with background work disabled. Message-history subscriptions in the
-mounted session-chat iframe stay enabled independently of that visibility flag
-so a delayed or lost handshake cannot hide an already-materialized transcript
-(busy subagents would otherwise show only the working-status row).
+Context-panel session chats render in this app as a chat column pinned to
+their session (`ChatView` `pinnedSession`, see the sync documentation's
+*Pinned chat columns*). Only the active chat tab is mounted while the panel is
+open; switching tabs opens the other session like a session switch.
+
+`useDirectoryStore.ts` resolves the home directory when the module loads and
+again on every runtime switch; only the newest resolution commits. On a
+browser's first visit to a server with a UI password, the page-load attempt
+runs before login, every source answers 401, and the home falls back to `/`
+with `isHomeReady` false. After authentication the session gate calls
+`ensureHomeDirectoryResolved` and keeps the app unmounted until it settles or
+10 seconds pass, so the app starts in the real home rather than `/`, where a
+new chat cannot even be created. A resolution still in flight is awaited, not
+replaced. If the server still cannot name the home, the app starts in `/` as it
+did before. A home that is already known, from storage or the desktop shell,
+shows the app at once.
 
 ### Session / project coordination stores
 
@@ -219,7 +228,9 @@ Settings fields are declared once in the settings registry (`packages/ui/src/lib
 
 Session defaults belong to the active runtime. Switching instances clears the in-memory defaults and directory config snapshots; persisted config hydrates only when its recorded runtime matches. Legacy snapshots without an owner are refetched. Initialization, health checks, and directory activation reject obsolete continuations, including A to B to A switches.
 
-Configured project and global model identifiers remain selected through provider discovery gaps. A draft can display its configured identifier before model metadata arrives. Catalog absence never selects Big Pickle in its place. An unknown settings document defers fallback selection; a successful document with no configured model permits the normal OpenCode fallback. Saved thinking preferences stay in settings; an OpenCode config `model` carries its effort as a `#variant` suffix, and a discovered model's supported variants determine the effective thinking level.
+Persisted config (`config-store`) holds selections only. The provider and agent catalogs and their `*Loaded` flags stay in memory, both top level and per directory. VS Code gives every OpenChamber webview one origin, so each localStorage write reaches every webview in every window as a `StorageEvent` carrying the old and the new value. With the catalogs included, one write was tens of megabytes, and the shared webview renderer ran out of memory. A cold start therefore paints the pickers once `initializeApp` / `activateDirectory` load the catalogs; an empty hydrated snapshot reports not-loaded, never an authoritative empty list. Older blobs that still carry catalogs hydrate as before. The slim format is persist version 1: a build without it has no `migrate` for version 1 and skips the blob, so it gets a cold start instead of reading `snapshot.agents` on a snapshot that has none. The persist middleware writes after every `set()`, including one whose updater returns the same state, so selection setters (`setProvider`, `setModel`, `setAgent` and the model it resolves) check for an unchanged selection before calling `set()`.
+
+Configured project and global model identifiers remain selected through provider discovery gaps. A draft can display its configured identifier before model metadata arrives. Catalog absence never selects Big Pickle in its place. An unknown settings document defers fallback selection; a successful document with no configured model permits the normal OpenCode fallback. Before that fallback comes the model last picked in a chat composer (`lastSelectedModel`, a synced profile setting written only by the composer's model picker and the favorite-model shortcuts, never by other model pickers or session restores), so a new session starts where the user last chose when nothing configured names a model. Like a configured identifier it survives catalog gaps; a model hidden since is skipped, and so is an Auto pick the server cannot honour. The fallback itself (Big Pickle, else the first model) skips models hidden in the picker, on the client and in the server's session routes; a configured project, settings, agent, or OpenCode model is honoured even when hidden, and with every model hidden the unfiltered pick stands. Saved thinking preferences stay in settings; an OpenCode config `model` carries its effort as a `#variant` suffix, and a discovered model's supported variants determine the effective thinking level.
 
 Project defaults include `defaultAgent`, `defaultModel`, and `defaultVariant`.
 The project agent precedes the global agent, then OpenCode's default and the
@@ -367,6 +378,7 @@ Important properties:
 - `directories: Map<string, DirectoryGitState>` is the source of truth
 - loading state is per-directory, not global
 - `ensureStatus()` and `ensureAll()` are the preferred entry points for consumers
+- a non-repository answer is cached for the repository-check window; `recheckRepository()` is the one way past it, for a directory that just became a repository (Initialize Git in the shared not-a-repository state, `views/git/InitializeGitButton.tsx`). It invalidates adapter caches through `notifyGitStatusInvalidated` and forces a fresh probe and status
 - in-flight dedupe exists for status and `ensureAll()`; status dedupe is scoped to the per-directory status mutation revision, so a refresh requested after a mutation never joins a pre-mutation in-flight request
 - nested repository discovery (`nestedReposByRoot`, `nestedRepoSelection`, `ensureNestedRepos`) is per-root state for roots that are not themselves git repositories; discovery failure is a `null` marker (never a valid empty result), a runtime without the discovery route (VS Code) commits an `'unsupported'` marker, and an in-flight discovery whose runtime switched is discarded at commit time instead of repopulating the cleared map. Selections are persisted per runtime + root, and `useEffectiveGitDirectory(root)` resolves the directory git surfaces operate on (`root` when the root is a repository, the selected nested repository otherwise). A selection whose repository fails its probe is dropped and remembered session-only (`staleClearedSelections`) so auto-select does not re-pick it and loop walk+probe; manual picker picks bypass the memory. `hooks/useNestedGitDirectory.ts` owns the resolution flow (root probe, discovery, auto-select, stale-selection recovery) for every consuming surface (Git tab, diff view, pull-request view, walkthrough view, mobile changes, work-status project readout), and `git/NestedRepoResolutionStates.tsx` renders the shared pending/failed/unsupported/empty states
 - worktree bootstrap polling and session/worktree machinery stay keyed on the project root even while a nested repository is selected; only git data and actions follow the selection
@@ -381,9 +393,11 @@ Important properties:
 
 Diff prefetch admits at most two outstanding transport requests per runtime and directory across overlapping batches. Its 15-second deadline stops waiting for a result; it does not cancel server work. A timed-out request retains its path and concurrency slot until the transport settles, including across cache resets, so later batches cannot repeat it or exceed the limit. Saturated prefetch skips further work instead of queueing retries. Late timed-out results never enter the cache, and successful or rejected transport completion releases capacity. Duplicate or saturated demand does not invalidate a batch already running. The Git view schedules prefetch only while active; explicit file opens remain independent of background prefetch capacity.
 
-### `useGitHubPrStatusStore.ts`
+`useGitIdentitiesStore.ts` owns the active runtime's author profile inventory, global author summary, default author, and temporary selection. Runtime endpoint reset clears all of them synchronously. Every load and mutation captures the runtime key and store generation before awaiting; profile mutations also carry per-profile generations, so a completion from another runtime or an older same-ID edit cannot publish. Profile responses pass the shared strict public DTO parser and cannot contain legacy authentication fields. In VS Code the webview adapter keeps profiles in webview memory for the lifetime of the view; neither the store nor the extension host persists them.
 
-`useGitHubPrStatusStore` is a centralized PR cache keyed by a collision-safe tuple of runtime, directory, branch, and requested remote.
+### Source-control stores
+
+`useSourceControlAuthStore`, `useChangeRequestContextStore`, and the transitional `useGitHubPrStatusStore` own provider-neutral source-control state. Bound status keys include runtime, provider instance, immutable account ID, repository ID, binding revision, directory, branch, and primary remote. Context keys include their directory and change-request identity. Despite its transitional name and legacy display aliases, `useGitHubPrStatusStore` performs network reads only through `SourceControlAPI.changeRequestStatus` with an exact `SourceControlReadContext`; it has no ambient `RuntimeAPIs.github` fallback.
 
 Core model:
 
@@ -401,15 +415,24 @@ Important properties:
 - `ensureEntry()` initializes a key lazily
 - `setParams()` attaches runtime context
 - parameter changes advance an entry revision; stale queued, successful, and failed requests cannot update a newer authority
-- `startWatching()` / `stopWatching()` are for true live PR consumers only
+- `startWatching()` / `stopWatching()` are for true live PR consumers only. Nothing polls a watched entry: `noteBranchActivity(directory)` (an agent turn finished there) and `noteWindowReturned()` (answers older than `60s`) refresh it, both wired by `lib/trackedItems/interest.ts`
 - `refreshTargets()` supports one-shot multi-target bootstrap without turning on live watching
-- `syncOpenPrSummaries()` keeps unwatched open PRs live through one batched summary request; it skips watched entries and PRs checked within `minAgeMs`, applies only answers newer than the entry's `fetchedAt`, leaves semantically unchanged entries untouched, and drops a batch that outlived a runtime switch; `linkedRefs` add the PRs linked to sessions on screen to the same batch, answered into the runtime-only `linkedSummaries` map (merged links are final and not asked again); `linkedIssueRefs` do the same for GitHub issues linked to sessions, answered into the runtime-only `linkedIssueSummaries` (asked on every cadence, since an issue can reopen)
+- an entry's open pull or merge request is a tracked item read with the bound account (`getBranchTrackedPull`, `useBranchTrackedPulls`); the server pushes its live state and `applyTrackedPulls` lays it on every entry of that request, skipping entries whose full refresh is newer and leaving semantically unchanged entries untouched.
+- PRs, merge requests and issues linked to sessions (GitHub, GitLab, Linear) are not in this store. The server follows them (`packages/web/server/lib/tracked-items/`) and pushes changes over the OpenChamber event stream; `useTrackedItemsStore` holds what it sent, persisted for 12 h (at most 300 records, re-parsed on hydration, an older answer never replaces a newer one), keyed by runtime and item key. Surfaces declare what they show with `useTrackedItems` (`lib/trackedItems/interest.ts`), which sends the union only when it changes and again after a reconnect, and reads with `useTrackedPullVisualSummaries` / `useTrackedIssueStates` / `useTrackedLinearStates`. Pull and merge request badges go through `getLinkedChangeRequestVisualSummary`, the same colour rule as a branch's PR.
 - runtime reset disposes timers, watchers, API references, and request ownership while inert namespaced snapshots remain isolated
-- persisted cache is versioned, TTL-filtered, and bounded for page refresh continuity, not broad background syncing
+- auth and context requests are deduplicated per provider instance and reject completions from an older runtime generation
+- context failures preserve the last complete cached result instead of becoming authoritative empty data
+- persisted status cache is versioned, TTL-filtered, and bounded for page refresh continuity, not broad background syncing
+- status hydration accepts only entries carrying account, repository, and binding-revision authority; legacy entries cannot seed a bound request
+- hydration verifies every serialized key authority dimension against the embedded identity; a current-shaped mismatch is discarded rather than re-keyed
+- simultaneous bindings for one provider instance retain independent entries; bound selectors require the exact account, repository, revision, directory, branch, and primary remote
+- a successful missing or `needs-attention` binding read clears prior status for that directory and invalidates in-flight completion; a failed binding read preserves prior cache
 - a closed/merged PR is the branch's history, not live status: it is displayed and persisted, but never treated as authority
 - closed/merged associations use the same `5m` discovery cadence as missing PRs so a newer open PR (or authoritative `pr: null`) replaces them without a manual refresh
 - hydrate restores a persisted closed/merged PR but resets its `lastDiscoveryPollAt`, so revalidation runs on the first watcher tick after a reload
 - a successful refresh that returns `pr: null` replaces any previously cached PR authoritatively; a failed refresh keeps the previous one
+
+`useWalkthroughStore.ts` keys entries, model and language choices, active requests, and progress pollers by runtime plus the full walkthrough target. Working-tree and branch targets need only their Git source. A pull-request target also carries the immutable `SourceControlReadContext` that discovered it, so equal PR numbers under different accounts, repositories, bindings, or provider instances cannot share client state. The client sends that context on every PR walkthrough operation and rejects successful read or generation responses unless they echo the exact authority tuple. Runtime reset aborts active requests, stops pollers, and clears pending entry-point targets before the new endpoint can reuse them.
 
 ## Ownership Rules
 
@@ -443,7 +466,7 @@ Each of them therefore keeps two things:
 - a flat mirror (`agents`, `commands`, `skills`, `mcpServers`, `providers`) that
   tracks the **active** directory only.
 
-`config-store` hydrates provider catalogs only for the matching runtime. Since 1.x and 2.x used the same unversioned key, a cached list whose models lack 2.x variant arrays is discarded for its directory and marked unloaded; the active mirror is checked separately. Valid 2.x lists, other directories, agents, and saved model and effort selections remain available. A successful provider read replaces the discarded list.
+`config-store` hydrates provider catalogs only for the matching runtime, and only from blobs written before the selections-only format (persist version 1), which carry no catalogs and are never treated as incompatible. Since 1.x and 2.x used the same unversioned key, a cached list whose models lack 2.x variant arrays is discarded for its directory and marked unloaded; the active mirror is checked separately. Valid 2.x lists, other directories, agents, and saved model and effort selections remain available. A successful provider read replaces the discarded list.
 
 A project whose OpenCode config OpenCode rejects (`ConfigInvalidError` and the
 other `Config*Error` names) is recorded in `useConfigStore.projectConfigErrors`,
@@ -626,6 +649,9 @@ Expected model:
 
 - `PullRequestSection` is the only true live PR watcher
 - `SessionSidebar` may do one-shot bootstrap for expanded visible project/worktree groups if PR info is missing
+- sidebar bootstrap reads the authoritative repository binding for each demanded directory; missing and `needs-attention` bindings issue no status request
+- sidebar status keys include the bound account, repository, revision, provider instance, and primary remote, so rebinding cannot overwrite or reuse another authority's result
+- source-control status and detailed-context caches use soft count targets: watched or loading entries remain protected, and failed unique-context churn evicts older inactive entries instead of growing without bound
 - no live PR work for header
 - no background PR sweeps outside visible demand
 
