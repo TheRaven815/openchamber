@@ -10,6 +10,7 @@ import { toast } from '@/components/ui';
 import { Icon } from "@/components/icon/Icon";
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { cn } from '@/lib/utils';
+import { useWaitingBlink } from '@/hooks/useDurationTicker';
 import { isDesktopLocalOriginActive, isDesktopShell, openDesktopPath, openDesktopProjectInApp } from '@/lib/desktop';
 import { DEFAULT_OPEN_IN_APP_ID, OPEN_IN_APPS } from '@/lib/openInApps';
 import { useOpenInAppsStore, type OpenInAppOption } from '@/stores/useOpenInAppsStore';
@@ -60,7 +61,7 @@ const AppIcon = ({
     <span
       className={cn(
         'h-4 w-4 rounded-sm flex items-center justify-center',
-        'bg-[var(--surface-muted)] text-[9px] font-medium text-muted-foreground'
+        'bg-[var(--surface-muted)] text-[0.5625rem] font-medium text-muted-foreground'
       )}
     >
       {initial}
@@ -70,15 +71,15 @@ const AppIcon = ({
 
 type OpenInAppButtonProps = {
   directory: string;
-  className?: string;
 };
 
-export const OpenInAppButton = ({ directory, className }: OpenInAppButtonProps) => {
+const OpenInAppButtonComponent = ({ directory }: OpenInAppButtonProps) => {
   const { t } = useI18n();
   const selectedAppId = useOpenInAppsStore((state) => state.selectedAppId);
   const availableApps = useOpenInAppsStore((state) => state.availableApps);
   const isCacheStale = useOpenInAppsStore((state) => state.isCacheStale);
   const isScanning = useOpenInAppsStore((state) => state.isScanning);
+  const blink = useWaitingBlink(isScanning);
   const initialize = useOpenInAppsStore((state) => state.initialize);
   const loadInstalledApps = useOpenInAppsStore((state) => state.loadInstalledApps);
   const selectApp = useOpenInAppsStore((state) => state.selectApp);
@@ -100,11 +101,7 @@ export const OpenInAppButton = ({ directory, className }: OpenInAppButtonProps) 
     return withFallbackIcon(OPEN_IN_APPS[0]);
   }, [availableApps, selectedAppId]);
 
-  if (!isDesktopLocal || !directory) {
-    return null;
-  }
-
-  if (availableApps.length === 0) {
+  if (!isDesktopLocal || !directory || availableApps.length === 0) {
     return null;
   }
 
@@ -130,23 +127,19 @@ export const OpenInAppButton = ({ directory, className }: OpenInAppButtonProps) 
   };
 
   return (
-    <div
-        className={cn(
-          'app-region-no-drag inline-flex h-7 items-center self-center rounded-[9px] [corner-shape:squircle] supports-[corner-shape:squircle]:rounded-[50px]',
-          'bg-[var(--surface-elevated)] overflow-hidden',
-          'border border-border/60',
-          className
-        )}
-    >
+    <div className="inline-flex items-center text-muted-foreground">
       <button
         type="button"
         onClick={() => void handleOpen(selectedApp)}
         className={cn(
-          'inline-flex h-full items-center px-2.5 typography-ui-label font-medium',
-          'text-foreground hover:bg-interactive-hover transition-colors',
-          isScanning && 'animate-pulse'
+          // No hover fill: the work-status panel shows interactivity through the
+          // glyph, not blocks of colour.
+          'inline-flex size-6 items-center justify-center rounded-md opacity-85 transition-opacity hover:opacity-100',
+          'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--interactive-focus-ring)]',
+          blink
         )}
         aria-label={t('openInApp.actions.openInAria', { app: selectedApp.label })}
+        title={t('openInApp.actions.openInAria', { app: selectedApp.label })}
       >
         <AppIcon
           label={selectedApp.label}
@@ -158,17 +151,14 @@ export const OpenInAppButton = ({ directory, className }: OpenInAppButtonProps) 
         <DropdownMenuTrigger asChild>
           <button
             type="button"
-            className={cn(
-              'inline-flex h-full w-7 items-center justify-center',
-              'border-l border-[var(--interactive-border)] text-muted-foreground',
-              'hover:bg-interactive-hover hover:text-foreground transition-colors'
-            )}
+            className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--interactive-focus-ring)] data-[popup-open]:text-foreground"
             aria-label={t('openInApp.actions.chooseAppAria')}
           >
             <Icon name="arrow-down-s" className="h-4 w-4" />
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent
+          data-work-status-popup
           align="end"
           className="w-56 max-h-[70vh] overflow-y-auto"
         >
@@ -192,7 +182,7 @@ export const OpenInAppButton = ({ directory, className }: OpenInAppButtonProps) 
                 />
                 <span className="typography-ui-label text-foreground">{app.label}</span>
                 {selectedApp.id === app.id ? (
-                  <Icon name="check" className="ml-auto h-4 w-4 text-primary" />
+                  <Icon name="check" className="ms-auto h-4 w-4 text-primary" />
                 ) : null}
               </DropdownMenuItem>
             );
@@ -211,3 +201,7 @@ export const OpenInAppButton = ({ directory, className }: OpenInAppButtonProps) 
     </div>
   );
 };
+
+// Memoised: it sits in the work-status card, which re-renders on every streamed
+// message, and its only prop is the directory.
+export const OpenInAppButton = React.memo(OpenInAppButtonComponent);

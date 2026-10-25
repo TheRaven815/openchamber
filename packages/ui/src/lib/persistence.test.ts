@@ -148,6 +148,7 @@ const resetModelPrefsState = (): void => {
     collapsedModelProviders: [],
     recentModels: [],
     recentAgents: [],
+    favoriteAgents: [],
     recentEfforts: {},
   });
 };
@@ -560,7 +561,7 @@ describe('updateDesktopSettings', () => {
       projectDisplayMode: 'all',
       sidebarViewMode: 'projects',
       projectSortOrder: 'manual',
-      showRecentSection: true,
+      showChatsSection: true,
       singleProjectId: 'local-project',
     });
     registerSettingsApi(async () => ({}), async () => ({
@@ -568,7 +569,7 @@ describe('updateDesktopSettings', () => {
         sidebarProjectDisplayMode: 'single',
         sidebarViewMode: 'timeline',
         sidebarProjectSortOrder: 'recent',
-        sidebarShowRecentSection: false,
+        sidebarShowChatsSection: false,
         autoSaveEnabled: true,
         draftStartersCraftGoalAdded: true,
         draftStartersScheduleTaskAdded: true,
@@ -583,13 +584,13 @@ describe('updateDesktopSettings', () => {
       projectDisplayMode: state.projectDisplayMode,
       sidebarViewMode: state.sidebarViewMode,
       projectSortOrder: state.projectSortOrder,
-      showRecentSection: state.showRecentSection,
+      showChatsSection: state.showChatsSection,
       singleProjectId: state.singleProjectId,
     }).toEqual({
       projectDisplayMode: 'single',
       sidebarViewMode: 'timeline',
       projectSortOrder: 'recent',
-      showRecentSection: false,
+      showChatsSection: false,
       singleProjectId: 'local-project',
     });
   });
@@ -601,7 +602,7 @@ describe('updateDesktopSettings', () => {
       projectDisplayMode: 'single',
       sidebarViewMode: 'timeline',
       projectSortOrder: 'a-z',
-      showRecentSection: false,
+      showChatsSection: false,
     });
     registerSettingsApi(async (changes) => {
       saves.push(changes);
@@ -624,12 +625,12 @@ describe('updateDesktopSettings', () => {
       projectDisplayMode: state.projectDisplayMode,
       sidebarViewMode: state.sidebarViewMode,
       projectSortOrder: state.projectSortOrder,
-      showRecentSection: state.showRecentSection,
+      showChatsSection: state.showChatsSection,
     }).toEqual({
       projectDisplayMode: 'single',
       sidebarViewMode: 'timeline',
       projectSortOrder: 'a-z',
-      showRecentSection: false,
+      showChatsSection: false,
     });
   });
 
@@ -639,7 +640,7 @@ describe('updateDesktopSettings', () => {
       projectDisplayMode: 'single',
       sidebarViewMode: 'timeline',
       projectSortOrder: 'z-a',
-      showRecentSection: false,
+      showChatsSection: false,
     });
     registerSettingsApi(async () => ({}), async () => {
       throw new Error('offline');
@@ -652,12 +653,12 @@ describe('updateDesktopSettings', () => {
       projectDisplayMode: state.projectDisplayMode,
       sidebarViewMode: state.sidebarViewMode,
       projectSortOrder: state.projectSortOrder,
-      showRecentSection: state.showRecentSection,
+      showChatsSection: state.showChatsSection,
     }).toEqual({
       projectDisplayMode: 'single',
       sidebarViewMode: 'timeline',
       projectSortOrder: 'z-a',
-      showRecentSection: false,
+      showChatsSection: false,
     });
   });
 
@@ -866,6 +867,7 @@ describe('updateDesktopSettings', () => {
         collapsedModelProviders: ['openai'],
         recentModels: [{ providerID: 'google', modelID: 'gemini-pro' }],
         recentAgents: ['build'],
+        favoriteAgents: ['plan'],
         recentEfforts: { 'openai/gpt-5': ['low'] },
       });
 
@@ -878,6 +880,7 @@ describe('updateDesktopSettings', () => {
         collapsedModelProviders: ['openai'],
         recentModels: [{ providerID: 'google', modelID: 'gemini-pro' }],
         recentAgents: ['build'],
+        favoriteAgents: ['plan'],
         recentEfforts: { 'openai/gpt-5': ['low'] },
         customProviderIcons: {},
       });
@@ -905,6 +908,7 @@ describe('updateDesktopSettings', () => {
         collapsedModelProviders: [],
         recentModels: [],
         recentAgents: [],
+        favoriteAgents: [],
         recentEfforts: {},
         customProviderIcons: {},
       }]);
@@ -1509,6 +1513,7 @@ describe('unload lifecycle flush (#2197)', () => {
         collapsedModelProviders: [],
         recentModels: [],
         recentAgents: [],
+        favoriteAgents: [],
         recentEfforts: {},
         customProviderIcons: {},
       }]);

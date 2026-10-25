@@ -20,12 +20,14 @@ credentials, the provider dispatch and the token refresh. Routes live under
   Also caches the model list for 30 seconds — a generation needs the model's
   context and output limits, and a round trip per session title is the wrong
   trade. An unreachable OpenCode keeps the previous answer rather than
-  retracting it.
+  retracting it. An empty list is never cached: OpenCode 2 answers with one
+  while it starts, and caching it hid every provider from the pickers.
 - `index.js` — `generateSmallModelText()`, `describeSmallModel()`,
-  `listAuthenticatedProviders()`.
-- `routes.js` — `GET /api/small-model` (resolution preview) and
-  `POST /api/small-model/generate` (`{ prompt, system?, maxOutputTokens?,
-  model?, directory? }` → `{ text, providerID, modelID, source }`).
+  `listAuthenticatedProviders(directory?)`.
+- `routes.js` — `GET /api/small-model` (resolution preview, including the
+  thinking variant) and `POST /api/small-model/generate` (`{ prompt, system?,
+  maxOutputTokens?, model?, directory? }` → `{ text, providerID, modelID,
+  source }`).
 - `runtime-providers.js` — compatibility re-export so `server/index.js` keeps
   resolving its import. Delete it once that import points at `client.js`.
 
@@ -55,17 +57,21 @@ login `generateSmallModelText` throws `404`. What happens next is per feature:
 
 Five things are decided here, in order:
 
-1. An explicit `model` on the request (`provider/model`) — `source: 'request'`.
+1. An explicit `model` on the request (`provider/model`), with the thinking
+   level the caller names beside it (`variant` for `generateSmallModelText`,
+   `overrideVariant` for `describeSmallModel`) — `source: 'request'`.
 2. OpenChamber's settings override (Settings → Sessions → Small Model): when
-   `smallModelUseDefault` is `false`, `smallModelOverride` wins —
+   `smallModelUseDefault` is `false`, `smallModelOverride` wins and
+   `smallModelVariant` names the thinking level beside it —
    `source: 'settings'`.
 3. The small model configured for OpenCode itself — `source: 'config'`. OpenCode
    2 has no `small_model` key of its own: it migrates the v1 `small_model` onto
    its hidden `title` agent, whose native form is `agents.title.model`, and
    its session titles run on that model before any family scan.
-   `getConfiguredSmallModelRef` reads it from `GET /api/agent/title` in the
-   caller's directory, so OpenCode's own merge of global, project and
-   `OPENCODE_CONFIG` layers decides it; nothing here parses config files.
+   `getConfiguredSmallModelRef` reads the model and its variant from
+   `GET /api/agent/title` in the caller's directory, so OpenCode's own merge of
+   global, project and `OPENCODE_CONFIG` layers decides it; nothing here parses
+   config files.
    Read on every call, never cached: OpenCode watches its config, so an edit
    applies without a restart. A cold location can answer 404 for a few
    seconds while its agents load; that call falls through to step 4 and the
@@ -73,8 +79,7 @@ Five things are decided here, in order:
    behind it is gone) is skipped the same way, as OpenCode's own titles move
    on to another model then; one it does not list yet (a plugin model still
    loading) is kept. Like the settings override, it is a choice the
-   user made on purpose, so a caller restricted to its session's provider
-   accepts it.
+   user made on purpose, so it may leave the caller's provider.
 4. The small model of the caller's provider (`preferredProviderID`: the
    session's, or the composer's for commit messages, PR descriptions, spoken
    summaries, the diff walkthrough and extensions) —
@@ -87,13 +92,19 @@ Five things are decided here, in order:
    models.dev `family` values, not model ids (`gpt-luna` is the family of
    `gpt-5.6-luna`); a model without one — a custom provider, a subscription
    outside the catalog — gets its family read from its id (`familyOf`:
-   luna / flash-lite / flash / haiku). A caller that passes `restrictToPreferredProvider`
-   (session titles, the session goal, session assist, notes from a selection)
-   and finds none then takes the session's own model — `source:
+   luna / flash-lite / flash / haiku). A provider with none of these families
+   takes the caller's own model (`preferredModelID`) — `source:
    'session-model'`: costlier than a small model elsewhere, but never another
-   provider's subscription.
+   provider's subscription. OpenCode's titles end the same way.
 5. Otherwise `GET /api/model/default` — `source: 'default'`. This is
-   OpenCode's default chat model, not a small one; it is the last resort.
+   OpenCode's default chat model, not a small one; it is the last resort, and
+   only for a caller that named no provider or whose provider it is on. With
+   no default configured OpenCode answers its first available model from any
+   provider, so a caller that named a provider and no model gets 404 rather
+   than that. Until 2026-10 only callers passing `restrictToPreferredProvider`
+   stayed on their provider; commit messages, PR descriptions, spoken
+   summaries, the walkthrough and extensions fell to the default. Current
+   servers ignore the flag; the UI still sends it for older ones.
 
 There is deliberately no step that takes a small model from whichever other
 provider is connected. Until 2026-09 one existed (`source: 'small'`, after
@@ -102,6 +113,23 @@ them, and the walkthrough and extensions reached it without even passing
 their provider. Content goes only to the provider the user works with, the
 model they picked, the small model they set for OpenCode, or the default they
 configured.
+
+## Thinking variants
+
+The settings override and OpenCode's `title` agent can each name a thinking
+variant. It travels as the model's `variant` on `/api/experimental/generate`.
+The variant is kept when the catalog does not know the model, because a
+discovery gap is not evidence against the choice. When the catalog knows the
+model, the variant must be listed; a missing or malformed variant list counts as
+no levels. A variant the model does not list is dropped and the call runs at the
+model default, the same rule session defaults apply
+(`../openchamber-sessions/routes.js`, `resolveVariant`).
+
+`smallModelVariant` is a sibling of `smallModelOverride`. A
+`provider/model#variant` string would look like part of the model id to a build
+that predates the field, so rollback would break instead of falling back to the
+model default. The pair also matches `defaultModel` and `defaultVariant`, and
+lets the Settings UI clear the effort when the model changes.
 
 Claude Code (`claude-code`, from the opencode-claude plugin) is a provider
 like any other: its generate path runs a clean one-shot turn with no tools and
@@ -136,9 +164,18 @@ what generation will do. It may be a **function** of
 as the resolved model allows — they cannot name a number before knowing which
 model they got. The resolved value comes back as `outputTokens`.
 
-`timeoutMs` overrides the 60s default; `signal` aborts a request that is no
-longer wanted. The timeout covers generation, retry waits and structured-output
-retries together.
+Without `timeoutMs`, the deadline derives from the prompt the module actually
+sends: 60 s base plus 40 ms per estimated token (~4 chars/token, the input-clamp
+heuristic), capped at 900 s — the walkthrough ceiling. An explicit `timeoutMs`
+still wins (the walkthrough passes its own per-hunk budget); `signal` aborts a
+request that is no longer wanted. The timeout covers generation, retry waits and
+structured-output retries together. The deadline is a hang guard, not a
+pace-setter: prefill dominates, and issue #5017 measured local-model prefill at
+94-187 tok/s on 4 GB-VRAM hardware (~10.6 ms/token worst observed), so 40 ms/token
+is ~4x headroom that also absorbs the answer decode and one structured-output
+retry. A blown deadline (not caller cancellation) throws `504` with
+`code: 'generation-timeout'`, naming the model and the budget; the route maps it
+to that message instead of the generic "choose another model" text.
 
 OpenCode 2 can reject an explicit model before its cold catalog finishes loading;
 plugin-provided models (Claude Code) stay unavailable for 20-40 s after OpenCode
@@ -167,23 +204,37 @@ capability is not knowable before the call, and callers must read `null` as
 
 ## Which providers the pickers may offer
 
-`listAuthenticatedProviders()` answers one question for the Small Model and
+`listAuthenticatedProviders(directory)` answers one question for the Small Model and
 Changes Walkthrough pickers: which providers OpenCode can call right now. A
 provider counts when it has at least one enabled model in `GET /api/model` —
-the same test OpenCode applies before letting a chat turn use it.
+the same test OpenCode applies before letting a chat turn use it. The model
+list is directory-scoped, so `directory` scopes this answer the same way
+`describeSmallModel` scopes its own; without one the server default applies,
+and a default directory with no model config would report no providers for
+models that work perfectly in the user's project.
 
 `GET /api/provider` only contributes names. It comes back empty on setups where
 models are perfectly usable, so an empty provider list is never read as "no
 providers". Claude Code is removed from the result for the reason above.
 
-The field is served as `authenticatedProviders` on `GET /api/small-model`. The
-name predates this resolution; it now means "callable".
+The field is served as `authenticatedProviders` on `GET /api/small-model`, and
+the route forwards its `?directory=` query to both halves of the answer. The
+Settings pickers send the current directory with the request, so the list
+matches what the user sees in chat for that project. The name predates this
+resolution; it now means "callable".
 
 ## describeSmallModel
 
-Reports which model would be used without calling it: `providerID`, `modelID`,
-`source`, plus `inputCharBudget`, `contextTokens`, `contextKnown`,
-`outputTokens`, `outputTokenLimit`, `structuredOutput` and `hasLogin`.
+Reports which model and thinking variant would be used without calling it:
+`providerID`, `modelID`, optional `variant`, `source`, plus `inputCharBudget`,
+`contextTokens`, `contextKnown`, `outputTokens`, `outputTokenLimit`,
+`structuredOutput`, `hasLogin` and `localEndpoint`.
+
+`localEndpoint` is `true` when the model's `settings.baseURL` (as OpenCode
+reports it on `GET /api/model`) points at loopback, a private or CGNAT
+(Tailscale) address, or a LAN-style host name: single-label, `.local`, `.lan`,
+`.internal`, `.home.arpa`, `.localhost`. A model without an endpoint is not
+local. Session assist uses it to keep background calls off a local chat model.
 
 `hasLogin` is `false` when OpenCode lists the model as disabled — a settings
 override can name a model there is no credential for, and the walkthrough

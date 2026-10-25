@@ -1,7 +1,20 @@
-import type { GitRemote, PageResult, SourceControlAuthAccount, SourceControlBindingRead, SourceControlIdentity, SourceControlProvider, SourceControlReadContext } from '@/lib/api/types';
+import type { SourceControlProviderDescriptor } from './providers/descriptor';
+import type { GitRemote, PageResult, SourceControlAuthAccount, SourceControlBindingRead, SourceControlIdentity, SourceControlReadContext } from '@/lib/api/types';
 
+/** github.com, for the one path that is GitHub's own: the github.com device flow and its legacy auth wire. */
 export const GITHUB_SOURCE_CONTROL_IDENTITY: SourceControlIdentity = { provider: 'github', instance: 'github.com' };
-const GITLAB_SOURCE_CONTROL_IDENTITY: SourceControlIdentity = { provider: 'gitlab', instance: 'https://gitlab.com' };
+
+/**
+ * Each provider's default instance (github.com, https://gitlab.com): the
+ * instances a remote is recognised on whether or not an account there is
+ * connected. Pass them with the connected instances to the resolvers below.
+ */
+export const defaultSourceControlIdentities = (descriptors: readonly SourceControlProviderDescriptor[]): SourceControlIdentity[] => (
+  descriptors.flatMap((descriptor) => {
+    const instance = descriptor.instances.defaultInstance;
+    return instance ? [{ provider: descriptor.id, instance }] : [];
+  })
+);
 
 const getRemoteAuthority = (remote: GitRemote | null | undefined): string | null => {
   const value = remote?.pushUrl?.trim() || remote?.fetchUrl?.trim();
@@ -22,7 +35,7 @@ const getIdentityAuthority = (identity: SourceControlIdentity): string => {
   }
 };
 
-export type SourceControlTarget = {
+type SourceControlTarget = {
   identity: SourceControlIdentity;
   remote: GitRemote;
 };
@@ -41,7 +54,8 @@ export const getBoundSourceControlReadContexts = (
   result: SourceControlBindingRead,
   directory: string,
   activeAccountFor: (identity: SourceControlIdentity) => string | null = () => null,
-  knownIdentities: SourceControlIdentity[] = [],
+  /** The instances remotes are recognised on: connected ones and each provider's default instance. */
+  knownIdentities: readonly SourceControlIdentity[] = [],
 ): SourceControlReadContext[] => {
   const contexts: SourceControlReadContext[] = (result.binding?.providers ?? []).filter((provider) => provider.readiness === 'ready'
     && provider.endpoint?.fingerprint === result.repository.remotes.find((remote) => remote.name === provider.primaryRemote)?.fetch.fingerprint
@@ -100,7 +114,7 @@ export const hasSameSourceControlReadContext = (
   && left.directory === right.directory
   && left.primaryRemote === right.primaryRemote;
 
-export const appendMissingSourceControlItems = <T extends { number: number; project: { id: string } }>(
+const appendMissingSourceControlItems = <T extends { number: number; project: { id: string } }>(
   items: T[],
   candidates: T[],
 ): T[] => {
@@ -120,16 +134,20 @@ export const mergeIncompleteSourceControlPage = <T extends { number: number; pro
   );
 };
 
+/**
+ * The one provider instance the remotes point at, or null when none or several
+ * do. `identities` are the instances to recognise: the connected ones and each
+ * provider's default instance (`defaultSourceControlIdentities`).
+ */
 export const resolveSourceControlTarget = (
   remotes: GitRemote[],
-  identities: SourceControlIdentity[],
+  identities: readonly SourceControlIdentity[],
 ): SourceControlTarget | null => {
-  const knownIdentities = [GITHUB_SOURCE_CONTROL_IDENTITY, GITLAB_SOURCE_CONTROL_IDENTITY, ...identities];
   const targets: SourceControlTarget[] = [];
   for (const remote of remotes) {
     const authority = getRemoteAuthority(remote);
     if (!authority) continue;
-    const identity = knownIdentities.find((candidate) => getIdentityAuthority(candidate) === authority);
+    const identity = identities.find((candidate) => getIdentityAuthority(candidate) === authority);
     if (identity) targets.push({ identity, remote });
   }
   return targets.length === 1 ? targets[0] : null;
@@ -137,24 +155,14 @@ export const resolveSourceControlTarget = (
 
 export const resolveSourceControlIdentity = (
   remote: GitRemote | null | undefined,
-  identities: SourceControlIdentity[],
+  identities: readonly SourceControlIdentity[],
 ): SourceControlIdentity | null => remote
   ? resolveSourceControlTarget([remote], identities)?.identity ?? null
   : null;
 
-export const getSourceControlBaseUrl = (identity: SourceControlIdentity): string => (
+export const getSourceControlBaseUrl = (identity: Pick<SourceControlIdentity, 'instance'>): string => (
   identity.instance.includes('://') ? identity.instance : `https://${identity.instance}`
 );
-
-export const getSourceControlProviderLabel = (provider: SourceControlProvider): 'GitHub' | 'GitLab' =>
-  provider === 'github' ? 'GitHub' : 'GitLab';
-
-/** GitLab addresses merge requests as `!N`; GitHub addresses pull requests as `#N`. */
-export const getChangeRequestReferencePrefix = (provider: SourceControlProvider): '#' | '!' =>
-  provider === 'gitlab' ? '!' : '#';
-
-export const formatChangeRequestReference = (provider: SourceControlProvider | null | undefined, number: number): string =>
-  `${provider ? getChangeRequestReferencePrefix(provider) : '#'}${number}`;
 
 /**
  * One label shape for every account picker: provider @user · instance · source.
@@ -165,20 +173,16 @@ export const formatChangeRequestReference = (provider: SourceControlProvider | n
  */
 const formatSourceControlAccountLabel = (
   identity: SourceControlIdentity,
+  providerLabel: string,
   account: { user: { username: string } },
   sourceLabel: string,
-): string => `${getSourceControlProviderLabel(identity.provider)} @${account.user.username} · ${identity.instance} · ${sourceLabel}`;
+): string => `${providerLabel} @${account.user.username} · ${identity.instance} · ${sourceLabel}`;
 
-type ManagedCredentialSourceLabelKey =
-  | 'settings.github.page.accountSource.oauth'
-  | 'settings.github.page.accountSource.cli'
-  | 'settings.gitlab.token.label';
+type ManagedCredentialSource = 'oauth' | 'pat' | 'cli';
 
-export const getManagedCredentialSourceLabelKey = (source: 'oauth' | 'pat' | 'cli'): ManagedCredentialSourceLabelKey => (
-  source === 'oauth' ? 'settings.github.page.accountSource.oauth'
-    : source === 'cli' ? 'settings.github.page.accountSource.cli'
-      : 'settings.gitlab.token.label'
-);
+export const getManagedCredentialSourceLabelKey = (
+  source: ManagedCredentialSource,
+): `settings.sourceControl.accountSource.${ManagedCredentialSource}` => `settings.sourceControl.accountSource.${source}`;
 
 /**
  * The host a git remote points at, for `https://host/owner/repo.git` and for
@@ -349,28 +353,63 @@ type ManagedAccountOption = {
 };
 
 /**
- * Selectable managed HTTPS credential accounts: one per person.
+ * Whether an identity can answer with this account.
+ *
+ * The server uses a provider's CLI login for Git transport only where the
+ * provider says so (`auth.cliTransport`: the gh CLI), and only while it is the
+ * active account in Integrations, so such an account counts only while it is
+ * current. Any other CLI login never does: Git transport reads only the
+ * credentials OpenChamber stores (the glab login).
+ */
+export const accountUsableByIdentity = (
+  account: Pick<SourceControlAuthAccount, 'source' | 'current'>,
+  cliTransport: boolean,
+): boolean => account.source !== 'cli' || (cliTransport && account.current);
+
+/**
+ * Why an identity's account cannot be used, for its Git Settings row: it names
+ * a CLI login usable for transport (`github.com#cli:<user id>`) while no CLI
+ * account is in use, so switching to it in Integrations fixes it; otherwise
+ * the account is gone. A CLI login in use as another person is gone too, since
+ * switching cannot help.
+ */
+export const unavailableAccountReason = (
+  account: SourceControlIdentity & { accountId: string },
+  listedAccounts: Pick<SourceControlAuthAccount, 'source' | 'current'>[] | null,
+  cliTransport: boolean,
+): 'cli-not-in-use' | 'gone' => cliTransport
+  && account.accountId.includes('#cli:')
+  && !listedAccounts?.some((listed) => listed.source === 'cli' && listed.current)
+  ? 'cli-not-in-use'
+  : 'gone';
+
+/**
+ * Selectable managed HTTPS credential accounts: one per person and source.
  *
  * Re-authenticating keeps the credential it replaces, so one account can hold
  * several. Offering each of them separately asks a question nobody can answer
  * — they carry the same name — so the current credential represents the
  * person, and the others stay valid for identities that already name them.
+ * The gh CLI login of the same person is a different credential with its own
+ * source label, so it stays a separate option.
  */
 export const buildManagedAccountOptions = (
   identity: SourceControlIdentity,
+  descriptor: Pick<SourceControlProviderDescriptor, 'label' | 'auth'>,
   accounts: SourceControlAuthAccount[],
   sourceLabel: (account: SourceControlAuthAccount) => string,
 ): ManagedAccountOption[] => {
-  const byProviderUser = new Map<string, SourceControlAuthAccount>();
+  const byPerson = new Map<string, SourceControlAuthAccount>();
   for (const account of accounts) {
-    if (account.status !== 'valid' || account.source === 'cli') continue;
-    const existing = byProviderUser.get(account.providerUserId);
-    if (!existing || (account.current && !existing.current)) byProviderUser.set(account.providerUserId, account);
+    if (account.status !== 'valid' || !accountUsableByIdentity(account, descriptor.auth.cliTransport)) continue;
+    const key = `${account.source === 'cli' ? 'cli' : 'stored'}:${account.providerUserId}`;
+    const existing = byPerson.get(key);
+    if (!existing || (account.current && !existing.current)) byPerson.set(key, account);
   }
-  return [...byProviderUser.values()].map((account) => ({
+  return [...byPerson.values()].map((account) => ({
     key: JSON.stringify([identity.provider, identity.instance, account.id]),
     reference: { ...identity, accountId: account.id },
-    label: formatSourceControlAccountLabel(identity, account, sourceLabel(account)),
+    label: formatSourceControlAccountLabel(identity, descriptor.label, account, sourceLabel(account)),
     source: account.source,
   }));
 };

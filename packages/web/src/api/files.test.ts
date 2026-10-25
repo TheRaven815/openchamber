@@ -3,9 +3,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { RuntimeUrlQuery, RuntimeUrlResolver } from '@openchamber/ui/lib/runtime-url';
 
 const runtimeFetchMock = vi.fn();
+const searchFilesMock = vi.fn();
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.clearAllMocks();
 });
 
 vi.mock('@openchamber/ui/lib/runtime-fetch', () => ({
@@ -30,6 +32,28 @@ const urls: RuntimeUrlResolver = {
 };
 
 describe('createWebFilesAPI', () => {
+  it('sends a request for a path inside a space to that space, whichever folder is open', async () => {
+    const { createWebFilesAPI } = await import('./files');
+    let open = '/repo';
+    const api = createWebFilesAPI({ urls, getDirectory: () => open });
+    const directoryOfCall = (index: number) => runtimeFetchMock.mock.calls[index]?.[1]?.headers?.['x-opencode-directory'];
+    runtimeFetchMock.mockReset();
+    runtimeFetchMock.mockImplementation(async () => Response.json({ path: '/x', entries: [] }));
+
+    // A draft waiting for a space stands on the project's folder and lists the space.
+    await api.listDirectory('/spaces/a1b2c3d4e5f6/repo');
+    await api.createDirectory('/spaces/a1b2c3d4e5f6/repo/src');
+    // A host path keeps the open folder, and a space's own folder keeps itself.
+    await api.listDirectory('/repo/src');
+    open = '/spaces/a1b2c3d4e5f6/repo';
+    await api.listDirectory('/spaces/a1b2c3d4e5f6/repo/src');
+
+    expect([0, 1, 2, 3].map(directoryOfCall)).toEqual([
+      '/spaces/a1b2c3d4e5f6', '/spaces/a1b2c3d4e5f6', '/repo', '/spaces/a1b2c3d4e5f6/repo',
+    ]);
+    runtimeFetchMock.mockReset();
+  });
+
   it('preserves the directory permission failure contract', async () => {
     const { createWebFilesAPI } = await import('./files');
     const api = createWebFilesAPI({ urls, getDirectory: () => '/workspace' });
@@ -56,6 +80,23 @@ describe('createWebFilesAPI', () => {
     await expect(api.listDirectory('/workspace')).rejects.toMatchObject({
       reason: 'invalid-response',
     });
+  });
+
+  it('forwards respectGitignore only when the caller asks for it', async () => {
+    const { createWebFilesAPI } = await import('./files');
+    const api = createWebFilesAPI({ urls, getDirectory: () => '/workspace' });
+
+    runtimeFetchMock.mockResolvedValueOnce(Response.json({ path: '/workspace', entries: [] }));
+    await api.listDirectory('/workspace', { respectGitignore: true });
+    expect(runtimeFetchMock).toHaveBeenLastCalledWith('/api/fs/list', expect.objectContaining({
+      query: new URLSearchParams({ path: '/workspace', respectGitignore: 'true' }),
+    }));
+
+    runtimeFetchMock.mockResolvedValueOnce(Response.json({ path: '/workspace', entries: [] }));
+    await api.listDirectory('/workspace');
+    expect(runtimeFetchMock).toHaveBeenLastCalledWith('/api/fs/list', expect.objectContaining({
+      query: new URLSearchParams({ path: '/workspace' }),
+    }));
   });
 
   it('uses per-call workspace directory for stat and read requests', async () => {
@@ -100,8 +141,24 @@ describe('createWebFilesAPI', () => {
     await expect(api.downloadFile?.('/current-workspace/file.txt')).rejects.toThrow('Download failed');
 
     expect(runtimeFetchMock).toHaveBeenLastCalledWith('/api/fs/raw', {
-      query: { path: '/current-workspace/file.txt', download: true },
+      query: new URLSearchParams({ path: '/current-workspace/file.txt', download: 'true' }),
       headers: { 'x-opencode-directory': '/current-workspace' },
+    });
+  });
+
+  it('forwards allowOutsideWorkspace for a download of an outside file', async () => {
+    const { createWebFilesAPI } = await import('./files');
+    const api = createWebFilesAPI({ urls, getDirectory: () => '/workspace' });
+
+    // The request is sent before the response is inspected, so a failed status
+    // still proves the query the client built.
+    runtimeFetchMock.mockResolvedValueOnce(new Response('', { status: 500 }));
+    await expect(api.downloadFile?.('/tmp/model.obj', { allowOutsideWorkspace: true, directory: '/workspace' }))
+      .rejects.toThrow('Download failed');
+
+    expect(runtimeFetchMock).toHaveBeenLastCalledWith('/api/fs/raw', {
+      query: new URLSearchParams({ path: '/tmp/model.obj', download: 'true', allowOutsideWorkspace: 'true' }),
+      headers: { 'x-opencode-directory': '/workspace' },
     });
   });
 
@@ -173,6 +230,20 @@ describe('createWebFilesAPI', () => {
     });
   });
 
+  it('reports a rename onto an existing name as a conflict', async () => {
+    const { createWebFilesAPI } = await import('./files');
+    const api = createWebFilesAPI({ urls, getDirectory: () => '/workspace' });
+    runtimeFetchMock.mockResolvedValueOnce(Response.json(
+      { error: 'Destination already exists', reason: 'already-exists' },
+      { status: 409 },
+    ));
+
+    await expect(api.rename?.('/workspace/src/a.ts', '/workspace/lib/a.ts')).rejects.toMatchObject({
+      reason: 'already-exists',
+      status: 409,
+    });
+  });
+
   it('opens the native share sheet for downloads in the Capacitor app', async () => {
     const { createWebFilesAPI } = await import('./files');
     const api = createWebFilesAPI({ urls, getDirectory: () => '/workspace' });
@@ -206,5 +277,99 @@ describe('createWebFilesAPI', () => {
 
     expect(registerPlugin).toHaveBeenCalledWith('FileShare');
     expect(share).toHaveBeenCalledWith({ fileName: 'hello.txt', mimeType: 'text/plain', data: btoa('hello') });
+  });
+
+  it('delegates file search to file.find and maps hits', async () => {
+    const { createWebFilesAPI } = await import('./files');
+    const api = createWebFilesAPI({ urls, getDirectory: () => '/workspace', searchFiles: searchFilesMock });
+    searchFilesMock.mockResolvedValueOnce([
+      { name: 'package.json', path: '/workspace/package.json', relativePath: 'package.json' },
+    ]);
+
+    const results = await api.search({ directory: '/workspace', query: 'package', maxResults: 40 });
+
+    expect(searchFilesMock).toHaveBeenCalledWith('package', {
+      directory: '/workspace',
+      limit: 40,
+      type: 'file',
+    });
+    expect(results).toEqual([{ path: '/workspace/package.json', preview: ['package.json'] }]);
+  });
+
+  it('propagates search failures instead of returning empty', async () => {
+    const { createWebFilesAPI } = await import('./files');
+    const api = createWebFilesAPI({ urls, getDirectory: () => '/workspace', searchFiles: searchFilesMock });
+    searchFilesMock.mockRejectedValueOnce(new Error('gone'));
+
+    await expect(api.search({ directory: '/workspace', query: 'package' })).rejects.toThrow('gone');
+    expect(searchFilesMock).toHaveBeenCalledWith('package', {
+      directory: '/workspace',
+      limit: undefined,
+      type: 'file',
+    });
+  });
+});
+
+describe('createWebFilesAPI.searchContents', () => {
+  const request = () => {
+    const [url, init] = runtimeFetchMock.mock.calls.at(-1) ?? [];
+    return { url, init };
+  };
+
+  it('sends the search as the server expects and parses the matches', async () => {
+    const { createWebFilesAPI } = await import('./files');
+    const api = createWebFilesAPI({ urls, getDirectory: () => '/elsewhere' });
+    runtimeFetchMock.mockResolvedValueOnce(Response.json({
+      matches: [{ path: 'C:\\repo\\src\\a.ts', relativePath: 'src/a.ts', line: 3, column: 7, text: 'const needle', ranges: [[6, 12]], cutStart: false }],
+      stopped: 'limit',
+    }));
+    const abort = new AbortController();
+
+    const outcome = await api.searchContents!({
+      directory: '/repo', query: 'needle', regex: true, limit: 50, includeHidden: true, respectGitignore: false, signal: abort.signal,
+    });
+
+    const { url, init } = request();
+    expect(url).toBe('/api/fs/find-in-files');
+    expect(Object.fromEntries(init.query)).toEqual({ query: 'needle', regex: 'true', limit: '50', includeHidden: 'true', respectGitignore: 'false' });
+    expect(init.headers).toEqual({ 'x-opencode-directory': '/repo' });
+    expect(init.signal).toBe(abort.signal);
+    expect(outcome).toEqual({
+      status: 'ok',
+      stopped: 'limit',
+      matches: [{ path: 'C:/repo/src/a.ts', relativePath: 'src/a.ts', line: 3, column: 7, text: 'const needle', ranges: [[6, 12]], cutStart: false }],
+    });
+  });
+
+  it('leaves default options out of the query', async () => {
+    const { createWebFilesAPI } = await import('./files');
+    const api = createWebFilesAPI({ urls, getDirectory: () => '/repo' });
+    runtimeFetchMock.mockResolvedValueOnce(Response.json({ matches: [], stopped: null }));
+
+    await api.searchContents!({ directory: '/repo', query: 'needle', regex: false });
+
+    expect(Object.fromEntries(request().init.query)).toEqual({ query: 'needle', regex: 'false' });
+  });
+
+  it('turns the server’s unavailable and invalid-pattern answers into outcomes', async () => {
+    const { createWebFilesAPI } = await import('./files');
+    const api = createWebFilesAPI({ urls, getDirectory: () => '/repo' });
+
+    runtimeFetchMock.mockResolvedValueOnce(Response.json({ error: 'no ripgrep', reason: 'search-unavailable' }, { status: 501 }));
+    expect(await api.searchContents!({ directory: '/repo', query: 'x', regex: false })).toEqual({ status: 'unavailable' });
+
+    runtimeFetchMock.mockResolvedValueOnce(Response.json({ error: 'unclosed group', reason: 'invalid-pattern' }, { status: 400 }));
+    expect(await api.searchContents!({ directory: '/repo', query: '(', regex: true })).toEqual({ status: 'invalid-pattern', message: 'unclosed group' });
+  });
+
+  it('rejects other failures and malformed successes instead of answering no matches', async () => {
+    const { createWebFilesAPI } = await import('./files');
+    const api = createWebFilesAPI({ urls, getDirectory: () => '/repo' });
+
+    runtimeFetchMock.mockResolvedValueOnce(Response.json({ error: 'ripgrep exited with code 2', reason: 'search-failed' }, { status: 500 }));
+    await expect(api.searchContents!({ directory: '/repo', query: 'x', regex: false })).rejects.toMatchObject({ message: 'ripgrep exited with code 2', status: 500 });
+
+    runtimeFetchMock.mockResolvedValueOnce(Response.json({ matches: [{ path: '/a' }] }));
+    await expect(api.searchContents!({ directory: '/repo', query: 'x', regex: false })).rejects.toMatchObject({ reason: 'invalid-response' });
   });
 });

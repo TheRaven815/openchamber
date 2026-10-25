@@ -1,5 +1,5 @@
-// The project's worktree setup commands, run inside a space after its code arrived (DESIGN.md,
-// "Code in and out"; STAGES.md, stage 5d-4). They are the commands OpenChamber runs for a new
+// The project's worktree setup commands, run inside a space after its code arrived (see "Setup
+// commands" in DOCUMENTATION.md). They are the commands OpenChamber runs for a new
 // worktree on the host, chosen by the client the same way, the shared ones only after the user
 // trusted them; here they run in the space, as the space user, one after the other, and stop at
 // the first that fails, as the host's `&&` chain does.
@@ -52,7 +52,7 @@ const substituteProjectPath = (command, projectPath) => command
 // Whole sequences first: operating-system commands with their text, such as a link, up to their
 // end; colour and cursor sequences; any other escape. Then every control character but a tab and a
 // line break, the one-byte controls of the C1 range, and the marks that turn text direction.
-// eslint-disable-next-line no-control-regex
+// oxlint-disable-next-line no-control-regex
 const TERMINAL_SEQUENCE = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?|\u001b\[[0-?]*[ -/]*[@-~]|\u001b[@-_]?|[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g;
 
 /**

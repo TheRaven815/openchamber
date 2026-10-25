@@ -1,3 +1,4 @@
+import { isString } from '../shared/guards.js';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -5,19 +6,24 @@ import { createCallbackAddress } from '../agent-tool/callback-address.js';
 import { parseGitCredentialQuery } from './credential-broker.js';
 import { parseGitCredentialReference } from './credential-resolver.js';
 import { helperShellCommand } from './helper-launch.js';
+import { isLoopbackHost } from './loopback-http.js';
 
 const HELPER_PATH = fileURLToPath(new URL('./repository-credential-helper.js', import.meta.url));
 const MAX_QUERY_BYTES = 64 * 1024;
 const NONE = Object.freeze({ mode: 'none' });
 const SYSTEM = Object.freeze({ mode: 'system' });
 
-const isString = (value) => Object.prototype.toString.call(value) === '[object String]';
-
-/** The origin a redacted remote URL points at, or null when it is not HTTPS. */
-const httpsOrigin = (displayUrl) => {
+/**
+ * The origin a redacted remote URL points at: HTTPS, or plain HTTP on a
+ * loopback host (a provider's local development instance; the credential
+ * resolver then answers only when that loopback origin is the credential's
+ * own provider instance and the provider allows loopback HTTP, the rule
+ * every managed transfer follows). Null for anything else.
+ */
+const transferOrigin = (displayUrl) => {
   try {
     const url = new URL(displayUrl);
-    return url.protocol === 'https:' ? url.origin : null;
+    return url.protocol === 'https:' || (url.protocol === 'http:' && isLoopbackHost(url.hostname)) ? url.origin : null;
   } catch {
     return null;
   }
@@ -26,8 +32,8 @@ const httpsOrigin = (displayUrl) => {
 const queryOrigin = (query) => {
   const protocol = isString(query.protocol) ? query.protocol : '';
   const host = isString(query.host) ? query.host : '';
-  if (protocol !== 'https' || !host) return null;
-  return httpsOrigin(`https://${host}`);
+  if (!['https', 'http'].includes(protocol) || !host) return null;
+  return transferOrigin(`${protocol}://${host}`);
 };
 
 /** A repository path without its slashes or `.git`, so `o/r` and `/o/r.git` compare equal. */
@@ -65,7 +71,7 @@ const grantForEndpoint = (read, origin, queryPath) => {
   const matches = [];
   for (const grant of read.binding?.remotes ?? []) {
     const urls = [grant.fetch.displayUrl, grant.push.displayUrl]
-      .filter((url) => httpsOrigin(url) === origin && (!queryPath || pathMatches(queryPath, url)));
+      .filter((url) => transferOrigin(url) === origin && (!queryPath || pathMatches(queryPath, url)));
     if (urls.length === 0) continue;
     const remote = current.get(grant.name);
     const vouched = remote && grant.readiness === 'ready'
@@ -90,10 +96,11 @@ const grantForEndpoint = (read, origin, queryPath) => {
  */
 const credentialEndpoint = (endpointUrl) => {
   const url = new URL(endpointUrl);
+  const protocol = url.protocol === 'http:' ? 'http' : 'https';
   return {
-    protocol: 'https',
+    protocol,
     host: url.hostname.toLowerCase(),
-    port: Number(url.port || 443),
+    port: Number(url.port || (protocol === 'http' ? 80 : 443)),
     path: url.pathname,
   };
 };
@@ -122,6 +129,7 @@ export function createGitRepositoryCredentialRuntime({
   getActivePort,
   getActiveHost = () => null,
   helperPath = HELPER_PATH,
+  helperLaunch,
   randomBytes = crypto.randomBytes,
 }) {
   if (!(readBinding instanceof Function) || !credentialResolver || !isString(dataDir)
@@ -205,7 +213,9 @@ export function createGitRepositoryCredentialRuntime({
       activeSecret = randomBytes(32).toString('base64url');
       const url = `http://${callbackHost()}:${port}/api/git/repository-credential`;
       await writePrivate(endpointFilePath, `${JSON.stringify({ version: 1, url, secret: activeSecret })}\n`, 0o600);
-      const script = `#!/bin/sh\nexec ${helperShellCommand(path.resolve(helperPath), [endpointFilePath])} "$@"\n`;
+      // No `exec`: under Electron the command starts with a variable
+      // assignment, which `exec` would take for the program to run.
+      const script = `#!/bin/sh\n${helperShellCommand(path.resolve(helperPath), [endpointFilePath], helperLaunch)} "$@"\n`;
       await writePrivate(launcherPath, script, 0o700);
     },
     registerRoutes: (app) => {

@@ -12,6 +12,7 @@ import { useI18n } from '@/lib/i18n';
 import { useEffectiveDirectory } from '@/hooks/useEffectiveDirectory';
 import { getRuntimeKey } from '@/lib/runtime-switch';
 import { focusChatInput } from '@/components/chat/composer/editor/dom';
+import { diffCommentOriginKey, type DiffCommentOrigin } from '@/lib/diffCommentOrigin';
 
 type LineRangeBase = {
   start: number;
@@ -31,6 +32,8 @@ interface UseInlineCommentControllerOptions<TRange extends LineRangeBase> {
   getCodeForRange: (range: TRange) => string;
   toStoreRange: (range: TRange) => StoreRange;
   fromDraftRange: (draft: InlineCommentDraft) => TRange;
+  /** The diff these comments are written on; absent for uncommitted changes. */
+  origin?: DiffCommentOrigin;
 }
 
 const normalizeStoreRange = (range: StoreRange): StoreRange => {
@@ -57,7 +60,10 @@ export function useInlineCommentController<TRange extends LineRangeBase>(
   options: UseInlineCommentControllerOptions<TRange>
 ) {
   const { t } = useI18n();
-  const { source, fileLabel, language, getCodeForRange, toStoreRange, fromDraftRange } = options;
+  const { source, fileLabel, language, getCodeForRange, toStoreRange, fromDraftRange, origin } = options;
+  // The same path in a pull request and on disk are different lines, so a
+  // comment shows only on the diff it was written on.
+  const originKey = diffCommentOriginKey(origin);
 
   const currentSessionId = useSessionUIStore((state) => state.currentSessionId);
   const newSessionDraftOpen = useSessionUIStore((state) => state.newSessionDraft?.open);
@@ -95,8 +101,10 @@ export function useInlineCommentController<TRange extends LineRangeBase>(
 
   const drafts = React.useMemo(() => {
     if (!target || !fileLabel) return [];
-    return sessionDrafts.filter((draft) => draft.source === source && draft.fileLabel === fileLabel);
-  }, [fileLabel, sessionDrafts, source, target]);
+    return sessionDrafts.filter((draft) => (
+      draft.source === source && draft.fileLabel === fileLabel && diffCommentOriginKey(draft.origin) === originKey
+    ));
+  }, [fileLabel, originKey, sessionDrafts, source, target]);
 
   const reset = React.useCallback(() => {
     setSelection(null);
@@ -147,6 +155,7 @@ export function useInlineCommentController<TRange extends LineRangeBase>(
         code,
         language,
         text: trimmedText,
+        origin,
       });
     } else {
       addDraft(target, {
@@ -158,6 +167,7 @@ export function useInlineCommentController<TRange extends LineRangeBase>(
         code,
         language,
         text: trimmedText,
+        origin,
       });
     }
 
@@ -165,7 +175,7 @@ export function useInlineCommentController<TRange extends LineRangeBase>(
     if (isNewComment) {
       requestAnimationFrame(focusChatInput);
     }
-  }, [addDraft, editingDraftId, fileLabel, getCodeForRange, language, reset, selection, source, t, target, toStoreRange, updateDraft]);
+  }, [addDraft, editingDraftId, fileLabel, getCodeForRange, language, origin, reset, selection, source, t, target, toStoreRange, updateDraft]);
 
   return {
     sessionKey,

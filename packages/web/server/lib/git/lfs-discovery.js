@@ -1,3 +1,4 @@
+import { isString } from '../shared/guards.js';
 import { normalizeDiscoveryEndpoint, resolveGitRelativeEndpoint } from './discovery-endpoint.js';
 
 export const LFS_DISCOVERY_LIMITS = Object.freeze({
@@ -25,7 +26,6 @@ const SAFE_FILTERS = Object.freeze({
   'filter.lfs.smudge': 'git-lfs smudge -- %f',
   'filter.lfs.process': 'git-lfs filter-process',
 });
-const isString = (value) => Object.prototype.toString.call(value) === '[object String]';
 
 const lfsError = (message, code = 'INVALID_LFS_DISCOVERY_INPUT') => Object.assign(new Error(message), { code });
 
@@ -38,7 +38,7 @@ const boundedText = (value, maxBytes, label) => {
   return text;
 };
 
-const parseConfig = (value, limits, label) => {
+const parseConfig = (value, limits, label, { allowRepeatedCanonicalFilters = false } = {}) => {
   const text = boundedText(value, limits.maxConfigBytes, label);
   if (!text) return new Map();
   if (!text.endsWith('\0')) throw lfsError(`${label} is incomplete`);
@@ -48,7 +48,10 @@ const parseConfig = (value, limits, label) => {
     if (separator <= 0 || separator === record.length - 1) throw lfsError(`${label} record is malformed`);
     const key = record.slice(0, separator).toLowerCase();
     const configValue = record.slice(separator + 1);
-    if (result.has(key)) throw lfsError(`${label} contains duplicate ${key}`);
+    // Effective Git config reports every layer, including identical LFS installs.
+    const repeatedCanonicalFilter = allowRepeatedCanonicalFilters && result.get(key) === configValue
+      && (SAFE_FILTERS[key] === configValue || (key === 'filter.lfs.required' && configValue === 'true'));
+    if (result.has(key) && !repeatedCanonicalFilter) throw lfsError(`${label} contains duplicate ${key}`);
     result.set(key, configValue);
   }
   return result;
@@ -80,9 +83,6 @@ const parseAttributes = (value, limits) => {
     if (fields[index + 2] === 'lfs' && !seen.has(filePath)) {
       seen.add(filePath);
       paths.push(filePath);
-      if (paths.length > limits.maxPublicRecords) {
-        throw lfsError('LFS attribute records exceed their public record limit', 'LFS_DISCOVERY_LIMIT_EXCEEDED');
-      }
     }
   }
   return paths;
@@ -144,6 +144,14 @@ export function parseTreeObjects(treeOutput) {
   return entries;
 }
 
+/**
+ * Every tracked file is checked, and every pointer-sized blob that claims to be
+ * an LFS pointer is validated. The result keeps only bounded evidence: up to
+ * `maxPublicRecords` attribute records and `maxPointerSamples` pointer samples.
+ * Hydration needs to know whether LFS is in use, not an inventory, so a
+ * repository with thousands of LFS files is scanned in the same memory as one
+ * with a handful.
+ */
 export async function scanLfsFiles(filesOutput, query, gitlinkPaths = [], treeObjects = null) {
   const limits = LFS_DISCOVERY_LIMITS;
   const text = boundedText(filesOutput, limits.maxFilesBytes, 'Tracked files output');
@@ -176,14 +184,10 @@ export async function scanLfsFiles(filesOutput, query, gitlinkPaths = [], treeOb
     }
     for (const file of selected) {
       const record = `${file}\0filter\0lfs\0`;
-      attributesBytes += Buffer.byteLength(record);
-      if (attributesBytes > limits.maxAttributesBytes) {
-        throw lfsError('LFS attribute records exceed their byte limit', 'LFS_DISCOVERY_LIMIT_EXCEEDED');
-      }
+      const recordBytes = Buffer.byteLength(record);
+      if (attributes.length >= limits.maxPublicRecords || attributesBytes + recordBytes > limits.maxAttributesBytes) break;
+      attributesBytes += recordBytes;
       attributes.push(record);
-    }
-    if (attributes.length > limits.maxPublicRecords) {
-      throw lfsError('LFS attribute records exceed their public record limit', 'LFS_DISCOVERY_LIMIT_EXCEEDED');
     }
 
     // Query sizes without reading blobs. Only pointer-sized blobs enter the
@@ -219,9 +223,8 @@ export async function scanLfsFiles(filesOutput, query, gitlinkPaths = [], treeOb
     for (const { candidate, content } of await readSmallBlobs(query, candidates, limits, 'Git object')) {
       if (content.subarray(0, prefix.length).equals(prefix)) {
         parseLfsPointer(content);
-        pointerSamples.push({ path: candidate.path, content: Buffer.from(content) });
-        if (pointerSamples.length > limits.maxPointerSamples) {
-          throw lfsError('LFS pointers exceed their record limit', 'LFS_DISCOVERY_LIMIT_EXCEEDED');
+        if (pointerSamples.length < limits.maxPointerSamples) {
+          pointerSamples.push({ path: candidate.path, content: Buffer.from(content) });
         }
       }
     }
@@ -321,7 +324,7 @@ const httpsCandidate = (value, gitRemoteUrl) => {
 
 export function resolveLfsPushConfig({ lfsConfigOutput, effectiveConfigOutput, gitRemoteName, gitRemoteUrl }) {
   const committed = parseConfig(lfsConfigOutput, LFS_DISCOVERY_LIMITS, 'Committed LFS configuration');
-  const effective = parseConfig(effectiveConfigOutput, LFS_DISCOVERY_LIMITS, 'Effective LFS configuration');
+  const effective = parseConfig(effectiveConfigOutput, LFS_DISCOVERY_LIMITS, 'Effective LFS configuration', { allowRepeatedCanonicalFilters: true });
   validateExecutableConfig(effective);
   const remoteUrlKey = `remote.${gitRemoteName.toLowerCase()}.lfsurl`;
   for (const key of committed.keys()) {
@@ -384,7 +387,7 @@ export function discoverLfs({
   }
 
   const lfsConfig = parseConfig(lfsConfigOutput, limits, '.lfsconfig output');
-  const effectiveConfig = parseConfig(effectiveConfigOutput, limits, 'Effective LFS config output');
+  const effectiveConfig = parseConfig(effectiveConfigOutput, limits, 'Effective LFS config output', { allowRepeatedCanonicalFilters: true });
   validateExecutableConfig(effectiveConfig);
   for (const key of lfsConfig.keys()) {
     if (key !== 'lfs.url' && key !== `remote.${gitRemoteName.toLowerCase()}.lfsurl`) {

@@ -1,16 +1,28 @@
+/**
+ * Magic Prompt definitions and the client for `/api/magic-prompts`
+ * (contract: packages/web/server/lib/magic-prompts/DOCUMENTATION.md).
+ *
+ * `loadMagicPrompts(directory)` reads, once per operation, the overrides the
+ * server resolved for work in that directory, and renders all of that
+ * operation's prompts from the read. Nothing is cached between operations, so
+ * a hand edit shows up on the next one, and a failed or malformed read throws
+ * instead of falling back to built-in text.
+ */
+import { z } from 'zod';
+
 import { runtimeFetch } from './runtime-fetch';
+import { getRuntimeKey } from './runtime-switch';
 
 export type MagicPromptId =
   | 'git.commit.generate.visible'
   | 'git.commit.generate.instructions'
   | 'git.pr.generate.visible'
   | 'git.pr.generate.instructions'
+  | 'walkthrough.instructions'
   | 'git.conflict.resolve.visible'
   | 'git.conflict.resolve.instructions'
   | 'git.integrate.cherrypick.resolve.visible'
   | 'git.integrate.cherrypick.resolve.instructions'
-  | 'linear.issue.review.visible'
-  | 'linear.issue.review.instructions'
   | 'plan.todo.visible'
   | 'plan.todo.instructions'
   | 'plan.improve.visible'
@@ -43,18 +55,20 @@ export type MagicPromptId =
   | 'session.explore.instructions'
   | 'session.fusion.visible'
   | 'session.fusion.instructions'
-  | 'session.fusion.codeInstructions';
+  | 'session.fusion.codeInstructions'
+  | 'memory.tidy.visible'
+  | 'memory.tidy.instructions';
 
-export interface MagicPromptDefinition {
+interface MagicPromptDefinition {
   id: MagicPromptId;
   title: string;
   description: string;
-  group: 'Git' | 'GitHub' | 'Linear' | 'Planning' | 'Session';
+  group: 'Git' | 'GitHub' | 'Linear' | 'Planning' | 'Session' | 'Memory';
   template: string;
   placeholders?: Array<{ key: string; description: string }>;
 }
 
-export interface MagicPromptOverridesPayload {
+interface MagicPromptOverridesPayload {
   version: number;
   overrides: Record<string, string>;
 }
@@ -145,59 +159,13 @@ Files changed across these commits:
 {{changed_files}}{{additional_context_block}}{{pr_template_block}}`,
   },
   {
-    id: 'linear.issue.review.visible',
-    title: 'Linear Issue Review Visible Prompt',
-    group: 'Linear',
-    description: 'Visible user message when creating a session from a Linear issue.',
-    placeholders: [
-      { key: 'identifier', description: 'Linear issue identifier, such as ENG-12.' },
-    ],
-    template: 'Review this Linear issue {{identifier}} using the provided issue context',
-  },
-  {
-    id: 'linear.issue.review.instructions',
-    title: 'Linear Issue Review Instructions',
-    group: 'Linear',
-    description: 'Hidden instructions attached when generating a Linear issue review response.',
-    template: `Review this Linear issue using the provided issue context.
-
-Process:
-- First classify the issue type (bug / feature request / question/support / refactor / ops) and state it as: Type: <one label>.
-- Gather any needed repository context (code, config, docs) to validate assumptions.
-- After gathering, if anything is still unclear or cannot be verified, do not speculate — state what's missing and ask targeted questions.
-
-Mode selection by type:
-- Bug / Question/Support / Ops: deliver the response directly using the matching template below. Do not bombard me with questions for straightforward diagnosis; use "Missing info" / "Repro/diagnostics needed" fields instead.
-- Feature request / Refactor with substantive unknowns: this is effectively a planning session. Do not emit the Feature template on the first turn. Instead, ask me focused clarifying questions in batches of at most 3, one topic at a time (scope, constraints, tradeoffs, UX, etc.), wait for answers, drop questions that became irrelevant, and repeat until you have no more substantive questions. Only then emit the Feature template.
-
-Output rules:
-- Compact output; pick ONE template below and omit the others.
-- No emojis. No code snippets. No fenced blocks.
-- Short inline code identifiers allowed.
-- Reference evidence with file paths and line ranges when applicable; if exact lines are not available, cite the file and say "approx" + why.
-- Keep the entire response under ~300 words (applies to the final template output, not to clarifying-question turns).
-
-Templates (choose one):
-Bug:
-- Summary (1-2 sentences)
-- Likely cause (max 2)
-- Repro/diagnostics needed (max 3)
-- Fix approach (max 4 steps)
-- Verification (max 3)
-
-Feature:
-- Summary (1-2 sentences)
-- Requirements (max 4)
-- Unknowns/questions (max 4)
-- Proposed plan (max 5 steps)
-- Verification (max 3)
-
-Question/Support:
-- Summary (1-2 sentences)
-- Answer/guidance (max 6 lines)
-- Missing info (max 4)
-
-Do not implement changes until I confirm; end with: "Next actions: <1 sentence>".`,
+    id: 'walkthrough.instructions',
+    title: 'Walkthrough Instructions',
+    group: 'Git',
+    description: 'Your preferences for Changes walkthroughs: tone, emphasis, what to dwell on or leave out. The server adds them to its own prompt, so they cannot change the walkthrough format. Empty means none.',
+    // No built-in text, on purpose: the server reads only the override, so a
+    // default here would be text the server never sends.
+    template: '',
   },
   {
     id: 'git.conflict.resolve.visible',
@@ -442,7 +410,7 @@ Respond in the same language the user used most in the conversation.`,
     id: 'session.review.instructions',
     title: 'Workspace Review Instructions',
     group: 'Session',
-    description: 'Hidden instructions attached to the /workspace-review command. Reviews the workspace diff for intent, correctness, and adequacy, with severity-classified findings.',
+    description: 'Hidden instructions attached to the /workspace-review command and to the first message of every review session. Reviews the workspace diff for intent, correctness, and adequacy, with severity-classified findings.',
     template: `Review the changes in this workspace and judge whether they are correct and adequate — not just whether they contain catastrophic bugs.
 
 The diff is the source of truth. Read the relevant code around the diff too, not only the diff itself, so you understand the change in context.
@@ -513,14 +481,15 @@ Keep the review concise and practical. Respond in the same language the user use
     title: 'Review Handoff Instructions',
     group: 'Session',
     description: 'Hidden instructions attached to the /handoff-review command. Produces a handoff for a separate review agent.',
-    template: `Produce a review handoff for another agent. Do not compact or mutate session history. Your output is an assistant message that OpenChamber will send to a separate reviewer agent.
+    template: `Produce a review handoff for another agent. Your output is an assistant message that OpenChamber will send to a separate reviewer agent, who checks whether the work actually came out right.
 
 Include:
 - The user's original intent and any later clarifications that changed the intent
+- Decisions the user made in this session and anything deliberately left out of scope, so the reviewer does not report them as gaps
 - What was implemented and why
-- Files changed, with brief purpose per file
+- Where the work lives: the files changed, with a brief purpose per file, or the commit range when the work is already committed. Say that other uncommitted changes in the workspace are not part of this work
 - Important design decisions and tradeoffs
-- Validation/tests run, if known
+- Validation: the exact checks and tests that ran with their results, and what was not checked
 - Known gaps, uncertainty, or areas the reviewer should inspect closely
 
 Formatting:
@@ -564,7 +533,7 @@ Focus on correctness, regressions, missing implementation, missing tests, and wh
     ],
     template: `Another agent reviewed your changes and left the feedback below.
 
-Please review the feedback, resolve the relevant issues, and explain what you changed.
+Fix the findings you agree with. When you think a finding is wrong, leave the code as it is and explain why. Then list what you changed and which findings you declined, with the reason for each.
 
 {{review_feedback}}`,
   },
@@ -578,7 +547,7 @@ Please review the feedback, resolve the relevant issues, and explain what you ch
     ],
     template: `The agent implementing the changes has responded to the previous review feedback.
 
-Please review the latest state again and report any remaining issues.
+Review the current diff again. For each earlier finding, say whether it is fixed, declined for a reason you accept, or still open; when you disagree with a decline, explain why. Report new findings only for problems the latest changes introduced.
 
 {{implementation_response}}`,
   },
@@ -610,7 +579,7 @@ Use the \`question\` tool only for clarifying decisions that have a small set of
 
 5. Do not write code or begin implementing during this phase. Planning is for understanding and deciding only.
 
-6. When everything is settled, produce the final implementation plan: a clear, ordered breakdown of the work, the files and areas affected, the decisions that were made (and why), known risks, and any remaining assumptions flagged explicitly. The plan must reflect the user's actual answers — never fill gaps with guesses.
+6. When everything is settled, produce the final implementation plan: a clear, ordered breakdown of the work, the files and areas affected, the decisions that were made (and why), known risks, and any remaining assumptions flagged explicitly. The plan must reflect the user's actual answers — never fill gaps with guesses. If the \`openchamber_knowledge\` tool is available, save the plan there and show it to the user, so they can read it, comment on it and send it to a session from the plan itself.
 
 7. After presenting the plan, if the \`openchamber\` tool is available, offer to start a separate session yourself to implement it; do so only after the user explicitly confirms, and include the full plan in that session's prompt because the new session cannot see this conversation.
 
@@ -895,6 +864,51 @@ Read diffs selectively, file by file; do not print every attempt in full.
 
 --- FUSION INPUTS START ---`,
   },
+  {
+    id: 'memory.tidy.visible',
+    title: 'Memory Tidy-up Visible Prompt',
+    group: 'Memory',
+    description: 'Visible user message sent by the Tidy up button in the Memory panel.',
+    template: 'Tidy up my memory: drop what is outdated, merge duplicates, and fix what has changed.',
+  },
+  {
+    id: 'memory.tidy.instructions',
+    title: 'Memory Tidy-up Instructions',
+    group: 'Memory',
+    description: 'Hidden instructions for the memory tidy-up session, followed by every stored entry with its full text.',
+    placeholders: [
+      { key: 'memory_entries', description: 'Every stored memory entry in both scopes: id, scope, type, dates, title and body.' },
+    ],
+    template: `You are tidying up the memory you keep through the openchamber_memory tool. Agents save entries as they work and rarely revisit them, while the code and the decisions behind them keep moving. Your job is to bring the store back in line with what is true now. Every stored entry is listed in full below, so you do not need memory.read or memory.list.
+
+During this session, save no new memories: you only restructure what is already stored, whatever the usual memory rules say.
+
+1. Go through every entry. For project entries, check the files, flags, commands, routes and decisions they name against the project: the code, git history, docs, instructions and skills, plans and notes, and whatever else you can reach, such as issues and linked trackers. A reference to something that is gone is a sign the entry is stale, not proof: a decision can outlive renamed code.
+
+2. Decide what changes. The first test for every entry: would an agent that reads the relevant code, docs and skills learn everything this entry says, including why it is so and whether it may be changed? If yes, the entry only duplicates the project and drifts from it over time: delete it. Where the entry and a doc or skill disagree, the doc or skill is current. Code shows what was done, not why, nor that it was deliberate: an entry that holds a decision, its reason, a rejected alternative or a "leave this as it is" that the project does not state stays, trimmed to that part if the rest is readable elsewhere. Do not move anything into docs or skills; this session changes memory only.
+- Obsolete: what it describes is gone or was reversed. Delete it.
+- Duplicates and overlapping entries: merge them into one entry, rewritten with memory.save and the surviving entry's memoryId, then delete the rest.
+- Partly outdated: rewrite it by memoryId with what is true now.
+- Wrong scope: something about this project filed under the user (global), or the other way round. Save it in the right scope, then delete the original.
+- One-off task state and anything the save rules exclude: delete.
+- A date in a title that only records when a decision was made: keep the decision; drop the date if the title needs the room.
+- Entries marked flagged: leave them alone; the user decides on those.
+An entry nothing contradicts still holds. Leave it as it is.
+
+3. Ask the user only about a real discrepancy you cannot settle from the project: two entries that contradict each other, or an entry the project contradicts while it may record a decision the project has not caught up with yet. Put all such questions in one question form, a handful at most. Never ask the user to re-confirm a standing preference or fact that nothing contradicts; assume it still holds. Entries about the user can rarely be checked against anything, so this applies to them most of all.
+
+4. Apply every change.
+
+5. Reply with a short report in the language the user works in, as their instructions or memory say:
+- removed: each title with one line on why;
+- merged: which entries went into which;
+- rewritten: each title and what changed;
+- how many entries stayed as they were.
+Nothing waits for approval. Keep the original text of what you changed in mind: if the user disagrees with something, you restore it from there.
+
+--- STORED MEMORY ---
+{{memory_entries}}`,
+  },
 ] as const;
 
 const MAGIC_PROMPT_DEFINITION_BY_ID = new Map<MagicPromptId, MagicPromptDefinition>(
@@ -912,8 +926,53 @@ const LEGACY_PROMPT_KEY_MAP: Record<string, { visible: MagicPromptId; instructio
   },
 };
 
-let cachedOverrides: Record<string, string> | null = null;
-let inFlightOverridesRequest: Promise<Record<string, string>> | null = null;
+/** One scope's overrides by prompt id. A Map, so an id such as `__proto__` stays an id. */
+type MagicPromptOverrides = ReadonlyMap<string, string>;
+
+/** One scope of a project view. `invalid` is a failed read and carries no map. */
+type MagicPromptScopeState =
+  | { status: 'ok' | 'missing'; overrides: MagicPromptOverrides }
+  | { status: 'invalid'; reason: string };
+
+export interface MagicPromptScopesView {
+  /** The registered project the view is about. */
+  project: { id: string; path: string; file: string };
+  scopes: { global: MagicPromptScopeState; project: MagicPromptScopeState };
+}
+
+/** Selects the scope a mutation writes, in the view of one registered project. */
+interface MagicPromptScopeSelector {
+  scope: 'global' | 'project';
+  projectId: string;
+}
+
+type MagicPromptSource = 'project' | 'global' | 'builtin';
+
+/** The scopes Settings shows one prompt through; `project` is null in the Global scope. */
+interface MagicPromptLayers {
+  project: MagicPromptOverrides | null;
+  global: MagicPromptOverrides;
+}
+
+interface ResolvedMagicPrompt {
+  template: string;
+  source: MagicPromptSource;
+}
+
+/** Every prompt of one operation, rendered from a single read of the overrides. */
+export interface MagicPromptSnapshot {
+  render: (id: MagicPromptId, variables?: Record<string, string>) => string;
+}
+
+class MagicPromptError extends Error {
+  readonly code: string | null;
+
+  constructor(message: string, code: string | null = null) {
+    super(message);
+    this.name = 'MagicPromptError';
+    this.code = code;
+  }
+}
 
 const replaceTemplateVariables = (template: string, variables: Record<string, string>) => {
   return template.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_match, key: string) => {
@@ -924,67 +983,153 @@ const replaceTemplateVariables = (template: string, variables: Record<string, st
   });
 };
 
-const normalizeOverridesPayload = (payload: unknown): Record<string, string> => {
-  const overridesRaw = (payload as { overrides?: unknown } | null)?.overrides;
-  if (!overridesRaw || typeof overridesRaw !== 'object' || Array.isArray(overridesRaw)) {
-    return {};
-  }
-
-  const result: Record<string, string> = {};
-  for (const [key, value] of Object.entries(overridesRaw as Record<string, unknown>)) {
-    if (typeof value !== 'string') {
-      continue;
-    }
-    result[key] = value;
-  }
-
+// A scope written before the split stores `git.commit.generate` as one text:
+// its first line is the visible prompt, the rest the instructions. Each part
+// fills only a split key the same scope does not set itself.
+const expandLegacyKeys = (stored: Map<string, string>): MagicPromptOverrides => {
+  const result = new Map(stored);
   for (const [legacyKey, splitKeys] of Object.entries(LEGACY_PROMPT_KEY_MAP)) {
-    const legacyValue = result[legacyKey];
-    if (typeof legacyValue !== 'string') {
-      continue;
-    }
+    const legacyValue = stored.get(legacyKey);
+    if (legacyValue === undefined) continue;
 
     const firstNewlineIndex = legacyValue.indexOf('\n');
     const visible = (firstNewlineIndex === -1 ? legacyValue : legacyValue.slice(0, firstNewlineIndex)).trim();
     const instructions = (firstNewlineIndex === -1 ? '' : legacyValue.slice(firstNewlineIndex + 1)).trim();
 
-    if (!(splitKeys.visible in result) && visible.length > 0) {
-      result[splitKeys.visible] = visible;
+    if (!stored.has(splitKeys.visible) && visible.length > 0) {
+      result.set(splitKeys.visible, visible);
     }
-    if (!(splitKeys.instructions in result) && instructions.length > 0) {
-      result[splitKeys.instructions] = instructions;
+    if (!stored.has(splitKeys.instructions) && instructions.length > 0) {
+      result.set(splitKeys.instructions, instructions);
     }
   }
-
   return result;
 };
 
-export const fetchMagicPromptOverrides = async (): Promise<Record<string, string>> => {
-  if (cachedOverrides) {
-    return cachedOverrides;
-  }
+const overrideMapSchema = z.preprocess(
+  // The parsed JSON's own entries, taken before an object rebuild could drop
+  // `__proto__`. Anything but an object, an array included, fails the parse.
+  (value) => (value instanceof Object && !Array.isArray(value) ? Object.entries(value) : null),
+  z.array(z.tuple([z.string(), z.string()])),
+).transform((entries) => expandLegacyKeys(new Map(entries)));
 
-  if (!inFlightOverridesRequest) {
-    inFlightOverridesRequest = runtimeFetch(API_ENDPOINT, {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-    })
-      .then(async (response) => {
-        if (!response.ok) {
-          throw new Error('Failed to load magic prompts');
-        }
-        const payload = await response.json().catch(() => ({}));
-        const normalized = normalizeOverridesPayload(payload);
-        cachedOverrides = normalized;
-        return normalized;
-      })
-      .finally(() => {
-        inFlightOverridesRequest = null;
-      });
-  }
+const globalPayloadSchema = z.object({
+  version: z.literal(1),
+  overrides: overrideMapSchema,
+});
 
-  return inFlightOverridesRequest;
+const scopeStateSchema = z.union([
+  z.object({ status: z.enum(['ok', 'missing']), overrides: overrideMapSchema }),
+  z.object({ status: z.literal('invalid'), reason: z.string() }),
+]);
+
+const scopesPayloadSchema = z.object({
+  version: z.literal(1),
+  project: z.object({ id: z.string().min(1), path: z.string(), file: z.string() }),
+  scopes: z.object({ global: scopeStateSchema, project: scopeStateSchema }),
+});
+
+const errorPayloadSchema = z.object({ error: z.string().min(1), code: z.string().optional() });
+
+const request = async <T>(
+  path: string,
+  init: {
+    method: 'GET' | 'PUT' | 'DELETE';
+    query?: { projectId: string; scope?: MagicPromptScopeSelector['scope'] } | { sessionDirectory: string };
+    body?: string;
+  },
+  schema: z.ZodType<T>,
+  failureMessage: string,
+): Promise<T> => {
+  const response = await runtimeFetch(path, {
+    method: init.method,
+    headers: init.body === undefined
+      ? { Accept: 'application/json' }
+      : { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: init.body,
+    query: init.query,
+    // Each operation reads the files as they are now, hand edits included.
+    cache: 'no-store',
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const error = errorPayloadSchema.safeParse(payload);
+    throw new MagicPromptError(
+      error.success ? error.data.error : failureMessage,
+      error.success ? error.data.code ?? null : null,
+    );
+  }
+  const parsed = schema.safeParse(payload);
+  if (!parsed.success) {
+    throw new MagicPromptError(`${failureMessage}: unexpected response`);
+  }
+  return parsed.data;
 };
+
+const promptPath = (id: MagicPromptId) => `${API_ENDPOINT}/${encodeURIComponent(id)}`;
+
+/** The global overrides, or with a directory the overrides the server resolved for work there. */
+const fetchOverrides = async (sessionDirectory?: string): Promise<MagicPromptOverrides> => (
+  (await request(
+    API_ENDPOINT,
+    { method: 'GET', query: sessionDirectory ? { sessionDirectory } : undefined },
+    globalPayloadSchema,
+    'Failed to load magic prompts',
+  )).overrides
+);
+
+/** Both scopes of a registered project. A scope that failed to read stays `invalid`, the other is still reported. */
+export const fetchMagicPromptScopes = async (projectId: string): Promise<MagicPromptScopesView> => {
+  const view = await request(
+    API_ENDPOINT,
+    { method: 'GET', query: { projectId } },
+    scopesPayloadSchema,
+    'Failed to load magic prompts',
+  );
+  if (view.project.id !== projectId) {
+    throw new MagicPromptError('Magic prompts answered for another project');
+  }
+  return { project: view.project, scopes: view.scopes };
+};
+
+/**
+ * A write goes only to the runtime it was decided on: `runtimeKey` is checked
+ * right before the request leaves, so a call made after a runtime switch sends
+ * nothing. A switch after the request left does not undo it; the caller drops
+ * the answer.
+ */
+const mutateScoped = async (
+  path: string,
+  method: 'PUT' | 'DELETE',
+  selector: MagicPromptScopeSelector,
+  runtimeKey: string,
+  failureMessage: string,
+  body?: string,
+): Promise<MagicPromptScopesView> => {
+  assertMagicPromptRuntime(runtimeKey);
+  const view = await request(
+    path,
+    { method, query: { scope: selector.scope, projectId: selector.projectId }, body },
+    scopesPayloadSchema,
+    failureMessage,
+  );
+  if (view.project.id !== selector.projectId) {
+    throw new MagicPromptError('Magic prompts answered for another project');
+  }
+  return { project: view.project, scopes: view.scopes };
+};
+
+export const saveScopedMagicPromptOverride = (selector: MagicPromptScopeSelector, id: MagicPromptId, text: string, runtimeKey: string) => (
+  mutateScoped(promptPath(id), 'PUT', selector, runtimeKey, 'Failed to save magic prompt', JSON.stringify({ text }))
+);
+
+export const resetScopedMagicPromptOverride = (selector: MagicPromptScopeSelector, id: MagicPromptId, runtimeKey: string) => (
+  mutateScoped(promptPath(id), 'DELETE', selector, runtimeKey, 'Failed to reset magic prompt')
+);
+
+export const resetAllScopedMagicPromptOverrides = (selector: MagicPromptScopeSelector, runtimeKey: string) => (
+  mutateScoped(API_ENDPOINT, 'DELETE', selector, runtimeKey, 'Failed to reset all magic prompts')
+);
 
 export const getMagicPromptDefinition = (id: MagicPromptId): MagicPromptDefinition => {
   const definition = MAGIC_PROMPT_DEFINITION_BY_ID.get(id);
@@ -998,71 +1143,63 @@ export const getDefaultMagicPromptTemplate = (id: MagicPromptId): string => {
   return getMagicPromptDefinition(id).template;
 };
 
-const getEffectiveMagicPromptTemplate = async (id: MagicPromptId): Promise<string> => {
-  const overrides = await fetchMagicPromptOverrides().catch((): Record<string, string> => ({}));
-  const override = overrides[id];
-  if (typeof override === 'string') {
-    return override;
-  }
-  return getDefaultMagicPromptTemplate(id);
+/** Project, then global, then built-in. Presence decides, so an empty override still wins. */
+export const resolveMagicPromptTemplate = (layers: MagicPromptLayers, id: MagicPromptId): ResolvedMagicPrompt => {
+  const projectTemplate = layers.project?.get(id);
+  if (projectTemplate !== undefined) return { template: projectTemplate, source: 'project' };
+  const globalTemplate = layers.global.get(id);
+  if (globalTemplate !== undefined) return { template: globalTemplate, source: 'global' };
+  return { template: getDefaultMagicPromptTemplate(id), source: 'builtin' };
 };
 
-export const renderMagicPrompt = async (id: MagicPromptId, variables: Record<string, string> = {}): Promise<string> => {
-  const template = await getEffectiveMagicPromptTemplate(id);
-  return replaceTemplateVariables(template, variables);
+/** Throws `runtime_changed` when the active runtime is no longer `runtimeKey`. */
+const assertMagicPromptRuntime = (runtimeKey: string): void => {
+  if (getRuntimeKey() !== runtimeKey) {
+    throw new MagicPromptError('The runtime changed before the magic prompt change was sent', 'runtime_changed');
+  }
 };
 
-export const saveMagicPromptOverride = async (id: MagicPromptId, text: string): Promise<MagicPromptOverridesPayload> => {
-  const response = await runtimeFetch(`${API_ENDPOINT}/${encodeURIComponent(id)}`, {
-    method: 'PUT',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: JSON.stringify({ text }),
-  });
-  if (!response.ok) {
-    const errorPayload = await response.json().catch(() => ({}));
-    throw new Error((errorPayload as { error?: string })?.error || 'Failed to save magic prompt');
-  }
-  const payload = await response.json();
-  cachedOverrides = normalizeOverridesPayload(payload);
+/**
+ * Reads the overrides once for one operation in `directory`, the directory
+ * the work happens in; the server merges the owning project's overrides over
+ * the global ones. `null` reads the global overrides alone, for work that has
+ * no directory yet, such as a new chat. Render every prompt of that operation
+ * from the returned snapshot, so a visible prompt and its instructions never
+ * come from two different reads. Throws on any read failure: built-in text is
+ * never a stand-in for overrides that could not be read.
+ */
+export const loadMagicPrompts = async (directory: string | null): Promise<MagicPromptSnapshot> => {
+  const overrides = await fetchOverrides(directory ?? undefined);
   return {
-    version: typeof payload?.version === 'number' ? payload.version : 1,
-    overrides: cachedOverrides,
+    render: (id, variables = {}) => replaceTemplateVariables(overrides.get(id) ?? getDefaultMagicPromptTemplate(id), variables),
   };
 };
 
-export const resetMagicPromptOverride = async (id: MagicPromptId): Promise<MagicPromptOverridesPayload> => {
-  const response = await runtimeFetch(`${API_ENDPOINT}/${encodeURIComponent(id)}`, {
-    method: 'DELETE',
-    headers: { Accept: 'application/json' },
-  });
-  if (!response.ok) {
-    const errorPayload = await response.json().catch(() => ({}));
-    throw new Error((errorPayload as { error?: string })?.error || 'Failed to reset magic prompt');
-  }
-  const payload = await response.json();
-  cachedOverrides = normalizeOverridesPayload(payload);
-  return {
-    version: typeof payload?.version === 'number' ? payload.version : 1,
-    overrides: cachedOverrides,
-  };
+// Global-only calls in the legacy response shape. Settings uses them for its
+// Global scope whether or not a project is selected; they never touch a
+// project file.
+
+const toRecord = (overrides: MagicPromptOverrides): Record<string, string> => Object.fromEntries(overrides);
+
+// Checked like `mutateScoped`: nothing is sent once `runtimeKey` is no longer active.
+const mutateGlobal = async (path: string, method: 'PUT' | 'DELETE', runtimeKey: string, failureMessage: string, body?: string): Promise<MagicPromptOverridesPayload> => {
+  assertMagicPromptRuntime(runtimeKey);
+  const payload = await request(path, { method, body }, globalPayloadSchema, failureMessage);
+  return { version: payload.version, overrides: toRecord(payload.overrides) };
 };
 
-export const resetAllMagicPromptOverrides = async (): Promise<MagicPromptOverridesPayload> => {
-  const response = await runtimeFetch(API_ENDPOINT, {
-    method: 'DELETE',
-    headers: { Accept: 'application/json' },
-  });
-  if (!response.ok) {
-    const errorPayload = await response.json().catch(() => ({}));
-    throw new Error((errorPayload as { error?: string })?.error || 'Failed to reset all magic prompts');
-  }
-  const payload = await response.json();
-  cachedOverrides = normalizeOverridesPayload(payload);
-  return {
-    version: typeof payload?.version === 'number' ? payload.version : 1,
-    overrides: cachedOverrides,
-  };
-};
+export const fetchMagicPromptOverrides = async (): Promise<Record<string, string>> => (
+  toRecord(await fetchOverrides())
+);
+
+export const saveMagicPromptOverride = (id: MagicPromptId, text: string, runtimeKey: string): Promise<MagicPromptOverridesPayload> => (
+  mutateGlobal(promptPath(id), 'PUT', runtimeKey, 'Failed to save magic prompt', JSON.stringify({ text }))
+);
+
+export const resetMagicPromptOverride = (id: MagicPromptId, runtimeKey: string): Promise<MagicPromptOverridesPayload> => (
+  mutateGlobal(promptPath(id), 'DELETE', runtimeKey, 'Failed to reset magic prompt')
+);
+
+export const resetAllMagicPromptOverrides = (runtimeKey: string): Promise<MagicPromptOverridesPayload> => (
+  mutateGlobal(API_ENDPOINT, 'DELETE', runtimeKey, 'Failed to reset all magic prompts')
+);

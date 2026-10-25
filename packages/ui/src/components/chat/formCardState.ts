@@ -19,7 +19,7 @@ import type { FormField, FormValue } from '@opencode/client';
  * a reply only when every external field answers `true`, so it records that
  * the user has seen the step with the link.
  */
-export type FieldValue = {
+type FieldValue = {
     text: string;
     number: number | null;
     boolean: boolean;
@@ -207,5 +207,3 @@ export function missingRequiredKeys(fields: readonly FormField[], values: FormVa
 export function buildFormAnswer(fields: readonly FormField[], values: FormValues): Record<string, FormValue> {
     return evaluateForm(fields, values).answer;
 }
-
-/** Fields a form request actually asks the user to fill in. */

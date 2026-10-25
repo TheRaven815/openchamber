@@ -30,11 +30,11 @@ import { createComposerMorphController, type ComposerMorphController } from './m
  * down. Collapsing under an open sheet would unmount the focused editor and
  * kill the keyboard the sheet is about to hand back.
  */
-export interface MobileComposerHolders {
+interface MobileComposerHolders {
     controlsPanelOpen: boolean;
     attachMenuOpen: boolean;
     draftPickerOpen: boolean;
-    /** The GitHub or Linear reference picker. */
+    /** The repository or tracker reference picker. */
     referencePickerOpen: boolean;
     isDragging: boolean;
 }
@@ -482,7 +482,9 @@ export function useMobileComposerShell(
         restoreKeyboardRef.current = false;
     }, []);
 
-    return {
+    // One identity until a field changes: composer callbacks depend on the
+    // shell, and a fresh object per render would rebuild them per keystroke.
+    return React.useMemo(() => ({
         expanded,
         focused,
         overlayHostBusy,
@@ -494,5 +496,17 @@ export function useMobileComposerShell(
         onEditorBlur,
         skipNextOverlayCloseRestore,
         cancelOverlayCloseRestore,
-    };
+    }), [
+        expanded,
+        focused,
+        overlayHostBusy,
+        dictationActive,
+        expand,
+        onDictationActiveChange,
+        holdDictationSend,
+        onEditorFocus,
+        onEditorBlur,
+        skipNextOverlayCloseRestore,
+        cancelOverlayCloseRestore,
+    ]);
 }

@@ -113,6 +113,34 @@ export const parseLsofListeners = (output) => {
 };
 
 /**
+ * Parses `lsof -a -d cwd -p <pids> -F pn`: the folder each process runs in.
+ *
+ * Same stateful `-F` format: an `n` line names the current directory of the
+ * process opened by the `p` line above it. A process that exited between the
+ * two calls is simply missing from the map.
+ */
+export const parseLsofCwds = (output) => {
+  const byPid = new Map();
+  let pid = null;
+
+  for (const line of String(output || '').split('\n')) {
+    if (!line) continue;
+    const tag = line[0];
+    const value = line.slice(1);
+
+    if (tag === 'p') {
+      const parsedPid = Number.parseInt(value, 10);
+      pid = Number.isInteger(parsedPid) ? parsedPid : null;
+      continue;
+    }
+    if (tag !== 'n' || pid === null || !value.startsWith('/')) continue;
+    if (!byPid.has(pid)) byPid.set(pid, value);
+  }
+
+  return byPid;
+};
+
+/**
  * Parses `netstat -ano -p TCP` on Windows, where no per-process command name is
  * available without a second call; `command` stays empty and callers fall back
  * to the port alone.

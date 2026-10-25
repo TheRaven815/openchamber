@@ -1,6 +1,7 @@
 import React from "react";
 import { cn } from "@/lib/utils";
 import { useUIStore } from "@/stores/useUIStore";
+import { isRightToLeft } from '@/lib/i18n';
 
 type OverlayScrollbarProps = {
   /** The scrolling element. Container replacement is picked up on the next React commit. */
@@ -18,11 +19,15 @@ type OverlayScrollbarProps = {
   suppressVisibility?: boolean;
   /** Requires recent user input in the default auto-hide mode. */
   userIntentOnly?: boolean;
+  /** Pixels kept clear above the vertical track, for controls floating over the scroller's top edge. */
+  verticalTrackStart?: number;
+  /** Called when a thumb drag starts: the thumb is outside the scroller, so its own gesture listeners never see it. */
+  onThumbDragStart?: () => void;
 };
 
 type ScrollbarOptions = Required<Pick<
   OverlayScrollbarProps,
-  "minThumbSize" | "hideDelayMs" | "disableHorizontal" | "observeMutations" | "suppressVisibility" | "userIntentOnly"
+  "minThumbSize" | "hideDelayMs" | "disableHorizontal" | "observeMutations" | "suppressVisibility" | "userIntentOnly" | "verticalTrackStart"
 >> & { alwaysVisible: boolean };
 
 // The inset is part of both rendering and drag math; changing it must preserve that shared track.
@@ -30,8 +35,16 @@ const TRACK_INSET = 8;
 const USER_INTENT_DURATION_MS = 1000;
 const SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "]);
 
-function calculateThumb(viewportLength: number, contentLength: number, minThumbSize: number) {
-  const trackLength = Math.max(viewportLength - TRACK_INSET * 2, 0);
+function setHidden(element: HTMLElement, hidden: boolean) {
+  if (element.hidden !== hidden) element.hidden = hidden;
+}
+
+function setStyle(element: HTMLElement, property: "height" | "width", value: string) {
+  if (element.style[property] !== value) element.style[property] = value;
+}
+
+function calculateThumb(viewportLength: number, contentLength: number, minThumbSize: number, trackStart = 0) {
+  const trackLength = Math.max(viewportLength - TRACK_INSET * 2 - trackStart, 0);
   const scrollRange = Math.max(contentLength - viewportLength, 0);
   if (trackLength === 0 || scrollRange === 0) return null;
 
@@ -51,6 +64,7 @@ function bindScrollbar(
   verticalThumb: HTMLDivElement,
   horizontalThumb: HTMLDivElement,
   initialOptions: ScrollbarOptions,
+  onThumbDragStart: () => void,
 ) {
   let options = initialOptions;
 
@@ -61,6 +75,9 @@ function bindScrollbar(
   // Cached unit conversions let steady scrolling avoid layout-dependent size reads.
   let verticalThumbPixelsPerScrollPixel = 0;
   let horizontalThumbPixelsPerScrollPixel = 0;
+  // scrollLeft is 0 at the start of the content: the left in LTR, the right in
+  // RTL, where it runs negative. Adding this origin measures it from the left.
+  let horizontalScrollOrigin = 0;
 
   // A single moving deadline avoids clearing and recreating a timer on every scroll event.
   let hideTimerId: ReturnType<typeof setTimeout> | null = null;
@@ -111,37 +128,40 @@ function bindScrollbar(
     const scrollHeight = container.scrollHeight;
     const clientWidth = options.disableHorizontal ? 0 : container.clientWidth;
     const scrollWidth = options.disableHorizontal ? 0 : container.scrollWidth;
-    const vertical = calculateThumb(clientHeight, scrollHeight, options.minThumbSize);
+    const vertical = calculateThumb(clientHeight, scrollHeight, options.minThumbSize, options.verticalTrackStart);
     const horizontal = options.disableHorizontal
       ? null
       : calculateThumb(clientWidth, scrollWidth, options.minThumbSize);
 
+    // Write only what changed: the wrapper's gutter matches the thumb's
+    // `hidden` through :has(), so even a same-value write invalidates style.
     if (vertical) {
       verticalThumbPixelsPerScrollPixel = vertical.thumbPixelsPerScrollPixel;
-      verticalThumb.hidden = false;
-      verticalThumb.style.height = `${vertical.length}px`;
+      setHidden(verticalThumb, false);
+      setStyle(verticalThumb, "height", `${vertical.length}px`);
     } else {
       verticalThumbPixelsPerScrollPixel = 0;
-      verticalThumb.hidden = true;
+      setHidden(verticalThumb, true);
     }
 
     if (horizontal) {
       horizontalThumbPixelsPerScrollPixel = horizontal.thumbPixelsPerScrollPixel;
-      horizontalThumb.hidden = false;
-      horizontalThumb.style.width = `${horizontal.length}px`;
+      horizontalScrollOrigin = isRightToLeft(container) ? scrollWidth - clientWidth : 0;
+      setHidden(horizontalThumb, false);
+      setStyle(horizontalThumb, "width", `${horizontal.length}px`);
     } else {
       horizontalThumbPixelsPerScrollPixel = 0;
-      horizontalThumb.hidden = true;
+      setHidden(horizontalThumb, true);
     }
   };
 
   const positionThumbs = () => {
     // This is the hot path: cached scales leave only scroll offsets to read and transforms to write.
     if (!verticalThumb.hidden) {
-      verticalThumb.style.transform = `translate3d(0, ${TRACK_INSET + container.scrollTop * verticalThumbPixelsPerScrollPixel}px, 0)`;
+      verticalThumb.style.transform = `translate3d(0, ${TRACK_INSET + options.verticalTrackStart + container.scrollTop * verticalThumbPixelsPerScrollPixel}px, 0)`;
     }
     if (!horizontalThumb.hidden) {
-      horizontalThumb.style.transform = `translate3d(${TRACK_INSET + container.scrollLeft * horizontalThumbPixelsPerScrollPixel}px, 0, 0)`;
+      horizontalThumb.style.transform = `translate3d(${TRACK_INSET + (horizontalScrollOrigin + container.scrollLeft) * horizontalThumbPixelsPerScrollPixel}px, 0, 0)`;
     }
   };
 
@@ -206,6 +226,7 @@ function bindScrollbar(
       scrollStartPx: axis === "vertical" ? container.scrollTop : container.scrollLeft,
     };
     markUserIntent();
+    onThumbDragStart();
     hideDeadlineMs = Number.POSITIVE_INFINITY;
     if (hideTimerId !== null) {
       clearTimeout(hideTimerId);
@@ -287,9 +308,17 @@ function bindScrollbar(
   root.addEventListener("pointerover", onPointerOver);
   root.addEventListener("pointerout", onPointerOut);
 
-  // ResizeObserver invalidates measurements; MutationObserver only keeps direct-child observation current.
+  // ResizeObserver callbacks run right after layout, so measuring there reads
+  // geometry the browser already has. Deferring to the next frame instead
+  // read it after the chat's own writes (a streaming reply grows the content
+  // every chunk) and forced a synchronous layout each time.
+  // MutationObserver only keeps direct-child observation current.
   const resizeObserver = globalThis.ResizeObserver
-    ? new ResizeObserver(() => scheduleUpdate(true))
+    ? new ResizeObserver(() => {
+        needsMeasurement = false;
+        measureThumbs();
+        positionThumbs();
+      })
     : null;
 
   const observeSizes = () => {
@@ -339,7 +368,8 @@ function bindScrollbar(
     update(nextOptions: ScrollbarOptions) {
       const visibilityChanged = nextOptions.alwaysVisible !== options.alwaysVisible;
       const mustMeasure = nextOptions.disableHorizontal !== options.disableHorizontal
-        || nextOptions.minThumbSize !== options.minThumbSize;
+        || nextOptions.minThumbSize !== options.minThumbSize
+        || nextOptions.verticalTrackStart !== options.verticalTrackStart;
       if (nextOptions.observeMutations !== options.observeMutations) {
         setMutationObservation(nextOptions.observeMutations);
         if (nextOptions.observeMutations) observeSizes();
@@ -397,7 +427,11 @@ export const OverlayScrollbar: React.FC<OverlayScrollbarProps> = ({
   observeMutations = true,
   suppressVisibility = false,
   userIntentOnly = false,
+  verticalTrackStart = 0,
+  onThumbDragStart,
 }) => {
+  const onThumbDragStartRef = React.useRef(onThumbDragStart);
+  onThumbDragStartRef.current = onThumbDragStart;
   const alwaysVisible = useUIStore((state) => state.alwaysShowScrollbars === true);
   const rootRef = React.useRef<HTMLDivElement>(null);
   const verticalThumbRef = React.useRef<HTMLDivElement>(null);
@@ -412,6 +446,7 @@ export const OverlayScrollbar: React.FC<OverlayScrollbarProps> = ({
     observeMutations,
     suppressVisibility,
     userIntentOnly,
+    verticalTrackStart,
   });
   optionsRef.current = {
     alwaysVisible,
@@ -421,6 +456,7 @@ export const OverlayScrollbar: React.FC<OverlayScrollbarProps> = ({
     observeMutations,
     suppressVisibility,
     userIntentOnly,
+    verticalTrackStart,
   };
 
   // Follow the LIVE container node, not the ref object: the chat timeline's
@@ -442,7 +478,7 @@ export const OverlayScrollbar: React.FC<OverlayScrollbarProps> = ({
     const horizontalThumb = horizontalThumbRef.current;
     if (!container || !root || !verticalThumb || !horizontalThumb) return;
 
-    bindingRef.current = bindScrollbar(container, root, verticalThumb, horizontalThumb, optionsRef.current);
+    bindingRef.current = bindScrollbar(container, root, verticalThumb, horizontalThumb, optionsRef.current, () => onThumbDragStartRef.current?.());
   });
 
   React.useLayoutEffect(() => () => {
@@ -460,8 +496,9 @@ export const OverlayScrollbar: React.FC<OverlayScrollbarProps> = ({
       observeMutations,
       suppressVisibility,
       userIntentOnly,
+      verticalTrackStart,
     });
-  }, [alwaysVisible, disableHorizontal, hideDelayMs, minThumbSize, observeMutations, suppressVisibility, userIntentOnly]);
+  }, [alwaysVisible, disableHorizontal, hideDelayMs, minThumbSize, observeMutations, suppressVisibility, userIntentOnly, verticalTrackStart]);
 
   return (
     <div ref={rootRef} className={cn("overlay-scrollbar", className)} aria-hidden="true">
@@ -477,7 +514,7 @@ export const OverlayScrollbar: React.FC<OverlayScrollbarProps> = ({
         hidden
         className="overlay-scrollbar__thumb overlay-scrollbar__thumb--horizontal"
         data-overlay-scrollbar-thumb="horizontal"
-        style={{ bottom: `${TRACK_INSET / 2}px` }}
+        style={{ bottom: `${TRACK_INSET / 2}px`, left: 0 }}
       />
     </div>
   );

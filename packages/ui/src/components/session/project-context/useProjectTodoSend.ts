@@ -3,7 +3,7 @@ import React from 'react';
 import { toast } from '@/components/ui';
 import { generateBranchName } from '@/lib/git/branchNameGenerator';
 import { useI18n } from '@/lib/i18n';
-import { renderMagicPrompt } from '@/lib/magicPrompts';
+import { loadMagicPrompts } from '@/lib/magicPrompts';
 import type { ProjectRef } from '@/lib/projectContextApi';
 import { createWorktreeSessionForNewBranch } from '@/lib/worktreeSessionCreator';
 import { useConfigStore } from '@/stores/useConfigStore';
@@ -95,18 +95,20 @@ export const useProjectTodoSend = (options: {
         return;
       }
 
-      const visiblePrompt = await renderMagicPrompt('plan.todo.visible', {
-        todo_text: pendingSendTarget.todoText,
-      });
-      const instructionsText = await renderMagicPrompt('plan.todo.instructions', {
-        todo_text: pendingSendTarget.todoText,
-      });
-      const syntheticParts = [{ synthetic: true as const, text: instructionsText }];
-
       setIsSubmitting(true);
       setSendingTodoId(pendingSendTarget.todoId);
 
       try {
+        // The todo's project owns the prompts, also when the session lands in a new worktree.
+        const prompts = await loadMagicPrompts(projectRef.path);
+        const visiblePrompt = prompts.render('plan.todo.visible', {
+          todo_text: pendingSendTarget.todoText,
+        });
+        const instructionsText = prompts.render('plan.todo.instructions', {
+          todo_text: pendingSendTarget.todoText,
+        });
+        const syntheticParts = [{ synthetic: true as const, text: instructionsText }];
+
         routeToChat();
 
         let sessionId: string | null = null;
@@ -122,7 +124,7 @@ export const useProjectTodoSend = (options: {
             return;
           }
           sessionId = created.id;
-          directoryHint = created.path;
+          directoryHint = created.directory;
         } else {
           const session = await createSession(undefined, projectRef.path, undefined, {
             model: { providerID: execution.providerID, id: execution.modelID, variant: execution.variant || undefined },

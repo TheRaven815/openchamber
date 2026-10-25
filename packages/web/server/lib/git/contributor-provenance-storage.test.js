@@ -44,6 +44,15 @@ describe('contributor provenance storage', () => {
       .rejects.toMatchObject({ code: 'CONTRIBUTOR_PROVENANCE_CONFLICT', status: 409 });
   });
 
+  it('records a worktree of an unbound repository at binding revision 0', async () => {
+    const { store } = await setup();
+    const unbound = { ...provenance, bindingRevision: 0 };
+    await expect(store.compareAndSwap('/checkout', 0, unbound)).resolves.toMatchObject({ revision: 1, provenance: unbound });
+    await expect(store.read('/checkout')).resolves.toMatchObject({ provenance: unbound });
+    await expect(store.compareAndSwap('/checkout', 1, { ...provenance, bindingRevision: -1 }))
+      .rejects.toMatchObject({ code: 'CONTRIBUTOR_PROVENANCE_STORE_INVALID' });
+  });
+
   it('frees the slot of a removed worktree when the store is full', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'openchamber-contributor-'));
     roots.push(root);
@@ -129,5 +138,34 @@ describe('contributor provenance storage', () => {
     expect(records).toHaveLength(2);
     expect(records.every((record) => record.provenance === null)).toBe(true);
     expect(storeReads).toBe(1);
+  });
+
+  it('reads an unresolvable listed worktree as no provenance instead of failing the batch', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'openchamber-contributor-batch-'));
+    roots.push(root);
+    const gitDirectory = path.join(root, 'one');
+    await fs.mkdir(gitDirectory);
+    const store = createContributorProvenanceStore({
+      filePath: path.join(root, 'provenance.json'),
+      resolveRepositoryIdentity: async (directory) => (directory === '/gone'
+        ? { supported: false }
+        : { supported: true, repositoryId: 'repo_one' }),
+      resolveGitPaths: async (directory) => (directory === '/gone'
+        ? { supported: false, reason: 'not-a-git-repository' }
+        : { supported: true, bare: false, gitDirectory }),
+    });
+
+    // A worktree deleted outside git (or a bare repository root) has no
+    // identity to look up; the rest of the listing still answers.
+    const records = await store.readMany(['/one', '/gone']);
+    expect(records).toHaveLength(2);
+    expect(records[0].provenance).toBe(null);
+    expect(records[1]).toEqual({ revision: 0, provenance: null });
+
+    // Store corruption stays a hard failure.
+    await fs.writeFile(path.join(root, 'provenance.json'), '{"version":1,"records":"bad"}', { mode: 0o600 });
+    await expect(store.readMany(['/one', '/gone'])).rejects.toMatchObject({
+      code: 'CONTRIBUTOR_PROVENANCE_STORE_INVALID',
+    });
   });
 });

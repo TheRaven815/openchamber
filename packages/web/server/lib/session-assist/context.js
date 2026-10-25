@@ -12,7 +12,12 @@ const QUOTE_FIELDS = new Map([
   ['browser-annotation', 'prompt'], ['pr-comment', 'body'], ['pr-check', 'output'],
   ['terminal', 'output'],
 ]);
-const LINK_KINDS = new Set(['github-issue', 'github-pr', 'linear-issue']);
+// Linked items whose message text is the whole context: the current kinds
+// (`repository-issue`, `repository-discussion`, `change-request`,
+// `tracker-item`) and the legacy names older messages carry.
+const LINK_KINDS = new Set([
+  'repository-issue', 'repository-discussion', 'change-request', 'tracker-item', 'github-issue', 'github-pr', 'linear-issue',
+]);
 
 export function excerpt(text, limit) {
   if (text.length <= limit) return text;
@@ -111,6 +116,7 @@ function readMessage(message) {
     id: message.id,
     role,
     created: Number.isFinite(message.time?.created) ? message.time.created : null,
+    completed: Number.isFinite(message.time?.completed) ? message.time.completed : null,
     transparent: isTransparent(message),
     // v2 has no `parentID` on a message: a turn is the run of messages between
     // one user message and the assistant reply that follows it, which is what
@@ -135,7 +141,7 @@ function readMessage(message) {
  * about to send — v1 carried them as parts of that user message — so they are
  * folded into the next user message instead of opening a turn of their own.
  */
-function collectTurns(messages, limit = TURN_LIMIT) {
+function collectTurns(messages) {
   const turns = [];
   let active = null;
   let attached = [];
@@ -159,46 +165,7 @@ function collectTurns(messages, limit = TURN_LIMIT) {
     if (message.text) active.assistant = message;
     active.complete = message.complete && Boolean(message.text);
   }
-  return turns.slice(-limit);
-}
-
-const settledTurns = (messages) => collectTurns(messages, Infinity)
-  .filter((turn) => turn.complete)
-  .slice(-TURN_LIMIT);
-
-/**
- * The settled turns before a message that was just sent, oldest first: what a
- * classifier reads next to the new request. The newest records may already
- * hold that message (and nothing after it); a turn without a completed answer
- * is not settled and is left out. Failure is thrown; an empty list means the
- * session has no settled turn yet.
- */
-export async function loadSettledTurns({ readPage, signal }) {
-  let messages = [];
-  let cursor;
-  const cursors = new Set();
-  const ids = new Set();
-  for (let pageNumber = 0; pageNumber < MAX_PAGES; pageNumber++) {
-    signal.throwIfAborted();
-    const page = await readPage({ limit: PAGE_SIZE, cursor });
-    signal.throwIfAborted();
-    if (!Array.isArray(page?.data)) throw new Error('Session message page is unavailable');
-    const older = [];
-    for (const record of page.data) {
-      if (!record?.id || ids.has(record.id)) continue;
-      ids.add(record.id);
-      older.push(readMessage(record));
-    }
-    older.reverse();
-    messages = older.concat(messages);
-    const settled = settledTurns(messages);
-    const next = typeof page.cursor?.next === 'string' ? page.cursor.next : null;
-    if (settled.length === TURN_LIMIT || !next) return settled;
-    if (cursors.has(next)) throw new Error('Session message pagination made no progress');
-    cursors.add(next);
-    cursor = next;
-  }
-  return settledTurns(messages);
+  return turns.slice(-TURN_LIMIT);
 }
 
 /** Failure is thrown; null means no eligible final answer within bounded history. */

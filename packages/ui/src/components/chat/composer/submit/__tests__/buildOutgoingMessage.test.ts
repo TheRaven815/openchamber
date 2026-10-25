@@ -6,11 +6,13 @@ import { fileURLToPath } from 'node:url';
 import type { AttachedFile } from '@/stores/types/sessionTypes';
 import type { InlineCommentDraft } from '@/stores/useInlineCommentDraftStore';
 import { CONTEXT_METADATA_KEY, contextPayloadFromDraft } from '@/lib/messages/contextParts';
-import type { QueuedContextPart } from '@/stores/messageQueueStore';
+import type { QueuedContextPart, QueuedMessage } from '@/stores/messageQueueStore';
 import {
     buildComposerContext,
     buildOutgoingMessage,
+    expandCommentSnippets,
     queuedContextToParts,
+    selectComposerQueue,
     type ComposerContextInput,
     type OutgoingMessageDeps,
     type OutgoingMessageInput,
@@ -79,13 +81,47 @@ describe('the composer text alone', () => {
     });
 });
 
+describe('manual queue projection', () => {
+    const ordinary: QueuedMessage = {
+        id: 'ordinary', content: 'User follow up', text: 'User follow up', createdAt: 1,
+        sendConfig: { providerID: 'openai', modelID: 'chosen', agent: 'plan' },
+    };
+    const scheduled: QueuedMessage = {
+        id: 'scheduled', content: 'Scheduled follow up', text: 'Scheduled follow up', createdAt: 1,
+        scheduledTask: { projectId: 'project-1', taskId: 'task-1' },
+    };
+
+    for (const sendConfig of [undefined, { providerID: 'other', modelID: 'other' }]) {
+        test(`a scheduled head with ${sendConfig ? 'explicit' : 'inherited'} selection does not supply config or text to mixed send-all`, () => {
+            const projection = selectComposerQueue([{ ...scheduled, sendConfig }, ordinary]);
+            expect(projection).toEqual([ordinary]);
+            expect(projection[0]?.sendConfig).toBe(ordinary.sendConfig);
+            const outgoing = buildOutgoingMessage(input({ queued: projection, composerText: 'Typed now' }), deps());
+            expect(outgoing.primaryText).toBe('User follow up\n\nTyped now');
+            expect(outgoing.additionalParts).toEqual([]);
+        });
+    }
+
+    test('a scheduled-only queue has no manual sendable content', () => {
+        const projection = selectComposerQueue([scheduled]);
+        expect(projection.length).toBe(0);
+        expect(projection[0]?.sendConfig).toBeUndefined();
+        expect(buildOutgoingMessage(input({ queued: projection }), deps()).isEmpty).toBe(true);
+    });
+
+    test('ordinary queues keep their original items, order and identity', () => {
+        const queue = [ordinary, { ...ordinary, id: 'second' }];
+        expect(selectComposerQueue(queue)).toBe(queue);
+    });
+});
+
 describe('queued messages', () => {
-    test('the oldest becomes primary and the rest follow in order', () => {
+    test('all of them share the visible message, oldest first', () => {
         const result = buildOutgoingMessage(input({
             queued: [{ text: 'first' }, { text: 'second' }, { text: 'third' }],
         }), deps());
-        expect(result.primaryText).toBe('first');
-        expect(result.additionalParts.map((p) => p.text)).toEqual(['second', 'third']);
+        expect(result.primaryText).toBe('first\n\nsecond\n\nthird');
+        expect(result.additionalParts).toEqual([]);
     });
 
     test('the composer text lands after everything queued', () => {
@@ -93,11 +129,20 @@ describe('queued messages', () => {
             queued: [{ text: 'queued' }],
             composerText: 'typed now',
         }), deps());
-        expect(result.primaryText).toBe('queued');
-        expect(result.additionalParts.map((p) => p.text)).toEqual(['typed now']);
+        expect(result.primaryText).toBe('queued\n\ntyped now');
+        expect(result.additionalParts).toEqual([]);
     });
 
-    test('the context a message was queued with follows it, before the next message', () => {
+    test('an attachment-only queued message adds no blank paragraph', () => {
+        const result = buildOutgoingMessage(input({
+            queued: [{ text: '', attachments: [attachment('pic')] }],
+            composerText: 'typed now',
+        }), deps());
+        expect(result.primaryText).toBe('typed now');
+        expect(result.primaryAttachments.map((a) => a.id)).toEqual(['pic']);
+    });
+
+    test('the context each message was queued with is sent in queue order', () => {
         const metadata = { [CONTEXT_METADATA_KEY]: { kind: 'repository-issue' as const, number: 3, title: 'Bug', url: 'https://x/issues/3' } };
         const result = buildOutgoingMessage(input({
             queued: [
@@ -106,8 +151,8 @@ describe('queued messages', () => {
             ],
             composerText: 'typed now',
         }), deps());
-        expect(result.primaryText).toBe('first');
-        expect(result.additionalParts.map((p) => p.text)).toEqual(['issue body', 'use: deploy', 'second', 'typed now']);
+        expect(result.primaryText).toBe('first\n\nsecond\n\ntyped now');
+        expect(result.additionalParts.map((p) => p.text)).toEqual(['issue body', 'use: deploy']);
         expect(result.additionalParts[0]).toEqual({ text: 'issue body', synthetic: true, metadata });
         expect(result.additionalParts[1]).toEqual({ text: 'use: deploy', synthetic: true });
     });
@@ -122,15 +167,17 @@ describe('queued messages', () => {
         expect(result.additionalParts).toEqual([]);
     });
 
-    test('each queued message keeps its own attachments', () => {
+    test('every attachment rides the visible message, in order', () => {
         const result = buildOutgoingMessage(input({
             queued: [
                 { text: 'a', attachments: [attachment('one')] },
                 { text: 'b', attachments: [attachment('two')] },
             ],
+            composerText: 'c',
+            composerAttachments: [attachment('three')],
         }), deps());
-        expect(result.primaryAttachments.map((a) => a.id)).toEqual(['one']);
-        expect(result.additionalParts[0].attachments?.map((a) => a.id)).toEqual(['two']);
+        expect(result.primaryAttachments.map((a) => a.id)).toEqual(['one', 'two', 'three']);
+        expect(result.additionalParts).toEqual([]);
     });
 });
 
@@ -233,15 +280,15 @@ describe('synthetic context', () => {
             .toEqual({ kind: 'repository-issue', number: 3, title: 'Bug', url: 'https://x/issues/3' });
     });
 
-    test('a linked Linear issue is sent as context', () => {
+    test('a linked tracker item is sent as context', () => {
         const result = buildOutgoingMessage(input({
             composerText: 'fix it',
-            references: [{ kind: 'linear-issue', identifier: 'ENG-12', title: 'Login', url: 'https://linear.app/x/issue/ENG-12', contextText: 'linear body' }],
+            references: [{ kind: 'tracker-item', provider: 'linear', identifier: 'ENG-12', title: 'Login', url: 'https://linear.app/x/issue/ENG-12', contextText: 'linear body' }],
         }), deps());
         expect(result.additionalParts).toHaveLength(1);
         expect(result.additionalParts[0].text).toBe('linear body');
         expect(result.additionalParts[0].metadata?.[CONTEXT_METADATA_KEY])
-            .toEqual({ kind: 'linear-issue', identifier: 'ENG-12', title: 'Login', url: 'https://linear.app/x/issue/ENG-12' });
+            .toEqual({ kind: 'tracker-item', provider: 'linear', identifier: 'ENG-12', title: 'Login', url: 'https://linear.app/x/issue/ENG-12' });
     });
 
     test('a linked guest issue is sent as context', () => {
@@ -365,7 +412,7 @@ describe('several references', () => {
         const result = buildOutgoingMessage(input({
             composerText: 'compare',
             references: [
-                { kind: 'linear-issue', identifier: 'ENG-1', title: 'A', url: 'https://linear.app/x/issue/ENG-1', contextText: 'linear' },
+                { kind: 'tracker-item', provider: 'linear', identifier: 'ENG-1', title: 'A', url: 'https://linear.app/x/issue/ENG-1', contextText: 'linear' },
                 { kind: 'repository-issue', number: 3, title: 'Bug', url: 'https://x/issues/3', contextText: 'issue 3' },
                 { kind: 'repository-issue', number: 4, title: 'Bug', url: 'https://x/issues/4', contextText: 'issue 4' },
                 { kind: 'guest', providerId: 'jira', id: 'OPS-2', title: 'Ops', url: 'https://jira/OPS-2', contextText: 'jira' },
@@ -384,14 +431,12 @@ describe('full assembly order', () => {
             references: [
                 { kind: 'repository-issue', number: 3, title: 'Bug', url: 'https://x/issues/3', contextText: 'issue' },
                 { kind: 'change-request', provider: 'github', number: 7, title: 'PR', url: 'https://x/pr/7', context: 'pr-diff' },
-                { kind: 'linear-issue', identifier: 'ENG-12', title: 'Login', url: 'https://linear.app/x/issue/ENG-12', contextText: 'linear' },
+                { kind: 'tracker-item', provider: 'linear', identifier: 'ENG-12', title: 'Login', url: 'https://linear.app/x/issue/ENG-12', contextText: 'linear' },
             ],
         }), deps());
 
-        expect(result.primaryText).toBe('q1');
+        expect(result.primaryText).toBe('q1\n\nq2\n\ntyped /deploy');
         expect(result.additionalParts.map((p) => p.text)).toEqual([
-            'q2',
-            'typed /deploy',
             'synthetic',
             'issue',
             'pr-diff',
@@ -416,7 +461,7 @@ describe('capturing composer context for the queue', () => {
             references: [
                 { kind: 'repository-issue', number: 3, title: 'Bug', url: 'https://x/issues/3', contextText: 'issue' },
                 { kind: 'change-request', provider: 'github', number: 7, title: 'PR', url: 'https://x/pr/7', context: 'pr-diff' },
-                { kind: 'linear-issue', identifier: 'ENG-12', title: 'Login', url: 'https://linear.app/x/issue/ENG-12', contextText: 'linear' },
+                { kind: 'tracker-item', provider: 'linear', identifier: 'ENG-12', title: 'Login', url: 'https://linear.app/x/issue/ENG-12', contextText: 'linear' },
             ],
         }), 'use: deploy');
 
@@ -498,6 +543,18 @@ describe('the composer send gate counts what the submission builder counts', () 
     // ChatInput cannot be mounted in bun test: its import graph pulls the composer editor,
     // Vite worker URLs and every runtime store. The gate is guarded at the source, the way
     // the neighbouring composer regression tests guard theirs.
+    test('queue counts and captured configuration use the ordinary-only projection', () => {
+        expect(gateExpression(/const composerQueuedMessages = ([^;\n]*);/, 'the manual queue projection'))
+            .toBe('selectComposerQueue(queuedMessages)');
+        expect(gateExpression(/const hasQueuedMessages = ([^;\n]*);/, 'the manual queue content gate'))
+            .toContain('composerQueuedMessages.length > 0');
+        const projection = gateExpression(/const queuedProjection = ([\s\S]*?);\n/, 'the captured queue projection');
+        expect(projection).toContain('composerQueuedMessages');
+        expect(projection).not.toContain('queuedMessages');
+        expect(gateExpression(/const capturedSendConfig = ([^;\n]*);/, 'the captured queue selection'))
+            .toContain('queuedProjection[0]?.sendConfig');
+    });
+
     test('every predicate the composer sends with counts a linked reference', () => {
         const gates = [
             gateExpression(/const hasContent = ([^;\n]*);/, 'the send-button gate'),
@@ -529,7 +586,7 @@ describe('the composer send gate counts what the submission builder counts', () 
         const onlyLinked: Partial<OutgoingMessageInput>[] = [
             { references: [{ kind: 'repository-issue', number: 12, title: 'Attached', url: 'https://github.com/acme/app/issues/12', contextText: 'body' }] },
             { references: [{ kind: 'change-request', provider: 'github', number: 34, title: 'Attached', url: 'https://github.com/acme/app/pull/34', context: 'body' }] },
-            { references: [{ kind: 'linear-issue', identifier: 'ENG-1', title: 'Attached', url: 'https://linear.app/acme/issue/ENG-1', contextText: 'body' }] },
+            { references: [{ kind: 'tracker-item', provider: 'linear', identifier: 'ENG-1', title: 'Attached', url: 'https://linear.app/acme/issue/ENG-1', contextText: 'body' }] },
             { references: [{ kind: 'guest', providerId: 'guest.example', id: 'guest-1', title: 'Attached', url: 'https://example.com/issues/1', contextText: 'body' }] },
         ];
 
@@ -541,3 +598,33 @@ describe('the composer send gate counts what the submission builder counts', () 
     });
 });
 
+
+describe('expandCommentSnippets', () => {
+    const draft = (text: string, code = 'see #review here'): InlineCommentDraft => ({
+        id: text,
+        sessionKey: 's',
+        source: 'chat-quote',
+        fileLabel: 'm1',
+        startLine: 1,
+        endLine: 1,
+        code,
+        language: '',
+        text,
+        createdAt: 0,
+    });
+    const expandText = async (text: string) => text.replace('#review', 'Review this carefully.');
+
+    test('expands the comment words and leaves the quote verbatim', async () => {
+        const [expanded] = await expandCommentSnippets([draft('#review please')], expandText);
+        expect(expanded.text).toBe('Review this carefully. please');
+        expect(expanded.code).toBe('see #review here');
+    });
+
+    test('keeps a comment as written when expansion fails', async () => {
+        const original = draft('#review please');
+        const [kept] = await expandCommentSnippets([original], async () => {
+            throw new Error('offline');
+        });
+        expect(kept).toBe(original);
+    });
+});

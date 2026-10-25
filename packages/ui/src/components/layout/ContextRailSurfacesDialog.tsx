@@ -1,7 +1,7 @@
 import React from 'react';
 import { useI18n } from '@/lib/i18n';
 import { useUIStore } from '@/stores/useUIStore';
-import { SettingsCheckboxRow } from '@/components/sections/shared/SettingsSection';
+import { SettingsSortableVisibilityList } from '@/components/sections/shared/SettingsSortableVisibilityList';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -26,6 +26,7 @@ export const ContextRailSurfacesDialog: React.FC<{
 }> = ({ open, onOpenChange }) => {
   const { t } = useI18n();
   const contextRailOrder = useUIStore((state) => state.contextRailOrder);
+  const setSurfaceOrder = useUIStore((state) => state.setContextRailOrder);
   const hidden = useUIStore((state) => state.contextRailHiddenSurfaces);
   const setSurfaceVisible = useUIStore((state) => state.setContextRailSurfaceVisible);
   const setHiddenSurfaces = useUIStore((state) => state.setContextRailHiddenSurfaces);
@@ -40,27 +41,50 @@ export const ContextRailSurfacesDialog: React.FC<{
 
   const allVisible = hidden.length === 0;
   const noneVisible = surfaces.every((surface) => hidden.includes(surface.id));
+  const dragging = React.useRef(false);
+  const items = React.useMemo(() => surfaces.map((surface) => ({
+    id: surface.id,
+    label: surface.label ?? t(surface.labelKey),
+    visible: !hidden.includes(surface.id),
+  })), [hidden, surfaces, t]);
+  const handleReorder = (next: string[]) => {
+    const shown = new Set<string>(next);
+    // Keep saved entries for extensions that are temporarily unavailable.
+    setSurfaceOrder([...next, ...contextRailOrder.filter((id) => !shown.has(id))]);
+  };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-md">
+    <Dialog open={open} onOpenChange={(nextOpen, details) => {
+      if (!nextOpen && details.reason === 'escape-key' && dragging.current) {
+        details.cancel();
+        details.allowPropagation();
+        return;
+      }
+      dragging.current = false;
+      onOpenChange(nextOpen);
+    }}>
+      <DialogContent
+        className="max-w-md"
+        onKeyDown={(event) => {
+          // Base UI stops arrow keys at the popup; dnd-kit listens on document.
+          if (dragging.current && ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(event.key)) {
+            event.preventBaseUIHandler();
+          }
+        }}
+      >
         <DialogHeader>
           <DialogTitle>{t('contextRail.configure.dialogTitle')}</DialogTitle>
           <DialogDescription>{t('contextRail.configure.dialogDescription')}</DialogDescription>
         </DialogHeader>
 
-        <div className="flex flex-col">
-          {surfaces.map((surface) => (
-            <SettingsCheckboxRow
-              key={surface.id}
-              settingsItem={`layout.context-rail.surface.${surface.id}`}
-              checked={!hidden.includes(surface.id)}
-              onChange={(checked) => setSurfaceVisible(surface.id, checked)}
-              label={surface.label ?? t(surface.labelKey)}
-              ariaLabel={surface.label ?? t(surface.labelKey)}
-            />
-          ))}
-        </div>
+        <SettingsSortableVisibilityList
+          items={items}
+          onVisibleChange={setSurfaceVisible}
+          onReorder={handleReorder}
+          settingsItemPrefix="layout.context-rail.surface."
+          dragInstructions={t('contextRail.configure.dragInstructions')}
+          onDraggingChange={(next) => { dragging.current = next; }}
+        />
 
         {!allVisible ? (
           <div className="flex items-center justify-between border-t pt-3">

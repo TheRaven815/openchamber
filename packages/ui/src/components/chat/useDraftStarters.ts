@@ -3,7 +3,7 @@ import { arrayMove } from '@dnd-kit/sortable';
 import { useI18n } from '@/lib/i18n';
 import { useUIStore } from '@/stores/useUIStore';
 import { useCommandsStore } from '@/stores/useCommandsStore';
-import { useSkillsStore } from '@/stores/useSkillsStore';
+import { selectAvailableSkillsForDirectory, useSkillsStore } from '@/stores/useSkillsStore';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { updateDesktopSettings } from '@/lib/persistence';
 import { getProjectDraftStarters, saveProjectDraftStarters, updateSharedProjectSetup, type ProjectDraftStarter } from '@/lib/openchamberConfig';
@@ -68,7 +68,7 @@ export function useDraftStarters(): UseDraftStartersResult {
     const isVSCode = React.useMemo(() => isVSCodeRuntime(), []);
     const globalRaw = useUIStore((s) => s.globalDraftStarters);
     const commands = useCommandsStore((s) => s.commands);
-    const skills = useSkillsStore((s) => s.skills);
+    const skills = useSkillsStore((s) => selectAvailableSkillsForDirectory(s));
     const activeProjectId = useProjectsStore((s) => s.activeProjectId);
     const projects = useProjectsStore((s) => s.projects);
 
@@ -99,7 +99,7 @@ export function useDraftStarters(): UseDraftStartersResult {
         return () => { cancelled = true; };
         // Keyed on project id to avoid reloading when the memoized ref object
         // changes identity but still points at the same project.
-        // eslint-disable-next-line react-hooks/exhaustive-deps
+        // oxlint-disable-next-line react-hooks/exhaustive-deps
     }, [projectRef?.id]);
 
     const ensureLoaded = React.useCallback(() => {
@@ -130,7 +130,7 @@ export function useDraftStarters(): UseDraftStartersResult {
             return { id: chipId(group, plain), ref: plain, group, label: normalizeStarterLabel(ref.name), icon: COMMAND_FALLBACK_ICON, submitText: `/${ref.name}`, shared };
         }
         if (!skillNames.has(ref.name)) return null;
-        return { id: chipId(group, plain), ref: plain, group, label: normalizeStarterLabel(ref.name), icon: SKILL_FALLBACK_ICON, submitText: `/${ref.name}`, shared };
+        return { id: chipId(group, plain), ref: plain, group, label: normalizeStarterLabel(ref.name), icon: SKILL_FALLBACK_ICON, submitText: `$${ref.name}`, shared };
     }, [t, commandNames, skillNames, isVSCode]);
 
     const globalRefs = React.useMemo<readonly DraftStarterRef[]>(

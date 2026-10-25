@@ -6,6 +6,10 @@ import {
   type GuestWorkspaceQuery,
   type GuestWorkspaceSnapshot,
   type GuestWorkspaceSubscription,
+  type GuestShellsSubscription,
+  type GuestShellOutputRequest,
+  type GuestShellOutputResult,
+  type GuestShellStopResult,
   GUEST_SESSION_AGENT_MAX,
   GUEST_SESSION_MODEL_MAX,
   OPENCHAMBER_SDK_API_VERSION,
@@ -27,6 +31,7 @@ import {
   type HostReadyContext,
   type HostRequestErrorCode,
   type HostResultPayload,
+  type LateGenerateResult,
   type ResolveResultPayload,
   type SessionSnapshot,
   type StartSessionResult,
@@ -36,6 +41,7 @@ import {
 import type { GuestFileProxyResult, GuestFileRequest } from '@/lib/guests/files';
 import type { GuestGenerateProxyResult } from '@/lib/guests/generate';
 import type { GuestOpenCommitResult } from '@/lib/guests/open-commit';
+import type { GuestOpenSurfaceResult } from '@/lib/guests/open-surface';
 import type { GuestRequestProxyResult } from '@/lib/guests/oauth';
 
 import { isContextPanelMode, type ContextPanelMode } from '@/lib/surfaces/modes';
@@ -44,12 +50,17 @@ type HostBridgeEffects = {
   workspaceRead: (query: GuestWorkspaceQuery) => GuestWorkspaceSnapshot;
   workspaceSubscribe: (subscription: GuestWorkspaceSubscription) => void;
   workspaceUnsubscribe: (subscriptionId: string) => void;
+  shellsSubscribe: (subscription: GuestShellsSubscription) => void;
+  shellsUnsubscribe: (subscriptionId: string) => void;
+  shellOutput: (request: GuestShellOutputRequest) => Promise<GuestShellOutputResult>;
+  shellStop: (request: { shellId: string }) => Promise<GuestShellStopResult>;
   storage: (request: GuestStorageRequest) => Promise<GuestStorageResult>;
   setStatusControls: (controls: GuestStatusControl[]) => void;
   openSession: (sessionId: string) => void;
   toast: (request: ToastRequest) => void;
   openUrl: (url: string) => Promise<boolean>;
-  openSurface: (mode: ContextPanelMode) => void;
+  /** Open a context panel surface; the pane owns directory and runtime support. */
+  openSurface: (mode: ContextPanelMode) => GuestOpenSurfaceResult;
   writeClipboard: (text: string) => Promise<boolean>;
   compose: (text: string, mode: 'replace' | 'append') => void;
   attach: (issue: AttachIssueRequest) => void;
@@ -142,6 +153,13 @@ export const buildResolveMessage = (id: string, command: string, args: string): 
   payload: { command, args },
 });
 
+export const buildGenerateLateMessage = (result: LateGenerateResult): HostMessage => ({
+  channel: OPENCHAMBER_SDK_CHANNEL,
+  v: OPENCHAMBER_SDK_API_VERSION,
+  type: 'generate-late',
+  payload: result,
+});
+
 export const buildSessionLifecycleMessage = (event: SessionLifecycleEvent): HostMessage => ({
   channel: OPENCHAMBER_SDK_CHANNEL,
   v: OPENCHAMBER_SDK_API_VERSION,
@@ -164,7 +182,7 @@ export const guestSessionLifecyclePhase = (
   return null;
 };
 
-export type GuestSessionSource = {
+type GuestSessionSource = {
   id: string;
   title?: string | null;
   busy?: boolean;
@@ -250,6 +268,10 @@ export const answerGuestMessage = async (
     case 'workspace-read': return okResult(message.id, effects.workspaceRead(message.payload));
     case 'workspace-subscribe': effects.workspaceSubscribe(message.payload); return okResult(message.id);
     case 'workspace-unsubscribe': effects.workspaceUnsubscribe(message.payload.subscriptionId); return okResult(message.id);
+    case 'shells-subscribe': effects.shellsSubscribe(message.payload); return okResult(message.id);
+    case 'shells-unsubscribe': effects.shellsUnsubscribe(message.payload.subscriptionId); return okResult(message.id);
+    case 'shell-output': return okResult(message.id, await effects.shellOutput(message.payload));
+    case 'shell-stop': return okResult(message.id, await effects.shellStop(message.payload));
     case 'storage': return okResult(message.id, await effects.storage(message.payload));
     case 'status-controls': effects.setStatusControls(message.payload.controls); return okResult(message.id);
     case 'open-session': effects.openSession(message.payload.sessionId); return okResult(message.id);
@@ -261,6 +283,7 @@ export const answerGuestMessage = async (
     case 'file-change':
     case 'file-save':
     case 'file-unsupported':
+    case 'generate-late-listen':
       return null;
     case 'toast':
       effects.toast(message.payload);
@@ -276,8 +299,8 @@ export const answerGuestMessage = async (
       if (!isContextPanelMode(message.payload.surfaceId)) {
         return errorResult(message.id, 'Unknown surface.');
       }
-      effects.openSurface(message.payload.surfaceId);
-      return okResult(message.id);
+      const opened = effects.openSurface(message.payload.surfaceId);
+      return opened.ok ? okResult(message.id) : errorResult(message.id, opened.message, opened.code);
     }
     case 'clipboard-write': {
       const copied = await effects.writeClipboard(message.payload.text);

@@ -73,7 +73,6 @@ describe('useSessionGrouping malformed hierarchy fallbacks', () => {
         sessionOrderRanks,
         gitBranches,
         isVSCode: false,
-        worktreeSortOrder: 'recent' as const,
       }).buildGroupedSessions;
       return null;
     };
@@ -108,7 +107,6 @@ describe('useSessionGrouping malformed hierarchy fallbacks', () => {
         sessionOrderRanks: new Map(),
         gitBranches: new Map(),
         isVSCode: false,
-        worktreeSortOrder: 'recent' as const,
       }).buildGroupedSessions;
       return null;
     };
@@ -131,12 +129,12 @@ describe('useSessionGrouping malformed hierarchy fallbacks', () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
-  test('stable worktree sorts ignore session activity', () => {
+  test('worktrees follow their latest activity', () => {
     const worktree = (name: string): WorktreeMetadata => ({
       source: 'sdk', name, path: `/workspace/.wt/${name}`, projectDirectory: '/workspace', branch: name, label: name,
     });
     const busy = { ...session('busy'), directory: '/workspace/.wt/zeta', time: { created: 1, updated: 99 } };
-    const worktreeOrder = (worktreeSortOrder: 'recent' | 'a-z') => {
+    const worktreeOrder = () => {
       const state: { build?: ReturnType<typeof useSessionGrouping>['buildGroupedSessions'] } = {};
       const Harness = () => {
         state.build = useSessionGrouping({
@@ -146,7 +144,6 @@ describe('useSessionGrouping malformed hierarchy fallbacks', () => {
           sessionOrderRanks: new Map(),
           gitBranches: new Map(),
           isVSCode: false,
-          worktreeSortOrder,
         }).buildGroupedSessions;
         return null;
       };
@@ -157,8 +154,36 @@ describe('useSessionGrouping malformed hierarchy fallbacks', () => {
         .map((group) => group.label);
     };
 
-    expect(worktreeOrder('recent')).toEqual(['zeta', 'alpha']);
-    expect(worktreeOrder('a-z')).toEqual(['alpha', 'zeta']);
+    expect(worktreeOrder()).toEqual(['zeta', 'alpha']);
+  });
+
+  test('groups a session inside a worktree sub-folder under that worktree', () => {
+    const alpha: WorktreeMetadata = {
+      source: 'sdk', name: 'alpha', path: '/workspace/.wt/alpha', projectDirectory: '/workspace', branch: 'alpha', label: 'alpha',
+    };
+    const inSubfolder = { ...session('sub'), directory: '/workspace/.wt/alpha/ai', time: { created: 1, updated: 1 } };
+    type GroupingCapture = { buildGroupedSessions?: ReturnType<typeof useSessionGrouping>['buildGroupedSessions'] };
+    const state: GroupingCapture = {};
+    const Harness = () => {
+      state.buildGroupedSessions = useSessionGrouping({
+        homeDirectory: null,
+        worktreeMetadata: new Map(),
+        pinnedSessionIds: new Set(),
+        sessionOrderRanks: new Map(),
+        gitBranches: new Map(),
+        isVSCode: false,
+      }).buildGroupedSessions;
+      return null;
+    };
+    renderToStaticMarkup(React.createElement(I18nProvider, null, React.createElement(Harness)));
+    if (!state.buildGroupedSessions) throw new Error('grouping callback was not mounted');
+
+    const groups = state.buildGroupedSessions([inSubfolder], '/workspace', [alpha], null, true);
+    const worktreeGroup = groups.find((group) => group.worktree);
+
+    expect(worktreeGroup?.directory).toBe('/workspace/.wt/alpha');
+    expect(collectIds(worktreeGroup?.sessions ?? [])).toEqual(['sub']);
+    expect(collectIds(groups.find((group) => group.isMain)?.sessions ?? [])).toEqual([]);
   });
 
   test('uses the row-local descendant snapshot for archive and hard-delete actions', async () => {
@@ -212,7 +237,6 @@ describe('useSessionGrouping malformed hierarchy fallbacks', () => {
         sessionOrderRanks: new Map(),
         gitBranches: new Map(),
         isVSCode: false,
-        worktreeSortOrder: 'recent' as const,
         sessionOwners: ownership.bySessionId,
       }).buildGroupedSessions;
       return null;
@@ -239,7 +263,6 @@ describe('useSessionGrouping malformed hierarchy fallbacks', () => {
         sessionOrderRanks: new Map(),
         gitBranches: new Map(),
         isVSCode: false,
-        worktreeSortOrder: 'recent' as const,
       }).buildGroupedSessions;
       return null;
     };

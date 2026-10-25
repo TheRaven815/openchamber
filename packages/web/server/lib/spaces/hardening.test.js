@@ -126,6 +126,8 @@ describe('findHardeningViolations', () => {
     ['runtime', withHost({ Runtime: 'sysbox-runc' })],
     ['devices', withHost({ Devices: [{ PathOnHost: '/dev/kvm', PathInContainer: '/dev/kvm' }] })],
     ['port_bindings', withHost({ PortBindings: { '3000/tcp': [{ HostIp: '127.0.0.1', HostPort: '3000' }] } })],
+    // The name of the Docker host is the gatekeeper's, for a provider on that machine; a space has no name to it.
+    ['extra_hosts', withHost({ ExtraHosts: ['host.docker.internal:host-gateway'] })],
   ])('reports %s', (check, container) => {
     expect(checksFor({ container })).toEqual([check]);
   });
@@ -150,10 +152,41 @@ describe('findHardeningViolations', () => {
   it('accepts exactly the variables a space gets and the base image sets', () => {
     const full = withEnv([
       ...Object.entries(SPACE_ENVIRONMENT).map(([name, value]) => `${name}=${value}`),
-      'NODE_VERSION=22.23.2',
+      'NODE_VERSION=24.21.0',
       'YARN_VERSION=1.22.22',
     ]);
     expect(checksFor({ container: full })).toEqual([]);
+  });
+
+  describe('OpenCode\'s start configuration', () => {
+    const window = (id) => `http://gatekeeper:8080/model/${id}`;
+    const entry = (id, settings = {}) => ({ settings: { baseURL: window(id), apiKey: 'space-window', ...settings } });
+    const withStartConfig = (text) => withEnv([`OPENCODE_CONFIG_CONTENT=${text}`]);
+
+    it('accepts the window address and the placeholder key of each provider', () => {
+      expect(checksFor({ container: withStartConfig(JSON.stringify({ providers: { 'ollama-local': entry('ollama-local'), lighthouse: entry('lighthouse') } })) })).toEqual([]);
+    });
+
+    it.each([
+      ['a real key', JSON.stringify({ providers: { 'ollama-local': entry('ollama-local', { apiKey: 'sk-live' }) } })],
+      ['another provider\'s window', JSON.stringify({ providers: { 'ollama-local': entry('lighthouse') } })],
+      ['an address outside the window', JSON.stringify({ providers: { 'ollama-local': entry('ollama-local', { baseURL: 'http://localhost:11434/v1' }) } })],
+      ['a header', JSON.stringify({ providers: { 'ollama-local': entry('ollama-local', { headers: { authorization: 'Bearer x' } }) } })],
+      ['the models', JSON.stringify({ providers: { 'ollama-local': { ...entry('ollama-local'), models: {} } } })],
+      ['an SDK', JSON.stringify({ providers: { 'ollama-local': { ...entry('ollama-local'), package: 'aisdk:@ai-sdk/anthropic' } } })],
+      ['a catalog provider\'s options', JSON.stringify({ provider: { groq: { options: { apiKey: 'x' } } }, providers: {} })],
+      ['an agent', JSON.stringify({ providers: {}, agent: { build: { prompt: 'x' } } })],
+      ['text that is not JSON', '{providers'],
+    ])('refuses %s', (_name, text) => {
+      expect(checksFor({ container: withStartConfig(text) })).toEqual(['environment']);
+    });
+
+    it('refuses a second copy of the variable, whatever the first holds', () => {
+      const good = `OPENCODE_CONFIG_CONTENT=${JSON.stringify({ providers: { 'ollama-local': entry('ollama-local') } })}`;
+      const keyed = `OPENCODE_CONFIG_CONTENT=${JSON.stringify({ providers: { 'ollama-local': entry('ollama-local', { apiKey: 'sk-live' }) } })}`;
+      expect(checksFor({ container: withEnv([good, keyed]) })).toEqual(['environment']);
+      expect(checksFor({ container: withEnv([good, good]) })).toEqual(['environment']);
+    });
   });
 
   it('refuses any other variable, whatever its name says', () => {
@@ -278,6 +311,7 @@ describe('findGatekeeperHardeningViolations', () => {
       memoryBytes: GATEKEEPER_MEMORY,
       tmpfs: '/tmp:rw,noexec,nosuid,size=16m',
       aliases: ['gatekeeper'],
+      extraHosts: ['host.docker.internal:host-gateway'],
     });
     container.NetworkSettings.Networks[OUTER] = {};
     return container;
@@ -334,6 +368,8 @@ describe('findGatekeeperHardeningViolations', () => {
     ['gatekeeper_port_bindings', withGatekeeperHost({ PortBindings: { '3128/tcp': [{ HostPort: '3128' }] } })],
     ['gatekeeper_network_mode', withGatekeeperHost({ NetworkMode: 'bridge' })],
     ['gatekeeper_memory_limit', withGatekeeperHost({ Memory: 4294967296, MemorySwap: 4294967296 })],
+    // The one extra name is the Docker host's; any other is a way to an address nobody granted.
+    ['gatekeeper_extra_hosts', withGatekeeperHost({ ExtraHosts: ['host.docker.internal:host-gateway', 'registry.internal:10.0.0.5'] })],
   ])('reports %s', (check, container) => {
     expect(gatekeeperChecks({ container })).toEqual([check]);
   });

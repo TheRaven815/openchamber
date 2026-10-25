@@ -2,7 +2,6 @@ import React from 'react';
 import { z } from 'zod';
 import { toast } from '@/components/ui';
 import { formatMessage, useI18nStore, type I18nKey } from '@/lib/i18n';
-import { getGitLog, getGitStatus } from '@/lib/gitApi';
 import { normalizePath } from '@/lib/pathNormalization';
 import { isCapacitorApp } from '@/lib/platform';
 import { isVSCodeRuntime } from '@/lib/desktop';
@@ -13,16 +12,19 @@ import {
   type MergedWorktreeCleanupDeps,
   type MergedWorktreeOutcome,
 } from '@/lib/worktrees/mergedWorktreeCleanup';
-import { getWorktreeDisplayName, removeProjectWorktree } from '@/lib/worktrees/worktreeManager';
+import { getWorktreeDisplayName } from '@/lib/worktrees/worktreeManager';
+import { archiveWorktreeWork, takeRestoredWorktree } from '@/lib/worktrees/worktreeArchive';
+import { isWorktreeRemoving } from '@/lib/worktrees/worktreeRemovalState';
 import { getSafeStorage } from '@/stores/utils/safeStorage';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
 import { getFreshestPrStatusForBranch, useGitHubPrStatusStore } from '@/stores/useGitHubPrStatusStore';
 import { useGlobalSessionsStore } from '@/stores/useGlobalSessionsStore';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { useUIStore } from '@/stores/useUIStore';
-import { archiveSessions, getSessionLiveActivity } from '@/sync/session-actions';
+import { getSessionLiveActivity } from '@/sync/session-actions';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { changeRequestCopy } from '@/lib/source-control/changeRequestCopy';
+import { readSourceControlProvider } from '@/lib/source-control/providers/registry';
 
 const HANDLED_STORAGE_KEY = 'openchamber.mergedWorktreeCleanup.handled';
 const HANDLED_LIMIT = 200;
@@ -78,15 +80,10 @@ const report = (outcome: MergedWorktreeOutcome): void => {
   const dictionary = useI18nStore.getState().dictionary;
   const name = getWorktreeDisplayName(outcome.candidate.worktree);
   const params = { name, number: outcome.candidate.prNumber };
-  const key = (base: I18nKey) => changeRequestCopy(base, outcome.candidate.provider);
-  if (outcome.kind === 'removed') {
-    toast.success(formatMessage(dictionary, key('sessions.mergedCleanup.toast.removedTitle'), params), {
-      description: formatMessage(dictionary, 'sessions.mergedCleanup.toast.removedDescription', params),
-    });
-  } else if (outcome.kind === 'archived') {
-    toast.info(formatMessage(dictionary, key('sessions.mergedCleanup.toast.archivedTitle'), params), {
-      description: formatMessage(dictionary, key('sessions.mergedCleanup.toast.archivedDescription'), params),
-    });
+  const term = readSourceControlProvider(outcome.candidate.provider).terminology.changeRequest;
+  const key = (base: I18nKey) => changeRequestCopy(base, term);
+  if (outcome.kind === 'archived') {
+    toast.success(formatMessage(dictionary, key('sessions.mergedCleanup.toast.archivedTitle'), params), { description: name });
   } else {
     toast.error(formatMessage(dictionary, key('sessions.mergedCleanup.toast.failedTitle'), params), {
       description: outcome.error.message,
@@ -108,22 +105,18 @@ const createDeps = (): MergedWorktreeCleanupDeps => {
     isSessionIdle: (sessionId) => getSessionLiveActivity(sessionId) === 'idle',
     isWorktreeOpen: (path) => normalizePath(useDirectoryStore.getState().currentDirectory ?? null) === normalizePath(path),
     isSessionOpen: (sessionId) => useSessionUIStore.getState().currentSessionId === sessionId,
-    readWorktreeState: async (path) => {
-      const [status, log] = await Promise.all([
-        getGitStatus(path, { fresh: true }),
-        getGitLog(path, { maxCount: 1 }),
-      ]);
-      return { isDirty: !status.isClean, headCommit: log.latest?.hash ?? null };
+    isWorktreeRemoving,
+    takeRestored: takeRestoredWorktree,
+    archiveWorktree: async (candidate, sessions) => {
+      await archiveWorktreeWork({ project: candidate.project, worktree: candidate.worktree, sessions });
     },
-    archiveSessions: (sessionIds) => archiveSessions(sessionIds),
-    removeWorktree: (candidate) => removeProjectWorktree(candidate.project, candidate.worktree, { deleteLocalBranch: true }),
     report,
   };
 };
 
 /**
- * Archives a worktree's sessions once its PR is merged, and removes the
- * worktree with its local branch when nothing there can be lost. Opt-in
+ * Archives a worktree with its sessions once its PR is merged, when nobody
+ * works there. Opt-in
  * (`mergedWorktreeCleanupEnabled`). Runs on desktop and web only: VS Code has
  * no worktrees, and a phone would race the desktop it drives for the same
  * worktree.
@@ -152,10 +145,9 @@ export const useMergedWorktreeCleanup = ({ enabled }: { enabled: boolean }): voi
       } finally {
         running = false;
       }
-      if (rerun && !disposed) {
-        rerun = false;
-        void pass();
-      }
+      const next = rerun;
+      rerun = false;
+      if (next && !disposed) void pass();
     };
     const schedule = () => {
       if (debounce) clearTimeout(debounce);
@@ -174,8 +166,9 @@ export const useMergedWorktreeCleanup = ({ enabled }: { enabled: boolean }): voi
       if (state.currentSessionId !== previous.currentSessionId
         || state.availableWorktreesByProject !== previous.availableWorktreesByProject) schedule();
     });
+    // An agent going idle is no event here; a periodic pass catches it.
     const interval = setInterval(() => void pass(), PASS_INTERVAL_MS);
-    schedule();
+    void pass();
 
     return () => {
       disposed = true;

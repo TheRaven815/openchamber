@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -37,10 +38,7 @@ const createCtx = (workingDirectory, restartImpl = async () => undefined) => {
 const deps = {
   readSettings: () => ({}),
   persistSettings: async (changes) => changes,
-  readMagicPromptOverrides: () => ({ version: 1, overrides: {} }),
-  saveMagicPromptOverride: async () => ({ version: 1, overrides: {} }),
-  resetMagicPromptOverride: async () => ({ version: 1, overrides: {} }),
-  resetAllMagicPromptOverrides: async () => ({ version: 1, overrides: {} }),
+  handleMagicPromptRequest: async () => ({ status: 200, body: { version: 1, overrides: {} } }),
   fetchOpenCodeSkillsFromApi: async () => null,
   clientReloadDelayMs: 800,
 };
@@ -329,5 +327,121 @@ describe('VS Code config bridge plugin parity', () => {
       // v1 `enabled: false` becomes the inverse v2 `disabled: true`.
       disabled: true,
     });
+  });
+});
+
+describe('skills catalog bridge', () => {
+  const savedEnv = {};
+  const setEnv = (key, value) => {
+    if (!(key in savedEnv)) savedEnv[key] = process.env[key];
+    process.env[key] = value;
+  };
+
+  afterEach(() => {
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+      delete savedEnv[key];
+    }
+  });
+
+  // A local bare repository stands in for github.com/acme/skills, and a `git`
+  // wrapper first on PATH records every Git command the scan runs.
+  const createCatalogFixture = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'openchamber-vscode-skills-catalog-'));
+    tempRoots.push(root);
+    const realGit = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+    const runGit = (cwd, ...args) => execFileSync(realGit, ['-c', 'user.name=lab', '-c', 'user.email=lab@example.com', ...args], { cwd, stdio: 'pipe' });
+    const work = path.join(root, 'work');
+    for (const skillDir of ['skills/alpha', 'skills/beta', 'plugins/bundle/skills/gamma']) {
+      fs.mkdirSync(path.join(work, skillDir), { recursive: true });
+      fs.writeFileSync(path.join(work, skillDir, 'SKILL.md'), `---\nname: ${path.basename(skillDir)}\n---\nBody\n`);
+    }
+    runGit(work, 'init', '-q');
+    runGit(work, 'add', '.');
+    runGit(work, 'commit', '-qm', 'skills');
+    const bare = path.join(root, 'remote', 'acme', 'skills.git');
+    runGit(root, 'clone', '-q', '--bare', work, bare);
+    runGit(bare, 'config', 'uploadpack.allowFilter', 'true');
+
+    const binDir = path.join(root, 'bin');
+    const log = path.join(root, 'git.log');
+    fs.mkdirSync(binDir);
+    fs.writeFileSync(path.join(binDir, 'git'), `#!/bin/sh\necho "$*" >> "${log}"\nexec "${realGit}" "$@"\n`, { mode: 0o755 });
+    setEnv('PATH', `${binDir}${path.delimiter}${process.env.PATH}`);
+    setEnv('GIT_CONFIG_COUNT', '1');
+    setEnv('GIT_CONFIG_KEY_0', `url.${new URL(`file://${path.join(root, 'remote')}/`).href}.insteadOf`);
+    setEnv('GIT_CONFIG_VALUE_0', 'https://github.com/');
+    setEnv('OPENCHAMBER_DATA_DIR', path.join(root, 'data'));
+
+    const gitCommands = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean) : []);
+    return { root, gitCommands };
+  };
+
+  const catalogDeps = {
+    ...deps,
+    readSettings: () => ({ skillCatalogs: [{ id: 'acme', label: 'Acme', source: 'acme/skills', subpath: 'skills' }] }),
+  };
+
+  test.skipIf(process.platform === 'win32')('lists the sources without scanning any of them', async () => {
+    const { root, gitCommands } = createCatalogFixture();
+
+    const response = await handleConfigBridgeMessage({ id: 'c1', type: 'api:config/skills:catalog' }, createCtx(root), catalogDeps);
+
+    expect(response?.success).toBe(true);
+    expect(response?.data.ok).toBe(true);
+    expect(response?.data.sources.map((source) => source.id)).toContain('acme');
+    expect(response?.data.itemsBySource).toEqual({});
+    expect(gitCommands()).toEqual([]);
+  });
+
+  test.skipIf(process.platform === 'win32')('scans one source once for requests that arrive together', async () => {
+    const { root, gitCommands } = createCatalogFixture();
+    const request = (id, refresh) => handleConfigBridgeMessage({
+      id,
+      type: 'api:config/skills:catalog/source',
+      payload: { sourceId: 'acme', refresh },
+    }, createCtx(root), catalogDeps);
+
+    const responses = await Promise.all([request('s1', false), request('s2', true), request('s3', true)]);
+
+    for (const response of responses) {
+      expect(response?.data.ok).toBe(true);
+      expect(response?.data.items.map((item) => item.skillDir)).toEqual(['skills/alpha', 'skills/beta']);
+    }
+    const commands = gitCommands();
+    expect(commands.filter((line) => line.startsWith('clone '))).toHaveLength(1);
+    expect(commands.filter((line) => line.includes(' show '))).toEqual([]);
+  });
+
+  test('answers an unknown source with an error', async () => {
+    const response = await handleConfigBridgeMessage({
+      id: 's4',
+      type: 'api:config/skills:catalog/source',
+      payload: { sourceId: 'missing' },
+    }, createCtx(os.tmpdir()), deps);
+
+    expect(response?.data).toEqual({ ok: false, error: { kind: 'invalidSource', message: 'Unknown source' } });
+  });
+});
+
+describe('magic prompt bridge', () => {
+  test('hands the parsed request to the host and returns its status and body', async () => {
+    const handleMagicPromptRequest = mock(async () => ({ status: 409, body: { error: 'bad file', code: 'project_config_invalid' } }));
+    const send = (body) => handleConfigBridgeMessage({
+      id: 'm1',
+      type: 'api:magic-prompts',
+      payload: { method: 'PUT', id: 'plan.todo.instructions', query: { projectId: ['path_abc'], scope: ['project'], sessionDirectory: [] }, body },
+    }, undefined, { ...deps, handleMagicPromptRequest });
+
+    const response = await send({ text: '' });
+    // A selector in the body is reported, so the host refuses it instead of writing the global file.
+    await send({ text: 'x', scope: 'project' });
+
+    expect(handleMagicPromptRequest.mock.calls.map(([request]) => request)).toEqual([
+      { method: 'PUT', id: 'plan.todo.instructions', projectId: ['path_abc'], scope: ['project'], sessionDirectory: [], text: '', bodyNamesSelector: false },
+      { method: 'PUT', id: 'plan.todo.instructions', projectId: ['path_abc'], scope: ['project'], sessionDirectory: [], text: 'x', bodyNamesSelector: true },
+    ]);
+    expect(response).toEqual({ id: 'm1', type: 'api:magic-prompts', success: true, data: { status: 409, body: { error: 'bad file', code: 'project_config_invalid' } } });
   });
 });

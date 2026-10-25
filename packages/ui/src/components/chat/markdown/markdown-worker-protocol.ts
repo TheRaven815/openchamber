@@ -1,8 +1,15 @@
-// Message protocol for the markdown Shiki Web Worker.
+import type { Theme as ZedTheme } from '@pierre/highlights';
+import type { VSCodeTextMateTheme } from '@/lib/shiki/vscodeTextMateTheme';
+
+// Message protocol for the shared code highlighting Web Worker used by
+// non-Markdown code views.
 //
-// The worker tokenizes a complete code block off the main thread and returns
-// ready-to-splice Shiki HTML. The theme is dependency-free and imported inside
-// the worker directly, so it is not sent over postMessage.
+// The worker returns whole-block HTML, per-line HTML or themed token runs.
+// Its CSS-variable themes are imported directly. CodeMirror supplies arbitrary
+// theme definitions with its token requests.
+
+/** One app theme in both formats: Highlights reads `zed`, Shiki `textmate`. */
+export type CodeTokenTheme = { textmate: VSCodeTextMateTheme; zed: ZedTheme };
 
 // A single styled run inside a line: [length, color, fontStyleBits].
 // `color` is '' for default-foreground runs; fontStyleBits is Shiki's FontStyle
@@ -20,10 +27,10 @@ export type MarkdownWorkerRequest =
   // instead of one worker round-trip per line.
   | { type: 'highlightLines'; id: number; code: string; lang: string }
   // Tokenize with an arbitrary registered theme and return per-line styled runs
-  // with offsets — for building CodeMirror decorations. `theme` (a resolved
-  // TextMate theme object) is sent only the first time a theme name is used;
-  // afterwards only `themeName` is sent and the worker reuses the loaded theme.
-  | { type: 'highlightTokens'; id: number; code: string; lang: string; themeName: string; theme?: unknown };
+  // with offsets — for building CodeMirror decorations. `theme` is sent only
+  // the first time a theme name is used; afterwards only `themeName` is sent
+  // and the worker reuses the loaded theme.
+  | { type: 'highlightTokens'; id: number; code: string; lang: string; themeName: string; theme?: CodeTokenTheme };
 
 export type MarkdownWorkerResponse =
   | { type: 'highlight'; id: number; html: string }

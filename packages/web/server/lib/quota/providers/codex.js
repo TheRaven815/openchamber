@@ -6,7 +6,8 @@ import {
   toUsageWindow,
   toNumber,
   toTimestamp,
-  resolveWindowLabel
+  resolveWindowLabel,
+  asNonEmptyString
 } from '../utils/index.js';
 
 export const providerId = 'codex';
@@ -46,14 +47,38 @@ export const fetchQuota = async () => {
     });
 
     if (!response.ok) {
+      // A 401 is not always an expired token. OpenCode's `chatgpt-token-sharing`
+      // sign-in ("Sign in with ChatGPT") holds a token that only reaches the
+      // Responses route, and the usage endpoint refuses it with an
+      // access-enforcement body (`rejected_by_access_enforcement`). OpenAI has no
+      // usage endpoint for that sign-in and sends users to the ChatGPT usage page
+      // instead, so the message does the same rather than asking to sign in again.
+      if (response.status === 401) {
+        const body = await response.json().catch(() => null);
+        const errorType = asNonEmptyString(body?.error?.type);
+        if (errorType === 'rejected_by_access_enforcement') {
+          return buildResult({
+            providerId,
+            providerName,
+            ok: false,
+            configured: true,
+            error: 'OpenAI shows usage for Sign in with ChatGPT only at chatgpt.com/settings/usage. The legacy Codex sign-ins show it here.'
+          });
+        }
+        return buildResult({
+          providerId,
+          providerName,
+          ok: false,
+          configured: true,
+          error: 'Session expired \u2014 please re-authenticate with OpenAI'
+        });
+      }
       return buildResult({
         providerId,
         providerName,
         ok: false,
         configured: true,
-        error: response.status === 401
-          ? 'Session expired \u2014 please re-authenticate with OpenAI'
-          : `API error: ${response.status}`
+        error: `API error: ${response.status}`
       });
     }
 

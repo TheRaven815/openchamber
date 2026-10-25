@@ -189,6 +189,50 @@ describe('createOpenCodeWatcherRuntime', () => {
     });
   });
 
+  it('hands an event of an isolated space on with the space\'s id, and the host\'s without one', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const received = [];
+
+    const globalEventHub = createGlobalMessageStreamHub({
+      buildOpenCodeUrl: (path) => `http://127.0.0.1:4096${path}`,
+      getOpenCodeAuthHeaders: () => ({}),
+      upstreamReconnectDelayMs: 0,
+      fetchImpl: async (_url, options) => createSseResponse({
+        signal: options.signal,
+        holdOpen: true,
+        blocks: [
+          'data: {"payload":{"id":"evt-1","type":"session.renamed","location":{"directory":"/tmp/project"},"data":{"sessionID":"ses_host","title":"Host"}}}\n\n',
+        ],
+      }),
+    });
+
+    const watcher = createOpenCodeWatcherRuntime({
+      waitForOpenCodePort: async () => {},
+      buildOpenCodeUrl: (path) => `http://127.0.0.1:4096${path}`,
+      getOpenCodeAuthHeaders: () => ({}),
+      globalEventHub,
+      onPayload(payload, context) {
+        received.push({ sessionID: payload.properties?.sessionID, spaceId: context.spaceId });
+      },
+    });
+
+    await watcher.start();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    globalEventHub.injectEvent({
+      payload: { id: 'evt-2', type: 'session.renamed', location: { directory: '/spaces/abc/project' }, data: { sessionID: 'ses_space', title: 'Space' } },
+      directory: '/spaces/abc/project',
+      spaceId: 'abc',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    watcher.stop();
+    globalEventHub.stop();
+
+    expect(received).toEqual([
+      { sessionID: 'ses_host', spaceId: null },
+      { sessionID: 'ses_space', spaceId: 'abc' },
+    ]);
+  });
+
   it('does not stop a shared global event hub when the watcher stops', async () => {
     const events = new Set();
     const statuses = new Set();
@@ -202,6 +246,7 @@ describe('createOpenCodeWatcherRuntime', () => {
       stop() {
         stopCalls += 1;
       },
+      isConnected: () => false,
       subscribeEvent(subscriber) {
         events.add(subscriber);
         return () => {
@@ -231,5 +276,35 @@ describe('createOpenCodeWatcherRuntime', () => {
     expect(stopCalls).toBe(0);
     expect(events.size).toBe(0);
     expect(statuses.size).toBe(0);
+  });
+  it('reports each connect of the shared hub, including one made before it subscribed', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const statuses = new Set();
+    const globalEventHub = {
+      start() {},
+      stop() {},
+      isConnected: () => true,
+      subscribeEvent: () => () => {},
+      subscribeStatus(subscriber) {
+        statuses.add(subscriber);
+        return () => statuses.delete(subscriber);
+      },
+    };
+    const onConnect = vi.fn();
+    const watcher = createOpenCodeWatcherRuntime({
+      waitForOpenCodePort: async () => {},
+      buildOpenCodeUrl: (path) => `http://127.0.0.1:4096${path}`,
+      getOpenCodeAuthHeaders: () => ({}),
+      globalEventHub,
+      onPayload() {},
+      onConnect,
+    });
+
+    await watcher.start();
+    for (const subscriber of statuses) subscriber({ type: 'connect' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    watcher.stop();
+
+    expect(onConnect).toHaveBeenCalledTimes(2);
   });
 });

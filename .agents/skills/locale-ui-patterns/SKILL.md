@@ -9,6 +9,10 @@ description: Use when creating or modifying OpenChamber UI text, labels, buttons
 
 User-facing UI text must go through `@/lib/i18n`; do not hardcode English strings in components.
 
+## What the text says
+
+UI text tells the person what they get and what to do: what an option gives them, what happened, what fixes it. Engineering reasons (layout jumps, races, what the code avoids) belong in code comments and commit messages. Example: "Shows the model's thinking as it arrives. When off, the block stays folded and opens with a click." An error names the known cause and the action ("reconnect the repository's account in Settings"), never a generic "something went wrong" when the cause is known; correcting such text is ordinary implementation work, not a product decision.
+
 ## Translate everything immediately (no English placeholders)
 
 Every key you add to a non-English dictionary MUST contain a real translation in that language — never the English source string as a stand-in. There is NO "leave it in English for now" convention in this project; if an agent told you there was, it was wrong. Copying the English value into `es.ts`/`fr.ts`/`ko.ts`/`pl.ts`/`pt-BR.ts`/`uk.ts`/`zh-CN.ts`/`zh-TW.ts` is a defect, not a deferral. The app ships every locale at once, so an untranslated key is a visible bug for those users.
@@ -105,6 +109,16 @@ date
 ## Desktop Native Menus
 
 The Electron app menu and the right-click context menu are native, outside `@/lib/i18n`. Their labels live in `packages/electron/menu-locales.mjs` (`MENU_LOCALE_DICTIONARIES`, `CONTEXT_MENU_LABEL_DICTIONARIES`), keyed by the same locale codes as the UI. A new menu item gets its label in every locale there, and a new UI language gets its own entry there in the same change; `menu-locales.test.mjs` checks key parity.
+
+## Adding a UI Language
+
+A new locale code lands in all of these in one change:
+
+- `packages/ui/src/lib/i18n/runtime.ts`: the `Locale` union, `LOCALES`, `LOCALE_LABEL_KEYS`, and `normalizeLocale` (include legacy tags the platforms still send, such as `iw` for Hebrew). A right-to-left language also joins `RTL_LOCALES`; the layout side is owned by `rtl-layout`.
+- `store.ts` (lazy import), `intl.ts` (Intl tag), `bootstrap.ts` (startup strings), `messages.test.ts`.
+- `messages/<locale>.ts` and `messages/<locale>.settings.ts`, a `<locale>` block in every `messages/*.i18n.ts`, and a `common.language.<name>` label in every existing dictionary.
+- `packages/electron/menu-locales.mjs` (see above).
+- `packages/web/server/lib/opencode/settings-helpers.js` `UI_LOCALE_VALUES`: without it the server drops the saved choice. `packages/web/server/lib/walkthrough/languages.js` names the language for walkthrough prompts.
 
 ## Translation Boundary
 

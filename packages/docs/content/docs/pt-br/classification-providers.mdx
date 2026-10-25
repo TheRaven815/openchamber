@@ -5,7 +5,7 @@ description: Configure o Jev, o pequeno modelo de classificação por trás das 
 
 # Provedores de classificação (Jev)
 
-Algumas funções do OpenChamber precisam de uma decisão rápida antes de agir: este comando é arriscado? Que tipo de tarefa é este prompt? O usuário acabou de começar um trabalho de verdade? Quem responde a essas perguntas é o Jev, um pequeno modelo de decisão da TypeSafe. Esta página mostra como dar ao OpenChamber acesso ao Jev.
+Algumas funções do OpenChamber precisam de uma decisão rápida antes de agir: este comando é arriscado? Que tipo de tarefa é este prompt? Este trabalho parece concluído? Quem responde a essas perguntas é o Jev, um pequeno modelo de decisão da TypeSafe. Esta página mostra como dar ao OpenChamber acesso ao Jev.
 
 O Jev nunca escreve código nem responde no seu chat. Ele só devolve um veredito, e o OpenChamber age de acordo. O OpenChamber espera a resposta por no máximo quatro segundos.
 
@@ -15,10 +15,10 @@ O Jev nunca escreve código nem responde no seu chat. Ele só devolve um veredit
 | --- | --- |
 | [Permissões e rede de segurança](/pt-br/permissions/) | O agente deve perguntar a você antes de executar esta ação? |
 | [Roteamento automático de modelos](/pt-br/auto-model-routing/) | A qual das suas categorias este prompt pertence? |
-| [Sessões em andamento](/pt-br/sessions-in-work/) | Você acabou de pedir um trabalho de verdade? Este turno parece o fim dele? |
+| [Sessões em andamento](/pt-br/sessions-in-work/) | Este turno parece o fim do trabalho? |
 | [Resumo e sugestão da próxima mensagem](/pt-br/sessions-in-work/) | Vale a pena gerar um resumo ou uma sugestão depois deste turno? |
 
-Sem provedor, a rede de segurança e o Auto ficam ocultos, e as sessões só vão para em andamento quando você mesmo as move. Resumos e sugestões continuam funcionando, só que sem o filtro.
+Sem provedor, a rede de segurança e o Auto ficam ocultos, e as sessões em andamento não recebem a dica "parece concluído". As sessões continuam indo para em andamento quando você envia uma mensagem. Resumos e sugestões continuam funcionando, só que sem o filtro.
 
 ## Configuração
 
@@ -70,14 +70,14 @@ Qualquer serviço que fale a API System One da TypeSafe: um gateway auto-hospeda
 2. Adicione uma **Chave de API** se o serviço precisar. Ela é enviada como token `Bearer`.
 3. Clique em **Salvar**.
 
-Na URL, você pode colar o endereço completo terminado em `/v1/systemone`, uma URL base no estilo OpenAI terminada em `/v1` ou a raiz da API (como `https://api.typesafe.ai`). O OpenChamber completa a parte que falta e mostra o endereço exato que vai chamar. Só `http` e `https` funcionam, e a chave vai no campo próprio dela, nunca na URL.
+Cole o endereço completo em que o serviço responde, como `https://api.typesafe.ai/v1/systemone` ou `https://proxy.company.internal/v1/decision` num proxy da empresa. O OpenChamber chama exatamente o que você colou e não acrescenta nada ao caminho. Só `http` e `https` funcionam, e a chave vai no campo próprio dela, nunca na URL.
 
 Salvar também seleciona o endpoint. Assim como a chave da TypeSafe, o endpoint e a chave dele ficam no servidor do OpenChamber, em um arquivo próprio, e a chave nunca é enviada ao navegador.
 
 Um servidor também pode receber o endpoint pelo ambiente, o que ajuda quando você configura o OpenChamber para uma equipe:
 
 ```bash
-OPENCHAMBER_JEV_URL=https://jev.example.com/v1
+OPENCHAMBER_JEV_URL=https://jev.example.com/v1/systemone
 OPENCHAMBER_JEV_MODEL=jev-latest        # opcional, este é o padrão
 OPENCHAMBER_JEV_API_KEY=...             # opcional
 ```
@@ -96,7 +96,7 @@ Se o Jev estiver lento ou falhar em uma solicitação, nada quebra. Cada funçã
 
 - A rede de segurança deixa a ação esperando por você.
 - O Auto manda o prompt para o seu modelo de reserva.
-- As sessões em andamento continuam como estão.
+- A dica "parece concluído" não aparece nas sessões em andamento.
 - O resumo e a sugestão são gerados como se o Jev não existisse.
 
 ## O que o Jev vê
@@ -107,7 +107,7 @@ As solicitações vão do servidor do OpenChamber direto para o OpenCode Zen, o 
 
 ## Onde funciona
 
-O Jev roda no servidor do OpenChamber, então funciona no app desktop, no app web e no seu celular conectado a qualquer um dos dois. A extensão do VS Code fala direto com o OpenCode e não tem Jev: lá não há rede de segurança, não há Auto, e as sessões só vão para em andamento manualmente.
+O Jev roda no servidor do OpenChamber, então funciona no app desktop, no app web e no seu celular conectado a qualquer um dos dois. A extensão do VS Code fala direto com o OpenCode e não tem Jev: lá não há rede de segurança, não há Auto e não há a dica "parece concluído".
 
 ## Relacionado
 

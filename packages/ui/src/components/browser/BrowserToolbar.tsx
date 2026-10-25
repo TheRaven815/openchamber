@@ -41,8 +41,10 @@ const ToolbarButton: React.FC<ToolbarButtonProps> = ({ icon, label, onClick, dis
   </Tooltip>
 );
 
-export type BrowserToolbarProps = {
+type BrowserToolbarProps = {
   address: string;
+  /** A mark before the address, with its meaning: the page is inside an isolated space. */
+  addressMark?: { icon: IconName; label: string };
   /** Addresses already visited in this project, offered while typing. */
   suggestions?: readonly BrowserHistoryEntry[];
   onForgetSuggestion?: (url: string) => void;
@@ -74,6 +76,7 @@ export type BrowserToolbarProps = {
 
 export const BrowserToolbar: React.FC<BrowserToolbarProps> = ({
   address,
+  addressMark,
   suggestions = [],
   onForgetSuggestion,
   onAddressChange,
@@ -162,6 +165,16 @@ export const BrowserToolbar: React.FC<BrowserToolbarProps> = ({
           submitAddress(address);
         }}
       >
+        {addressMark ? (
+          <span
+            className="pointer-events-none absolute inset-s-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"
+            title={addressMark.label}
+            aria-label={addressMark.label}
+            role="img"
+          >
+            <Icon name={addressMark.icon} className="size-3.5" aria-hidden="true" />
+          </span>
+        ) : null}
         <input
           value={address}
           onChange={(event) => onAddressChange(event.target.value)}
@@ -174,8 +187,9 @@ export const BrowserToolbar: React.FC<BrowserToolbarProps> = ({
           aria-expanded={visibleSuggestions.length > 0}
           aria-controls="openchamber-browser-address-suggestions"
           className={cn(
-            'h-6 w-full rounded-full border border-border/50 bg-[var(--surface-elevated)] px-3',
-            'typography-micro text-foreground outline-none focus:border-[var(--interactive-focus-ring)]',
+            'oc-raised oc-field h-6 w-full rounded-full bg-[var(--surface-elevated)] px-3',
+            addressMark && 'ps-8',
+            'typography-micro text-foreground outline-none',
           )}
           aria-label={t('contextPanel.browser.addressAria')}
         />

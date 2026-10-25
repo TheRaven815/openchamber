@@ -8,7 +8,7 @@ interface WorkingPlaceholderProps {
   statusText: string | null;
   isGenericStatus?: boolean;
   isWaitingForPermission?: boolean;
-  retryInfo?: { attempt?: number; next?: number } | null;
+  retryInfo?: { attempt?: number; next?: number; resetsAt?: number } | null;
   agentName?: string;
   modelName?: string | null;
   providerId?: string | null;
@@ -54,6 +54,14 @@ const formatRetryCountdown = (seconds: number): string => {
 
   return `${days}d`;
 
+};
+
+/** "at 3:20 PM" today, "Oct 20, 3:20 PM" on another day, in the user's locale. */
+const formatResetTime = (at: number): string => {
+  const date = new Date(at);
+  const time = date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+  if (date.toDateString() === new Date().toDateString()) return `at ${time}`;
+  return `${date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}, ${time}`;
 };
 
 export function WorkingPlaceholder({
@@ -195,11 +203,17 @@ export function WorkingPlaceholder({
   }
 
   const providerLogo = hasProviderLogo && providerLogoSrc ? (
+    // Flex sibling of the label, never an inline rider on the text line: a
+    // tall inline-block drags the line box with it and the label drifts off
+    // the chip's vertical center. As flex children both center independently.
     <img
       src={providerLogoSrc}
       alt=""
       aria-hidden="true"
-      className="animate-status-logo inline-block h-3.5 w-3.5 mr-1.5 align-[-2px]"
+      // 16px box like the scroll pill's arrow icon. The padding normalizes
+      // the mark to the arrow glyph's geometry (~10.4px wide, ~2.8px inset),
+      // so equal boxes and equal paddings also mean equal visible edges.
+      className="h-4 w-4 shrink-0 p-[1.3px] me-1.5"
       style={{
         filter: isDarkTheme ? 'brightness(0.9) contrast(1.1) invert(1)' : 'brightness(0.9) contrast(1.1)',
       }}
@@ -213,7 +227,13 @@ export function WorkingPlaceholder({
     const countdownLabel = retryCountdown !== null && retryCountdown > 0
       ? ` in ${formatRetryCountdown(retryCountdown)}`
       : '';
-    const retryText = `Retrying${countdownLabel}${attemptLabel}`;
+    // A rate limit that lifts after the next retry: say when, since the
+    // retry itself will most likely hit the limit again.
+    const resetsAt = retryInfo.resetsAt;
+    const retryTargetAt = retryInfo.next ? toRetryTargetTimestamp(retryInfo.next) : Date.now();
+    const retryText = resetsAt !== undefined && resetsAt > retryTargetAt
+      ? `Limit resets ${formatResetTime(resetsAt)} · retry${countdownLabel}${attemptLabel}`
+      : `Retrying${countdownLabel}${attemptLabel}`;
 
     return (
       <div
@@ -222,10 +242,8 @@ export function WorkingPlaceholder({
         aria-live="polite"
         aria-label={retryText}
       >
-        <span className="typography-ui-header">
-          {providerLogo}
-          {retryText}
-        </span>
+        {providerLogo}
+        <span className="typography-ui-header">{retryText}</span>
       </div>
     );
   }
@@ -252,10 +270,8 @@ export function WorkingPlaceholder({
       aria-label={label}
       data-waiting={displayedPermission ? 'true' : undefined}
     >
-      <span className="text-sm">
-        {providerLogo}
-        {label}
-      </span>
+      {providerLogo}
+      <span className="text-[0.8125rem] leading-4">{label}</span>
     </div>
   );
 }

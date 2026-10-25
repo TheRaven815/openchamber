@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import type { SourceControlAPI, SourceControlBindingRead, SourceControlReadContext } from '@/lib/api/types';
 import { getRuntimeKey, subscribeRuntimeEndpointChanged } from '@/lib/runtime-switch';
-import { getBoundSourceControlReadContexts } from './identity';
+import { waitForWorktreeGitReady } from '@/lib/worktrees/worktreeBootstrap';
+import { defaultSourceControlIdentities, getBoundSourceControlReadContexts } from './identity';
+import { useSourceControlProviderRegistry } from './providers/registry';
 import { getSourceControlAuthKey, useSourceControlAuthStore } from '@/stores/useSourceControlAuthStore';
 
 type BindingAPI = Pick<SourceControlAPI, 'repositoryBinding'> & Partial<Pick<SourceControlAPI, 'authStatus'>>;
@@ -34,7 +36,11 @@ export class RepositoryBindingOwner {
   private resetListeners = new Set<() => void>();
   private trimScheduled = false;
 
-  constructor(private runtimeKey = getRuntimeKey, private idleLimit = 64) {}
+  constructor(
+    private runtimeKey = getRuntimeKey,
+    private idleLimit = 64,
+    private waitForRepository: (directory: string) => Promise<void> = waitForWorktreeGitReady,
+  ) {}
 
   scope(directory: string): BindingScope {
     return { runtimeKey: this.runtimeKey(), directory, generation: this.generation };
@@ -115,7 +121,7 @@ export class RepositoryBindingOwner {
         return null;
       }
       return state.status?.status === 'connected' ? state.status.accounts.find((account) => account.current)?.id ?? null : null;
-    }, auth.identities);
+    }, [...auth.identities, ...defaultSourceControlIdentities(useSourceControlProviderRegistry.getState().ordered)]);
   }
 
   private authApi: Pick<SourceControlAPI, 'authStatus'> | null = null;
@@ -126,7 +132,7 @@ export class RepositoryBindingOwner {
     if (this.authApi === api) return;
     this.authApi = api;
     this.authUnsubscribe?.();
-    this.authUnsubscribe = useSourceControlAuthStore.subscribe(() => {
+    const republish = () => {
       for (const entry of this.entries.values()) {
         if (entry.state.status !== 'ready') continue;
         const contexts = this.contextsFor(entry, entry.state.read);
@@ -134,7 +140,17 @@ export class RepositoryBindingOwner {
           this.publish(entry, { ...entry.state, contexts });
         }
       }
+    };
+    // The providers' default instances decide which remotes count as theirs,
+    // so a provider list that lands after the accounts republishes too.
+    const unsubscribeAuth = useSourceControlAuthStore.subscribe(republish);
+    const unsubscribeProviders = useSourceControlProviderRegistry.subscribe((state, previous) => {
+      if (state.ordered !== previous.ordered) republish();
     });
+    this.authUnsubscribe = () => {
+      unsubscribeAuth();
+      unsubscribeProviders();
+    };
   }
 
   private scheduleTrim() {
@@ -158,7 +174,11 @@ export class RepositoryBindingOwner {
     if (entry.pending) return entry.pending;
     if (!force && entry.state.status !== 'idle' && entry.state.status !== 'stale') return Promise.resolve(entry.state);
     const revision = entry.revision;
-    const pending = Promise.resolve().then(() => {
+    const pending = Promise.resolve().then(async () => {
+      if (!this.current(scope)) return null;
+      // A worktree still being checked out is not a repository yet; reading it
+      // then fails, and the failure would stay until a manual retry.
+      await this.waitForRepository(scope.directory);
       if (!this.current(scope)) return null;
       return api.repositoryBinding(scope.directory);
     }).then((read) => {
@@ -243,9 +263,13 @@ export const repositoryBindingOwner = new RepositoryBindingOwner();
 
 const generationSnapshot = () => repositoryBindingOwner.generation;
 
+const attachAuthOf = (api: BindingAPI) => {
+  if ('authStatus' in api && api.authStatus) repositoryBindingOwner.attachAuth(api as Pick<SourceControlAPI, 'authStatus'>);
+};
+
 export const useRepositoryBinding = (directory: string | null | undefined, api: BindingAPI, enabled = true) => {
   const runtimeKey = useSyncExternalStore(subscribeRuntimeEndpointChanged, getRuntimeKey, getRuntimeKey);
-  useEffect(() => { if ('authStatus' in api && api.authStatus) repositoryBindingOwner.attachAuth(api as Pick<SourceControlAPI, 'authStatus'>); }, [api]);
+  useEffect(() => attachAuthOf(api), [api]);
   const generation = useSyncExternalStore(repositoryBindingOwner.subscribeReset, generationSnapshot, generationSnapshot);
   const scope = useMemo(() => ({ runtimeKey, generation, directory: enabled ? directory ?? '' : '' }), [directory, enabled, generation, runtimeKey]);
   const subscribe = useCallback((listener: () => void) => repositoryBindingOwner.subscribe(scope, listener), [scope]);
@@ -257,4 +281,37 @@ export const useRepositoryBinding = (directory: string | null | undefined, api: 
   const retry = useCallback(() => repositoryBindingOwner.reconcile(scope, api), [api, scope]);
   const isCurrent = useCallback(() => state.status === 'ready' && repositoryBindingOwner.snapshot(scope) === state, [scope, state]);
   return { ...state, scope, retry, isCurrent, stale: state.read !== null && state.status !== 'ready' };
+};
+
+/**
+ * The bindings of several folders at once, in the order given: one hook for a
+ * list of folders, which a loop of `useRepositoryBinding` could not be. Each
+ * folder is read when idle or stale, as there; the array keeps its identity
+ * until one of the bindings changes.
+ */
+export const useRepositoryBindings = (directories: readonly string[], api: BindingAPI) => {
+  const runtimeKey = useSyncExternalStore(subscribeRuntimeEndpointChanged, getRuntimeKey, getRuntimeKey);
+  useEffect(() => attachAuthOf(api), [api]);
+  const generation = useSyncExternalStore(repositoryBindingOwner.subscribeReset, generationSnapshot, generationSnapshot);
+  const scopes = useMemo(() => directories.map((directory) => ({ runtimeKey, generation, directory })), [directories, generation, runtimeKey]);
+  const subscribe = useCallback((listener: () => void) => {
+    const stops = scopes.map((scope) => repositoryBindingOwner.subscribe(scope, listener));
+    return () => stops.forEach((stop) => stop());
+  }, [scopes]);
+  const last = useRef<BindingState[]>([]);
+  const snapshot = useCallback(() => {
+    const next = scopes.map((scope) => repositoryBindingOwner.snapshot(scope));
+    const previous = last.current;
+    if (previous.length === next.length && previous.every((state, index) => state === next[index])) return previous;
+    last.current = next;
+    return next;
+  }, [scopes]);
+  const states = useSyncExternalStore(subscribe, snapshot, snapshot);
+  useEffect(() => {
+    states.forEach((state, index) => {
+      const scope = scopes[index];
+      if (scope && (state.status === 'idle' || state.status === 'stale')) void repositoryBindingOwner.read(scope, api);
+    });
+  }, [api, scopes, states]);
+  return states;
 };

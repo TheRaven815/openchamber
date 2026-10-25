@@ -76,6 +76,26 @@ describe('settings helpers', () => {
     expect(helpers.sanitizeSettingsUpdate({ gitlabClientId: 42 })).toEqual({});
   });
 
+  it('keeps the machine of the Docker over SSH place as an SSH destination, and takes it away with an empty string', () => {
+    const helpers = createTestHelpers();
+    expect(helpers.sanitizeSettingsUpdate({ isolatedSpacesSshHost: ' debian-box ' })).toEqual({ isolatedSpacesSshHost: 'debian-box' });
+    expect(helpers.sanitizeSettingsUpdate({ isolatedSpacesSshHost: 'me@box.local:2222' })).toEqual({ isolatedSpacesSshHost: 'me@box.local:2222' });
+    expect(helpers.sanitizeSettingsUpdate({ isolatedSpacesSshHost: '' })).toEqual({ isolatedSpacesSshHost: '' });
+    // Anything `ssh` would read as an option or a command is not a destination.
+    for (const bad of ['-oProxyCommand=evil', 'box -p 22', 'box;rm', 'ssh://box', 42]) {
+      expect(helpers.sanitizeSettingsUpdate({ isolatedSpacesSshHost: bad }), String(bad)).toEqual({});
+    }
+  });
+
+  it('forgets the last directory when asked with an empty string', () => {
+    // Removing the last project sends this. A kept last directory would be
+    // turned back into a project on the next read and warmed at every start.
+    const helpers = createTestHelpers();
+    expect(helpers.sanitizeSettingsUpdate({ lastDirectory: '' })).toEqual({ lastDirectory: '' });
+    expect(helpers.sanitizeSettingsUpdate({ lastDirectory: '/home/testuser/project' })).toEqual({ lastDirectory: '/home/testuser/project' });
+    expect(helpers.sanitizeSettingsUpdate({ lastDirectory: 42 })).toEqual({});
+  });
+
   it('round-trips section order and preserves it across unrelated writes', () => {
     const helpers = createTestHelpers();
     const changes = helpers.sanitizeSettingsUpdate({ workStatusSectionOrder: ['mcp', 'session', 'mcp', null, ''] });
@@ -193,18 +213,18 @@ describe('settings helpers', () => {
       sidebarProjectDisplayMode: 'single',
       sidebarViewMode: 'timeline',
       sidebarProjectSortOrder: 'z-a',
-      sidebarShowRecentSection: false,
+      sidebarShowChatsSection: false,
     })).toEqual({
       sidebarProjectDisplayMode: 'single',
       sidebarViewMode: 'timeline',
       sidebarProjectSortOrder: 'z-a',
-      sidebarShowRecentSection: false,
+      sidebarShowChatsSection: false,
     });
     expect(helpers.sanitizeSettingsUpdate({
       sidebarProjectDisplayMode: 'grid',
       sidebarViewMode: 'grid',
       sidebarProjectSortOrder: 'random',
-      sidebarShowRecentSection: 'false',
+      sidebarShowChatsSection: 'false',
     })).toEqual({});
   });
 
@@ -658,6 +678,9 @@ describe('settings helpers', () => {
       expect(helpers.sanitizeSettingsUpdate({ recentAgents: ['build', 'plan'] })).toEqual({
         recentAgents: ['build', 'plan'],
       });
+      expect(helpers.sanitizeSettingsUpdate({ favoriteAgents: ['build', 'incident'] })).toEqual({
+        favoriteAgents: ['build', 'incident'],
+      });
     });
 
     it('round-trips recentEfforts as a Record<string, string[]>', () => {
@@ -810,34 +833,34 @@ describe('settings registry gate', () => {
     lastDirectory: '/home/testuser/project', homeDirectory: '/home/testuser', opencodeBinary: '/usr/local/bin/opencode',
     projects: [{ id: 'p', path: '/home/testuser/project' }], activeProjectId: 'p',
     securityScopedBookmarks: ['bookmark'], pinnedDirectories: ['/home/testuser/project'],
-    desktopLanAccessEnabled: true, desktopKeepAwakeEnabled: true, desktopMinimizeToTrayEnabled: true, desktopMacMenuBarEnabled: true,
+    desktopLanAccessEnabled: true, desktopKeepAwakeEnabled: true, desktopMinimizeToTrayEnabled: true, desktopMacMenuBarEnabled: true, desktopLinuxNativeFrame: true, sidebarShowChatsSection: false, sidebarShowWorkSection: false, sidebarShowPinnedSection: true, sidebarDetailedZoneRows: true,
     desktopUiPassword: 'secret', githubClientId: 'client', githubScopes: 'repo', gitlabClientId: 'gitlab-client', skillCatalogs: [{ id: 'c', label: 'C', source: 'https://x' }],
     defaultGitIdentityId: 'global', permissionAutoAccept: { sessions: { s: true }, revision: 1 }, permissionDefaultMode: 'safety', messageSearchEnabled: true, messageSearchReasoningEnabled: true,
-    agentControlToolEnabled: true, agentWebToolEnabled: true, browserProvider: 'builtin', agentMemoryToolEnabled: true, agentNotifyToolEnabled: true, agentToolsCodeMode: true, isolatedSpacesEnabled: true, isolatedSpacesIdleStop: { enabled: true, hours: 4 }, openCodeUpdateToastDismissedVersion: '1.0.0',
-    autoDeleteEnabled: true, autoDeleteAfterDays: 30, sessionRetentionOnlyArchived: false, sessionRetentionAction: 'archive', mergedWorktreeCleanupEnabled: true, terminalShell: 'zsh', terminalLoginShells: ['zsh'],
+    agentControlToolEnabled: true, agentScheduleToolEnabled: true, agentWebToolEnabled: true, browserProvider: 'builtin', agentMemoryToolEnabled: true, agentKnowledgeToolEnabled: true, agentNotifyToolEnabled: true, agentRenderToolEnabled: true, agentToolsCodeMode: true, isolatedSpacesEnabled: true, isolatedSpacesIdleStop: { enabled: true, hours: 4 }, isolatedSpacesSshHost: 'me@box.local:2222', openCodeUpdateToastDismissedVersion: '1.0.0',
+    autoDeleteEnabled: true, autoDeleteAfterDays: 30, sessionRetentionOnlyArchived: false, sessionRetentionAction: 'archive', mergedWorktreeCleanupEnabled: true, worktreeArchiveOnDoneEnabled: true, terminalShell: 'zsh', terminalLoginShells: ['zsh'],
     openInAppId: 'vscode', dictationEnabled: true, sttProvider: 'local', sttServerUrl: 'http://localhost:8001/v1', sttModel: 'm', sttLocalModel: 'm', sttLanguage: 'en',
-    tunnelProvider: 'cloudflare', tunnelMode: 'quick', tunnelBootstrapTtlMs: 600000, tunnelSessionTtlMs: 86400000, managedLocalTunnelConfigPath: '/tmp/x',
+    tunnelProvider: 'cloudflare', tunnelMode: 'quick', tunnelHttpsPort: 8443, tunnelBootstrapTtlMs: 600000, tunnelSessionTtlMs: 86400000, managedLocalTunnelConfigPath: '/tmp/x',
     managedRemoteTunnelHostname: 'x.example', managedRemoteTunnelToken: 'token', managedRemoteTunnelPresets: [{ id: 'a', name: 'A', hostname: 'a.example' }],
     managedRemoteTunnelSelectedPresetId: 'a', managedRemoteTunnelPresetTokens: { a: 'token' },
-    sidebarProjectDisplayMode: 'all', sidebarViewMode: 'timeline', sidebarProjectSortOrder: 'manual', sidebarWorktreeSortOrder: 'recent', sidebarShowRecentSection: true,
+    sidebarProjectDisplayMode: 'all', sidebarViewMode: 'timeline', sidebarListSessionGrouping: 'time', sidebarGrouping: 'time', sidebarKeepWorkInPlace: true, sidebarProjectSortOrder: 'manual',
     workStatusPanelEnabled: true, workStatusHiddenSections: ['mcp'], workStatusHiddenSectionsExplicit: true, workStatusSectionOrder: ['mcp', 'session'],
     showReasoningTraces: true, streamingAutoFollowEnabled: true, collapsibleThinkingBlocks: true, expandReasoningWhileStreaming: true, showTextJustificationActivity: true,
     chatRenderMode: 'live', activityRenderMode: 'summary', mermaidRenderingMode: 'svg', userMessageRenderingMode: 'markdown', collapsibleUserMessages: true,
     stickyUserHeader: true, promptNavigatorEnabled: true, wideChatLayoutEnabled: true, showSplitAssistantMessageActions: true, showToolFileIcons: true,
-    codeBlockLineWrap: true, tableCellWrap: true, copyMessagesAsPlainText: true, showTurnChangedFiles: true, showExpandedBashTools: true, showExpandedEditTools: true, toolJsonViewMode: 'raw',
-    timeFormatPreference: '24h', weekStartPreference: 'monday', messageStreamTransport: 'ws', diffLayoutPreference: 'inline', diffWrapLines: true,
+    codeBlockLineWrap: true, tableCellWrap: true, copyMessagesAsPlainText: true, showTurnChangedFiles: true, toolJsonViewMode: 'raw',
+    timeFormatPreference: '24h', weekStartPreference: 'monday', messageStreamTransport: 'ws', diffLayoutPreference: 'inline', diffWrapLines: true, diffHideWhitespace: true,
     gitChangesViewMode: 'tree', gitmojiEnabled: true, defaultFileViewerPreview: true, directoryShowHidden: true, filesViewShowGitignored: true,
-    fileEditorKeymap: 'vim', autoSaveEnabled: true, autoCreateWorktree: true, sessionTabsEnabled: true,
-    allowPromptingSubagentSessions: true, inputSpellcheckEnabled: true, enterToSend: true, enterToSendConfigured: true, persistChatDraft: true,
-    largeTextPasteBehavior: 'attach', followUpBehavior: 'steer', queueModeEnabled: true, inputHistoryScope: 'global', inputHistoryLimit: 40,
+    fileEditorKeymap: 'vim', fileEditorVimMappings: 'inoremap jk <Esc>', autoSaveEnabled: true, confirmFileTreeMove: false, layoutAnimations: false, openLinksInBrowserPanel: true, liveBrowserTabLimit: 8, openTrackerLinksOnBoard: true, fileTreeSide: 'left', autoCreateWorktree: true, sessionTabsEnabled: true,
+    allowPromptingSubagentSessions: true, inputSpellcheckEnabled: true, enterToSend: true, enterToSendConfigured: true, mobileReturnKeySends: true,
+    largeTextPasteBehavior: 'attach', savePastedImagesAsFiles: true, followUpBehavior: 'steer', queueModeEnabled: true, inputHistoryScope: 'global', inputHistoryLimit: 40,
     draftStarters: [{ type: 'command', name: 'plan-feature' }], draftStartersVisible: true, draftStartersCraftGoalAdded: true, draftStartersScheduleTaskAdded: true,
-    fontSize: 100, terminalFontSize: 14, editorFontSize: 14, uiFont: 'inter', monoFont: 'jetbrains-mono', padding: 100, cornerRadius: 8,
+    fontSize: 100, terminalFontSize: 14, editorFontSize: 14, uiFont: 'inter', monoFont: 'jetbrains-mono', customUiFont: 'Maple Mono NF CN', customMonoFont: 'Maple Mono', padding: 100, cornerRadius: 8,
     shortcutOverrides: { 'chat.send': 'mod+enter' },
-    defaultModel: 'anthropic/claude', defaultVariant: 'high', defaultAgent: 'build', smallModelUseDefault: false, smallModelOverride: 'anthropic/haiku',
-    walkthroughModelOverride: 'anthropic/claude', zenModel: 'zen/model',
+    defaultModel: 'anthropic/claude', defaultVariant: 'high', defaultAgent: 'build', smallModelUseDefault: false, smallModelOverride: 'anthropic/haiku', smallModelVariant: 'high',
+    walkthroughModelOverride: 'anthropic/claude', walkthroughModelVariant: 'high', zenModel: 'zen/model', fallbackModel: 'openai/gpt', fallbackVariant: 'high', accountSwitchProviders: ['anthropic'],
     favoriteModels: [{ providerID: 'anthropic', modelID: 'claude' }], hiddenModels: [{ providerID: 'openai', modelID: 'gpt' }], collapsedModelProviders: ['openai'],
-    recentModels: [{ providerID: 'anthropic', modelID: 'claude' }], lastSelectedModel: 'anthropic/claude', recentAgents: ['build'], recentEfforts: { 'anthropic/claude': ['high'] }, providerOrder: ['anthropic'],
-    sessionRecapEnabled: true, sessionSuggestionEnabled: true, sessionWorkEnabled: true, sessionWorkAutoOpen: true, sessionGoalEnabled: true, sessionGoalChecker: 'small-model', sessionGoalMaxAutoTurns: 50, sessionGoalDefaultBudgetEnabled: true, sessionGoalDefaultBudget: 5,
+    recentModels: [{ providerID: 'anthropic', modelID: 'claude' }], lastSelectedModel: 'anthropic/claude', recentAgents: ['build'], favoriteAgents: ['build'], recentEfforts: { 'anthropic/claude': ['high'] }, providerOrder: ['anthropic'],
+    sessionRecapEnabled: true, sessionSuggestionEnabled: true, sessionWorkEnabled: true, sessionReviewOfferEnabled: true, sessionGoalEnabled: true, sessionGoalChecker: 'small-model', sessionGoalMaxAutoTurns: 50, sessionGoalDefaultBudgetEnabled: true, sessionGoalDefaultBudget: 5,
     summarizeLastMessage: true, summaryThreshold: 100, summaryLength: 50, maxLastMessageLength: 200, showDeletionDialog: true,
     nativeNotificationsEnabled: true, notificationMode: 'always', notifyOnSubtasks: true, notifyOnCompletion: true, notifyOnError: true, notifyOnQuestion: true,
     notificationTemplates: { completion: { title: 't', message: 'm' } }, showOpenCodeUpdateNotifications: true, reportUsage: true,
@@ -927,7 +950,6 @@ describe('settings registry gate', () => {
     expect(helpers.sanitizeSettingsUpdate({
       providerOrder: ['b', 'a', 'a'],
       diffWrapLines: true,
-      persistChatDraft: false,
       largeTextPasteBehavior: 'inline',
       fileEditorKeymap: 'vim',
       allowPromptingSubagentSessions: true,
@@ -937,7 +959,6 @@ describe('settings registry gate', () => {
     })).toEqual({
       providerOrder: ['b', 'a'],
       diffWrapLines: true,
-      persistChatDraft: false,
       largeTextPasteBehavior: 'inline',
       fileEditorKeymap: 'vim',
       allowPromptingSubagentSessions: true,

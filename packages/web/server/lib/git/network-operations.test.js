@@ -13,9 +13,11 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fingerprintRemoteUrl } from '../source-control/url-redaction.js';
 import { createHttpsCredentialReference, createSshCredentialReference } from './credential-resolver.js';
-import { createNetworkOperations } from './network-operations.js';
+import { createNetworkOperations, createTrustedDirectoriesConfig } from './network-operations.js';
 import { createBindingService } from '../source-control/binding-service.js';
 import { createBindingStore } from '../source-control/binding-storage.js';
+import { createProviderDescriptors } from '../source-control/provider-descriptors.js';
+import { giteaDescriptor } from '../gitea/descriptor.js';
 import { resolveRepositoryIdentity } from '../source-control/repository-identity.js';
 
 const SHA = 'a'.repeat(40);
@@ -27,7 +29,7 @@ const CLONE_CREDENTIAL = {
   credentialRevision: 3,
   providerUserId: 'https://example.com#42',
   status: 'valid',
-  token: 'clone-secret',
+  secret: 'clone-secret',
 };
 const temporaryDirectories = [];
 const execFileAsync = promisify(execFile);
@@ -132,7 +134,7 @@ const createSpawn = (results = [], responder) => {
   return { spawnImpl, calls, children };
 };
 
-const setup = ({ mode = 'managed', transport = 'https', credentialId = 'opaque-credential', keyPath = '/keys/selected key', spawnResults, spawnResponder, env, timeoutMs, fsImpl, validateGitIdentity = async () => {}, validateManagedSshCredential, resolveSourceControlAccount = vi.fn(async () => CLONE_CREDENTIAL), applyGitIdentity, bindClonedRepository = async () => {}, inspectMergeState, enumerateManagedConfigKeys = vi.fn(async () => []), resolveChangeRequestSource, validateGitAuxiliaryContext, onCheckoutHydrated, auditStore, operationStore, authorityFor } = {}) => {
+const setup = ({ mode = 'managed', transport = 'https', credentialId = 'opaque-credential', keyPath = '/keys/selected key', spawnResults, spawnResponder, env, timeoutMs, fsImpl, validateGitIdentity = async () => {}, validateManagedSshCredential, resolveSourceControlAccount = vi.fn(async () => CLONE_CREDENTIAL), applyGitIdentity, bindClonedRepository = async () => {}, inspectMergeState, enumerateManagedConfigKeys = vi.fn(async () => []), resolveChangeRequestSource, validateGitAuxiliaryContext, onCheckoutHydrated, auditStore, operationStore, authorityFor, trustedDirectoriesConfig, sourceControlProviders } = {}) => {
   const authority = {
     endpoint: transport === 'ssh' ? 'git@example.com:owner/repository.git' : ENDPOINT,
     endpointFingerprint: fingerprintRemoteUrl(transport === 'ssh' ? 'git@example.com:owner/repository.git' : ENDPOINT),
@@ -191,6 +193,8 @@ const setup = ({ mode = 'managed', transport = 'https', credentialId = 'opaque-c
     onCheckoutHydrated,
     auditStore,
     operationStore,
+    trustedDirectoriesConfig,
+    sourceControlProviders,
   });
   return { service, authority, validateGitTransportContext, resolveRef, resolveSymbolicRef, credentialResolver, credentialBroker, ...spawned };
 };
@@ -430,6 +434,34 @@ describe('Git network operations', () => {
         endpointFingerprint: fingerprintRemoteUrl(lfsEndpoint), sourceRef: 'refs/heads/feature' }] },
     }));
     expect(JSON.stringify(auditStore.plan.mock.calls)).not.toMatch(/https:\/\/|lfs-secret|parent-secret/);
+  });
+
+  it.each(['checkout inspection', 'publication preparation'])('accepts identical global and local canonical LFS filters during %s', async (operation) => {
+    const fixture = await createLfsPublicationFixture();
+    await fixture.git('checkout', 'feature');
+    fixture.env.GIT_CONFIG_GLOBAL = path.join(fixture.parent, 'global.gitconfig');
+    for (const [key, value] of [
+      ['filter.lfs.clean', 'git-lfs clean -- %f'],
+      ['filter.lfs.smudge', 'git-lfs smudge -- %f'],
+      ['filter.lfs.process', 'git-lfs filter-process'],
+      ['filter.lfs.required', 'true'],
+    ]) {
+      await fixture.git('config', '--global', key, value);
+      await fixture.git('config', '--local', key, value);
+    }
+    if (operation === 'checkout inspection') {
+      const result = await fixture.service.inspectCheckoutHydration({
+        directory: fixture.directory, parentEndpoint: ENDPOINT, parentRemoteName: 'publish',
+      });
+      expect(result.requirements).toEqual([{ kind: 'lfs', path: '.', endpoint: {
+        displayUrl: fixture.lfsEndpoint, fingerprint: fingerprintRemoteUrl(fixture.lfsEndpoint),
+      } }]);
+      expect(fixture.transfers.calls.some((call) => call.args.includes('fetch') || call.args.includes('push') || call.args.includes('clone'))).toBe(false);
+    } else {
+      const plan = await fixture.service.plan(fixture.pushRequest);
+      expect(await fixture.service.execute(plan.operationId)).toMatchObject({ state: 'succeeded' });
+      expect(fixture.transfers.calls.filter((call) => call.args.includes('push'))).toHaveLength(2);
+    }
   });
 
   it('publishes ordinary history without probing git-lfs or adding a network transfer', async () => {
@@ -919,7 +951,8 @@ describe('Git network operations', () => {
     expect(setupValue.calls).toHaveLength(1);
     const fetchCall = setupValue.calls[0];
     expect(fetchCall.args).toEqual(expect.arrayContaining([
-      'fetch', '--no-tags', '--', ENDPOINT, 'refs/heads/feature:refs/remotes/pr-alice/feature',
+      // Forced, so a force-pushed change request head still replaces the stale tracking ref.
+      'fetch', '--no-tags', '--', ENDPOINT, '+refs/heads/feature:refs/remotes/pr-alice/feature',
     ]));
     expect(fetchCall.options.env.GIT_ASKPASS).toBeUndefined();
     expect(fetchCall.options.env.SSH_AUTH_SOCK).toBeUndefined();
@@ -927,6 +960,37 @@ describe('Git network operations', () => {
     expect(fetchCall.options.env.HOME).toBe('/dev/null');
     expect(fetchCall.options.env.GIT_CONFIG_GLOBAL).toBe('/dev/null');
     expect(fetchCall.options.env.GIT_TERMINAL_PROMPT).toBe('0');
+  });
+
+  it('lets managed fetch trust the directories the person trusted, and nothing else from their configuration', async () => {
+    const setupValue = setup({
+      resolveChangeRequestSource: vi.fn(async () => contributorSource()),
+      trustedDirectoriesConfig: vi.fn(async () => '/tmp/trust/config'),
+    });
+    const result = await setupValue.service.transferContributorHead({
+      directory: '/repository', sourceRequest: contributorRequest, source: contributorSource(),
+      credentialId: 'opaque-credential', destinationRef: 'refs/remotes/pr-alice/feature',
+    });
+
+    expect(result.state).toBe('succeeded');
+    expect(setupValue.calls[0].options.env.GIT_CONFIG_GLOBAL).toBe('/tmp/trust/config');
+    expect(setupValue.calls[0].options.env.GIT_CONFIG_NOSYSTEM).toBe('1');
+  });
+
+  it('reports why a contributor fetch failed instead of blaming the account', async () => {
+    const setupValue = setup({
+      resolveChangeRequestSource: vi.fn(async () => contributorSource()),
+      spawnResponder: ({ args }) => (args.includes('fetch')
+        ? { code: 128, stderr: "fatal: detected dubious ownership in repository at '/repository'\n" }
+        : undefined),
+    });
+    const result = await setupValue.service.transferContributorHead({
+      directory: '/repository', sourceRequest: contributorRequest, source: contributorSource(),
+      credentialId: 'opaque-credential', destinationRef: 'refs/remotes/pr-alice/feature',
+    });
+
+    expect(result).toMatchObject({ state: 'failed', error: { code: 'TRANSPORT_FAILED' } });
+    expect(result.error.message).toContain('dubious ownership');
   });
 
   it('rejects a changed contributor endpoint before transfer', async () => {
@@ -1412,6 +1476,54 @@ process.exit(safe ? 0 : 1);
       kind: 'provider', provider: 'gitlab', instance: 'https://example.com', accountId: 'https://example.com#42',
     });
     expect(setupValue.credentialBroker.revoke).toHaveBeenCalledWith(plan.operationId);
+  });
+
+  it('pushes for review with the composed refspec, writes no tracking ref, and stops when the gate closed', async () => {
+    const changeHost = { ...giteaDescriptor, id: 'review', capabilities: { ...giteaDescriptor.capabilities, createVia: 'push' } };
+    let primaryOf = ['review'];
+    const reviewSetup = () => setup({
+      sourceControlProviders: createProviderDescriptors([giteaDescriptor, changeHost]),
+      authorityFor: (_input, authority) => ({ ...authority, primaryOf }),
+      spawnResponder: ({ args }) => (args.includes('check-ref-format') ? { code: 0, stdout: 'main\n' } : undefined),
+    });
+    const reviewRequest = request('push', { review: { target: 'main', topic: 'sync', wip: true } });
+    delete reviewRequest.destinationRef;
+
+    const setupValue = reviewSetup();
+    const plan = await setupValue.service.plan(reviewRequest);
+    expect(plan.target.destinationRef).toBe('refs/for/main');
+    await expect(setupValue.service.execute(plan.operationId)).resolves.toMatchObject({ state: 'succeeded' });
+    const pushes = setupValue.calls.filter((call) => call.args.includes('push'));
+    expect(pushes.map((call) => call.args.slice(-3))).toEqual([['--', ENDPOINT, `${SHA}:refs/for/main%topic=sync,wip`]]);
+    expect(setupValue.calls.some((call) => call.args.includes('update-ref'))).toBe(false);
+
+    // The association went away between plan and execute: nothing is sent.
+    const closed = reviewSetup();
+    const closedPlan = await closed.service.plan(reviewRequest);
+    primaryOf = [];
+    await expect(closed.service.execute(closedPlan.operationId)).resolves.toMatchObject({ state: 'conflicted', error: { code: 'REMOTE_CHANGED' } });
+    expect(closed.calls.some((call) => call.args.includes('push'))).toBe(false);
+  });
+
+  it('leads a refused push\'s error with the remote\'s rejection, without its progress output', async () => {
+    const stderr = [
+      'remote: Processing changes: refs: 1',
+      'remote: Processing changes: refs: 1, done',
+      'remote: ERROR: commit 1a2b3c4: missing Change-Id in message footer',
+      'remote:',
+      'remote: Hint: to automatically insert a Change-Id, install the hook:',
+      'To https://example.com/owner/repository.git',
+      ' ! [remote rejected] abc -> refs/for/main (commit 1a2b3c4: missing Change-Id in message footer)',
+      'error: failed to push some refs to \'https://example.com/owner/repository.git\'',
+    ].join('\n');
+    const setupValue = setup({ spawnResponder: ({ args }) => (args.includes('push') ? { code: 1, stderr } : undefined) });
+    const plan = await setupValue.service.plan(request());
+    const result = await setupValue.service.execute(plan.operationId);
+    expect(result.state).toBe('failed');
+    expect(result.error.message.split('\n')).toEqual([
+      '! [remote rejected] abc -> refs/for/main (commit 1a2b3c4: missing Change-Id in message footer)',
+      'remote: ERROR: commit 1a2b3c4: missing Change-Id in message footer',
+    ]);
   });
 
   it('configures the exact local upstream only after a successful push', async () => {
@@ -2336,17 +2448,27 @@ process.exit(safe ? 0 : 1);
     });
   });
 
-  it('returns the stable missing git-lfs result without starting an LFS transfer', async () => {
+  // Past the old 256-record ceiling too: a repository of thousands of LFS
+  // files reaches the same client check instead of a discovery failure.
+  it.each([1, 3_000])('returns the stable missing git-lfs result for %i LFS files without starting an LFS transfer', async (count) => {
     const pointer = `version https://git-lfs.github.com/spec/v1\noid sha256:${'d'.repeat(64)}\nsize 12\n`;
+    const files = Array.from({ length: count }, (_, index) => `assets/asset-${index}.bin`);
+    const batch = (child, separator) => child.stdin.read().toString().slice(0, -1).split(separator);
     const setupValue = setup({
       spawnResponder: ({ args }) => {
         const command = args.join(' ');
         if (command.includes('config --blob HEAD:.gitmodules')) return { code: 1 };
         if (command.includes('ls-tree -rz')) return { code: 0 };
-        if (command.includes('ls-files -z')) return { code: 0, stdout: 'asset.bin\0' };
-        if (command.includes('check-attr')) return { code: 0, stdout: 'asset.bin\0filter\0lfs\0' };
-        if (command.includes('cat-file --batch-check')) return { code: 0, stdout: `${SHA} blob ${Buffer.byteLength(pointer)}\n` };
-        if (command.includes('cat-file --batch')) return { code: 0, stdout: `${SHA} blob ${Buffer.byteLength(pointer)}\n${pointer}\n` };
+        if (command.includes('ls-files -z')) return { code: 0, stdout: `${files.join('\0')}\0` };
+        if (command.includes('check-attr')) return { onSpawn: ({ child }) => {
+          child.stdout.write(batch(child, '\0').map((file) => `${file}\0filter\0lfs\0`).join(''));
+        } };
+        if (command.includes('cat-file --batch-check')) return { onSpawn: ({ child }) => {
+          child.stdout.write(batch(child, '\n').map(() => `${SHA} blob ${Buffer.byteLength(pointer)}\n`).join(''));
+        } };
+        if (command.includes('cat-file --batch')) return { onSpawn: ({ child }) => {
+          child.stdout.write(batch(child, '\n').map(() => `${SHA} blob ${Buffer.byteLength(pointer)}\n${pointer}\n`).join(''));
+        } };
         if (command.includes('HEAD:.lfsconfig') || command.includes('config --includes')) return { code: 1 };
         if (command.includes('lfs version')) return { code: 1, stderr: 'git-lfs is not installed at /private/bin' };
         return { code: 0 };
@@ -2502,7 +2624,10 @@ process.exit(safe ? 0 : 1);
     plan = await operation.service.plan({ operation: 'clone', remoteUrl: ENDPOINT, destinationPath: destination, transportMode: 'system', unverifiedConfirmed: true });
     const result = await operation.service.execute(plan.operationId);
     expect(result).toMatchObject(interruption === 'overflow'
-      ? { state: 'partial', hydration: { status: 'invalid' } }
+      ? {
+        state: 'partial', error: { code: 'CHECKOUT_TOO_LARGE' },
+        hydration: { status: 'invalid', lfs: [{ status: 'invalid', error: { code: 'CHECKOUT_TOO_LARGE' } }] },
+      }
       : { state: 'cancelled', error: { code: interruption.startsWith('CANCELLED') ? 'CANCELLED' : interruption }, hydration: { status: 'cancelled' } });
     expect(metadataBatches).toBe(2);
     expect(operation.calls.filter((call) => call.args.includes('cat-file'))).toHaveLength(4);
@@ -2729,7 +2854,9 @@ process.exit(safe ? 0 : 1);
     expect(setupValue.calls[0].args.slice(-6)).toEqual([
       'fetch', '--no-tags', '--no-recurse-submodules', '--', ENDPOINT, 'refs/heads/feature:refs/openchamber/network/git_operation_one',
     ]);
-    expect(setupValue.calls.find((call) => call.args.includes('rebase')).args.slice(-4)).toEqual(['rebase', '--no-verify', '--no-autostash', SHA]);
+    // Only the commits made since the remote copy was last seen are replayed.
+    expect(setupValue.calls.find((call) => call.args.includes('rebase')).args.slice(-7))
+      .toEqual(['rebase', '--no-verify', '--no-autostash', '--fork-point', '--onto', SHA, 'refs/remotes/publish/feature']);
     // The managed credential is revoked before integration; the tracking ref
     // must still move with the credential-free context.
     expect(setupValue.calls.map((call) => call.args.slice(-3)))
@@ -2800,9 +2927,10 @@ process.exit(safe ? 0 : 1);
     expect(setupValue.validateGitTransportContext.mock.calls.map(([value]) => [value.remote, value.endpointKind]))
       .toEqual(expect.arrayContaining([['upstream', 'fetch'], ['origin', 'push']]));
     expect(setupValue.calls[0].args.slice(-6)).toEqual([
-      'fetch', '--no-tags', '--no-recurse-submodules', '--', fetchEndpoint, 'refs/heads/main:refs/remotes/upstream/main',
+      'fetch', '--no-tags', '--no-recurse-submodules', '--', fetchEndpoint, '+refs/heads/main:refs/remotes/upstream/main',
     ]);
-    expect(setupValue.calls.find((call) => call.args.includes('rebase')).args.slice(-4)).toEqual(['rebase', '--no-verify', '--no-autostash', SHA]);
+    expect(setupValue.calls.find((call) => call.args.includes('rebase')).args.slice(-7))
+      .toEqual(['rebase', '--no-verify', '--no-autostash', '--fork-point', '--onto', SHA, 'refs/remotes/upstream/main']);
     expect(setupValue.calls.at(-2).args.slice(-4)).toEqual(['push', '--', pushEndpoint, `${SHA}:refs/heads/published`]);
     expect(setupValue.calls.at(-1).args.slice(-3)).toEqual(['update-ref', 'refs/remotes/origin/published', SHA]);
   });
@@ -3830,5 +3958,45 @@ process.exit(safe ? 0 : 1);
     expect(quarantine).toBeTruthy();
     await expect(fs.readFile(path.join(parent, quarantine, 'object', 'user-replacement'), 'utf8')).resolves.toBe('keep');
     expect(fsImpl.cp).not.toHaveBeenCalled();
+  });
+});
+
+describe('createTrustedDirectoriesConfig', () => {
+  // Git's own test switch makes it treat the checkout as owned by someone else.
+  const foreignOwnerGit = (directory, globalConfig) => new Promise((resolve) => {
+    execFile('git', ['status', '--porcelain'], {
+      cwd: directory,
+      env: { ...process.env, GIT_TEST_ASSUME_DIFFERENT_OWNER: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: globalConfig },
+    }, (error) => resolve(error ? error.code : 0));
+  });
+
+  it('copies only the trusted directories, and managed Git opens a foreign checkout with them', async () => {
+    const fixture = await createLocalRepository();
+    const globalConfig = path.join(fixture.parent, 'global-config');
+    const unusual = 'C:\\odd "path"';
+    for (const args of [['safe.directory', fixture.directory], ['safe.directory', unusual], ['credential.helper', 'store']]) {
+      await execFileAsync('git', ['config', '--file', globalConfig, '--add', ...args]);
+    }
+    const trusted = createTrustedDirectoriesConfig({
+      inheritedEnv: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: globalConfig },
+      tmpdir: () => fixture.parent,
+    });
+
+    const file = await trusted();
+    const copied = (await execFileAsync('git', ['config', '--file', file, '--get-all', 'safe.directory'])).stdout;
+    expect(copied.split('\n').filter(Boolean)).toEqual([fixture.directory, unusual]);
+    expect(await fs.readFile(file, 'utf8')).not.toContain('helper');
+    expect(await foreignOwnerGit(fixture.directory, '/dev/null')).not.toBe(0);
+    expect(await foreignOwnerGit(fixture.directory, file)).toBe(0);
+  });
+
+  it('answers null when the person trusts no directory', async () => {
+    const fixture = await createLocalRepository();
+    const trusted = createTrustedDirectoriesConfig({
+      inheritedEnv: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+      tmpdir: () => fixture.parent,
+    });
+
+    await expect(trusted()).resolves.toBeNull();
   });
 });

@@ -56,6 +56,17 @@
     min-width: 36px;
   }
 
+  /* Toast titles and icons line up with their buttons, which the rule above
+     makes at least 36px tall (sonner.tsx). */
+  :root.mobile-pointer:not(.desktop-runtime) [data-sonner-toast] {
+    --toast-row: max(1.5rem, 36px);
+  }
+
+  /* Composer top-slot rows keep room around their 36px buttons. */
+  :root.mobile-pointer:not(.desktop-runtime) .oc-composer-row {
+    height: 2.5rem;
+  }
+
   /* The Changes section and source pickers take their height from dropdownTriggerVariants,
      rather than the generic mobile button minimum. */
   :root.mobile-pointer:not(.desktop-runtime) button[data-mobile-comparison-trigger] {
@@ -132,7 +143,7 @@
   }
 
   /* Keep markdown code blocks horizontally scrollable on mobile. */
-  :root.mobile-pointer:not(.desktop-runtime) .markdown-content [data-markdown="code-block-body"] {
+  :root.mobile-pointer:not(.desktop-runtime) .markdown-content [data-streamdown="code-block-body"] {
     overflow-x: auto !important;
     overflow-y: hidden !important;
     -webkit-overflow-scrolling: touch;
@@ -361,7 +372,7 @@
 
   .pwa-dialog-content [data-slot="dialog-close"] {
     top: calc(0.25rem + (var(--oc-safe-area-top, 0px) * 0.35));
-    right: var(--pwa-dialog-padding);
+    inset-inline-end: var(--pwa-dialog-padding);
   }
 
   .pwa-dialog-content.pwa-compact [data-slot="dialog-close"] {
@@ -463,8 +474,7 @@
    enforces edge-to-edge and ignores that call, leaving content under the status
    bar. Capacitor injects the real insets as --safe-area-inset-* inline vars on
    <html> (env() still reads 0 on WebViews without the safe-area passthrough
-   fix), so read those first and fall back to env(). On devices where the native
-   inset still applies, both sources report 0 — no double padding. */
+   fix), so read those first and fall back to env(). */
 :root.oc-capacitor-app.oc-platform-android {
   --oc-safe-area-top: var(--safe-area-inset-top, env(safe-area-inset-top, 0px));
   --oc-safe-area-right: var(--safe-area-inset-right, env(safe-area-inset-right, 0px));
@@ -475,6 +485,15 @@
 
 :root.oc-capacitor-app.oc-platform-android .header-safe-area {
   padding-top: var(--oc-safe-area-top);
+}
+
+/* Android 14 and older: the WebView already sits below the status bar (overlay:false
+   in mobileNativeChrome.ts), yet Capacitor still injects the status bar height as
+   --safe-area-inset-top on WebView 140+. Reserving it again left an empty strip under
+   the status bar (#4803). !important beats Capacitor's inline value, so every surface
+   that reads the inset, directly or through --oc-safe-area-top, gets the real 0. */
+:root.oc-capacitor-app.oc-android-below-status-bar {
+  --safe-area-inset-top: 0px !important;
 }
 
 /* Android 15+ enforces edge-to-edge, and once the WebView can read the insets
@@ -620,6 +639,12 @@
      legs equal the keyboard height once settled, so the settle snap is
      geometry-neutral for the scroller. */
   padding-bottom: var(--oc-kb-scroll-inset, var(--oc-kb-layout, 0px));
+}
+
+/* The transcript's end fade band (index.css `.chat-scroll-fade--end`) is
+   measured from the scroller's bottom edge, so it extends with it. */
+:root.oc-capacitor-app .oc-mobile-app-shell .chat-scroll-fade--end {
+  bottom: calc(-1 * max(var(--oc-kb-layout, 0px) - var(--oc-app-bottom-safe, 0px), 0px));
 }
 
 /* WKWebView draws the text caret as a native layer that ignores CSS transforms:

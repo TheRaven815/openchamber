@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -404,19 +404,19 @@ describe('walkSkillMdFiles', () => {
   // the type argument is ignored on POSIX.
   const linkDirectory = (target, relativeLink) =>
     fs.symlinkSync(target, path.join(FIXTURE_DIR, relativeLink), process.platform === 'win32' ? 'junction' : 'dir');
-  const foundRelative = () =>
-    walkSkillMdFiles(FIXTURE_DIR)
+  const foundRelative = async () =>
+    (await walkSkillMdFiles(FIXTURE_DIR))
       .map((found) => path.relative(FIXTURE_DIR, found).split(path.sep).join('/'))
       .sort();
 
-  it('walks a skill deployed as a link inside the scanned root', () => {
+  it('walks a skill deployed as a link inside the scanned root', async () => {
     writeSkill('real-skill');
     fs.mkdirSync(path.join(FIXTURE_DIR, 'collection'), { recursive: true });
     writeSkill(path.join('collection', 'nested-skill'));
     linkDirectory(path.join(FIXTURE_DIR, 'real-skill'), 'linked-skill');
     linkDirectory(path.join(FIXTURE_DIR, 'collection'), 'collection-link');
 
-    expect(foundRelative()).toEqual([
+    expect(await foundRelative()).toEqual([
       'collection-link/nested-skill/SKILL.md',
       'collection/nested-skill/SKILL.md',
       'linked-skill/SKILL.md',
@@ -424,24 +424,24 @@ describe('walkSkillMdFiles', () => {
     ]);
   });
 
-  it('ends on a link that points back into the scanned tree', () => {
+  it('ends on a link that points back into the scanned tree', async () => {
     fs.mkdirSync(path.join(FIXTURE_DIR, 'loopdir'), { recursive: true });
     writeSkill('loopdir');
     linkDirectory(FIXTURE_DIR, path.join('loopdir', 'back'));
 
-    expect(foundRelative()).toEqual(['loopdir/SKILL.md']);
+    expect(await foundRelative()).toEqual(['loopdir/SKILL.md']);
   });
 
-  it('skips a link whose target is gone and keeps the rest of the scan', () => {
+  it('skips a link whose target is gone and keeps the rest of the scan', async () => {
     writeSkill('real-skill');
     fs.mkdirSync(path.join(FIXTURE_DIR, 'gone-skill'), { recursive: true });
     linkDirectory(path.join(FIXTURE_DIR, 'gone-skill'), 'dangling-link');
     fs.rmSync(path.join(FIXTURE_DIR, 'gone-skill'), { recursive: true, force: true });
 
-    expect(foundRelative()).toEqual(['real-skill/SKILL.md']);
+    expect(await foundRelative()).toEqual(['real-skill/SKILL.md']);
   });
 
-  it('follows a link nested below the top level of the scanned root', () => {
+  it('follows a link nested below the top level of the scanned root', async () => {
     const outside = `${FIXTURE_DIR}-outside`;
     fs.rmSync(outside, { recursive: true, force: true });
     fs.mkdirSync(path.join(outside, 'deep-skill'), { recursive: true });
@@ -449,20 +449,20 @@ describe('walkSkillMdFiles', () => {
     fs.mkdirSync(path.join(FIXTURE_DIR, 'group'), { recursive: true });
     try {
       linkDirectory(path.join(outside, 'deep-skill'), path.join('group', 'linked'));
-      expect(foundRelative()).toEqual(['group/linked/SKILL.md']);
+      expect(await foundRelative()).toEqual(['group/linked/SKILL.md']);
     } finally {
       fs.rmSync(outside, { recursive: true, force: true });
     }
   });
 
-  it('ends on a nested link loop between two directories', () => {
+  it('ends on a nested link loop between two directories', async () => {
     fs.mkdirSync(path.join(FIXTURE_DIR, 'a'), { recursive: true });
     fs.mkdirSync(path.join(FIXTURE_DIR, 'b'), { recursive: true });
     writeSkill('a');
     linkDirectory(path.join(FIXTURE_DIR, 'b'), path.join('a', 'to-b'));
     linkDirectory(path.join(FIXTURE_DIR, 'a'), path.join('b', 'to-a'));
 
-    expect(foundRelative()).toEqual(['a/SKILL.md', 'b/to-a/SKILL.md']);
+    expect(await foundRelative()).toEqual(['a/SKILL.md', 'b/to-a/SKILL.md']);
   });
 });
 
@@ -661,5 +661,122 @@ describe('writeConfig preserves JSONC comments (issue #3587)', () => {
     writeConfig({ a: 3 }, file);
 
     expect(fs.readFileSync(file, 'utf8')).toBe(JSON.stringify({ a: 3 }, null, 2));
+  });
+});
+
+describe('writeConfig replaces the file atomically', () => {
+  const OLD_CONFIG = '{\n  // keep me\n  "a": 1,\n}\n';
+
+  beforeEach(() => {
+    fs.rmSync(FIXTURE_DIR, { recursive: true, force: true });
+    fs.mkdirSync(FIXTURE_DIR, { recursive: true });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(FIXTURE_DIR, { recursive: true, force: true });
+  });
+
+  it('writes a sibling temp file and renames it over the target', () => {
+    const file = writeFixture('opencode.jsonc', OLD_CONFIG);
+    const inodeBefore = fs.statSync(file).ino;
+    const realRename = fs.renameSync;
+    const seen = [];
+    vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      // At the moment of the swap the target still holds the old, complete
+      // file and the temp file already holds the complete new one.
+      seen.push({
+        from,
+        to,
+        target: fs.readFileSync(file, 'utf8'),
+        temp: fs.readFileSync(from, 'utf8'),
+      });
+      return realRename(from, to);
+    });
+
+    writeConfig({ a: 2 }, file);
+
+    // The writer resolves symlinks, and on macOS the temp dir lives under one.
+    const realFile = fs.realpathSync(file);
+    expect(seen).toHaveLength(1);
+    expect(path.dirname(seen[0].from)).toBe(path.dirname(realFile));
+    expect(seen[0].to).toBe(realFile);
+    expect(seen[0].target).toBe(OLD_CONFIG);
+    expect(seen[0].temp).toBe('{\n  // keep me\n  "a": 2,\n}\n');
+    expect(fs.statSync(file).ino).not.toBe(inodeBefore);
+    expect(readConfigFile(file)).toEqual({ a: 2 });
+    expect(fs.readdirSync(FIXTURE_DIR).sort()).toEqual(['opencode.jsonc', 'opencode.jsonc.openchamber.backup']);
+  });
+
+  it.skipIf(process.platform === 'win32')('keeps the mode of the existing file', () => {
+    const file = writeFixture('opencode.jsonc', OLD_CONFIG);
+    fs.chmodSync(file, 0o640);
+
+    writeConfig({ a: 2 }, file);
+
+    expect(fs.statSync(file).mode & 0o777).toBe(0o640);
+  });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('refuses a read-only config', () => {
+    const file = writeFixture('opencode.jsonc', OLD_CONFIG);
+    fs.chmodSync(file, 0o444);
+
+    expect(() => writeConfig({ a: 2 }, file)).toThrow('Failed to write OpenCode configuration');
+
+    expect(fs.readFileSync(file, 'utf8')).toBe(OLD_CONFIG);
+  });
+
+  it('still writes the backup of the previous content', () => {
+    const file = writeFixture('opencode.jsonc', OLD_CONFIG);
+
+    writeConfig({ a: 2 }, file);
+
+    expect(fs.readFileSync(`${file}.openchamber.backup`, 'utf8')).toBe(OLD_CONFIG);
+  });
+
+  it('still refuses an unparseable file and leaves no temp file behind', () => {
+    const broken = '{\n  "a": 1,\n  plugin: ["x"]\n}\n';
+    const file = writeFixture('opencode.jsonc', broken);
+    const renameSpy = vi.spyOn(fs, 'renameSync');
+
+    expect(() => writeConfig({ a: 2 }, file)).toThrow(/cannot be loaded safely/);
+
+    expect(renameSpy).not.toHaveBeenCalled();
+    expect(fs.readFileSync(file, 'utf8')).toBe(broken);
+    expect(fs.readdirSync(FIXTURE_DIR)).toEqual(['opencode.jsonc']);
+  });
+
+  it('leaves the original untouched and removes the temp file when the rename fails', () => {
+    const file = writeFixture('opencode.jsonc', OLD_CONFIG);
+    vi.spyOn(fs, 'renameSync').mockImplementation(() => {
+      throw Object.assign(new Error('boom'), { code: 'EIO' });
+    });
+
+    expect(() => writeConfig({ a: 2 }, file)).toThrow('Failed to write OpenCode configuration');
+
+    expect(fs.readFileSync(file, 'utf8')).toBe(OLD_CONFIG);
+    expect(fs.readdirSync(FIXTURE_DIR).sort()).toEqual(['opencode.jsonc', 'opencode.jsonc.openchamber.backup']);
+  });
+
+  it.skipIf(process.platform === 'win32')('writes through a symlinked config instead of replacing the link', () => {
+    const real = writeFixture('dotfiles/opencode.jsonc', OLD_CONFIG);
+    const link = path.join(FIXTURE_DIR, 'opencode.jsonc');
+    fs.symlinkSync(real, link);
+
+    writeConfig({ a: 2 }, link);
+
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(readConfigFile(real)).toEqual({ a: 2 });
+  });
+
+  it.skipIf(process.platform === 'win32')('creates the file a dangling symlinked config points at', () => {
+    const real = path.join(FIXTURE_DIR, 'dotfiles', 'opencode.jsonc');
+    const link = path.join(FIXTURE_DIR, 'opencode.jsonc');
+    fs.symlinkSync(real, link);
+
+    writeConfig({ a: 2 }, link);
+
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(readConfigFile(real)).toEqual({ a: 2 });
   });
 });

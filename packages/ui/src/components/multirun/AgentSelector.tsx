@@ -13,7 +13,7 @@ import { isPrimaryMode } from '@/components/chat/mobileControlsUtils';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useI18n } from '@/lib/i18n';
 
-export interface AgentSelectorProps {
+interface AgentSelectorProps {
   /** Currently selected agent name (empty string for no agent) */
   value: string;
   /** Called when agent selection changes */
@@ -92,7 +92,6 @@ export const AgentSelector: React.FC<AgentSelectorProps> = ({
     >
       <SelectTrigger
         id={id}
-        size="lg"
         className={cn('max-w-full', className)}
       >
         <SelectValue placeholder={t('multirun.agentSelector.placeholder')} />

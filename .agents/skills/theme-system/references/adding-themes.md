@@ -48,6 +48,21 @@ export const presetThemes: Theme[] = [
 bun run type-check && bun run lint && bun run build
 ```
 
+### Judging a palette
+
+- Status colours keep their everyday meaning in light and dark variants:
+  success green, info blue, error red, warning amber. A purple info read as an
+  error and was rejected; tune the shade to its background, not the hue family.
+- Contrast numbers only point at candidates; the verdict comes from the real UI.
+  Look at body text, bold chat text and borders on the canvas, the sidebar and
+  elevated surfaces. Several dark built-ins (Dracula, Carbonfox, Aura, Monokai,
+  Mono Plus) were judged too harsh this way, Mono Plus's bold text and borders
+  most of all. The opposite failure is real too: a shared dark ceiling of 10
+  made most built-ins read dim on external monitors in a lit room (OpenCode
+  and T3 Code body text sits at 17–18:1). Dark built-ins now share one band:
+  body text about 13.3–13.6:1 and secondary text about 6:1, with hue kept by
+  raising OKLab lightness only. Catppuccin stays on its official palette.
+
 ## Authoring Tools
 
 Both do the mechanical work of steps 1–2 and are run by hand:

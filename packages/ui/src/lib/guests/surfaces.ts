@@ -48,5 +48,4 @@ const guestSurfaceFromInstalled = (
   labelKey: 'contextRail.surface.plugin',
   descriptionKey: 'contextRail.surface.plugin.description',
   availability: 'always',
-  defaultWidthFraction: 0.45,
 });

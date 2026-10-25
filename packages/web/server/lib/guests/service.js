@@ -7,10 +7,20 @@ import path from 'node:path';
 import {
   GUEST_REQUEST_RESPONSE_MAX,
   GUEST_REQUEST_TIMEOUT_MS,
+  OPENCHAMBER_HOST_CALLBACK_URL,
   isGuestRequestPath,
+  serviceProvides,
 } from '@openchamber/sdk';
 
+import { hostCallbackUrl } from './host-callback.js';
 import { readExtensionStore, updateExtensionStore } from './persist.js';
+import { readBoundedResponseText } from './response-body.js';
+import {
+  SERVICE_TOKEN_ENV,
+  reapOrphanedGuestServices,
+  recordGuestService,
+  releaseGuestService,
+} from './service-registry.js';
 import { resolveServiceSocketEnv } from './sockets.js';
 
 const METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
@@ -28,6 +38,7 @@ const OPENCHAMBER_SERVICE_AUTH_HEADER = 'authorization';
  *   status: 'starting' | 'ready' | 'failed' | 'stopped',
  *   packageRoot: string,
  *   entry: string,
+ *   released: Promise<void>,
  * }} ServiceRuntime
  */
 
@@ -42,14 +53,26 @@ const stoppingByGuest = new Map();
 
 // Requests retain their lifecycle object across awaits. A later host start
 // cannot reopen admission for work that belonged to the previous host.
-let hostLifecycle = { accepting: true };
+let hostLifecycle = { accepting: true, registryDir: null, orphansReaped: Promise.resolve() };
 
-export const beginGuestServiceHost = () => {
+/**
+ * Opens service admission for a new host. With `registryDir` every spawn is
+ * recorded there (`service-registry.js`), and the services a host that died
+ * without stopping them left running are stopped before this host spawns one.
+ * @param {{ registryDir?: string | null }} [options]
+ */
+export const beginGuestServiceHost = ({ registryDir = null } = {}) => {
   if (runtimes.size || startingByGuest.size || stoppingByGuest.size) {
     throw new Error('Guest services must finish stopping before a new host starts.');
   }
   hostLifecycle.accepting = false;
-  hostLifecycle = { accepting: true };
+  hostLifecycle = {
+    accepting: true,
+    registryDir,
+    orphansReaped: registryDir
+      ? reapOrphanedGuestServices(registryDir, { log: (message) => console.log(message) })
+      : Promise.resolve(),
+  };
 };
 
 export const beginGuestServiceShutdown = () => {
@@ -65,11 +88,12 @@ const assertGuestHostActive = (lifecycle) => {
 export class GuestServiceError extends Error {
   /**
    * @param {string} message
-   * @param {'NO_SERVICE' | 'SERVICE_FAILED' | 'REQUEST_FAILED' | 'BAD_PATH' | 'BAD_METHOD' | 'DISABLED' | 'CANCELLED'} code
+   * @param {'NO_SERVICE' | 'SERVICE_FAILED' | 'REQUEST_FAILED' | 'RESPONSE_TOO_LARGE' | 'BAD_PATH' | 'BAD_METHOD' | 'DISABLED' | 'CANCELLED'} code
    * `SERVICE_FAILED` is a service that never became ready: nothing was sent
    * to it. `REQUEST_FAILED` is a request that was sent and got no usable
    * answer (timeout, dropped connection, unreadable body): the service may
-   * have acted on it.
+   * have acted on it. `RESPONSE_TOO_LARGE` is an answer over `responseMax`:
+   * the service did act on the request.
    */
   constructor(message, code) {
     super(message);
@@ -298,6 +322,7 @@ const discardRuntime = async (guestId) => {
   runtime.status = 'stopped';
   const { child } = runtime;
   if (child.exitCode !== null || child.signalCode) {
+    await runtime.released;
     return;
   }
   const stopped = new Promise((resolve) => {
@@ -314,6 +339,8 @@ const discardRuntime = async (guestId) => {
   stoppingByGuest.set(guestId, stopped);
   try {
     await stopped;
+    // A child that outlived SIGKILL keeps its record for the next host's reaper.
+    if (child.exitCode !== null || child.signalCode) await runtime.released;
   } finally {
     stoppingByGuest.delete(guestId);
   }
@@ -329,6 +356,24 @@ export const stopAllGuestServices = async () => {
   // Cancelled starts reject normally. Await their cleanup as well as children
   // already registered when shutdown began.
   await Promise.allSettled([...starts, ...stops]);
+};
+
+/**
+ * Records the child for a later host's reaper and drops the record once the
+ * child exits. Resolves after the drop.
+ * @param {string | null} registryDir
+ * @param {import('node:child_process').ChildProcess} child
+ * @param {{ guestId: string, token: string, entry: string }} service
+ */
+const recordServiceProcess = (registryDir, child, service) => {
+  const { pid } = child;
+  // A spawn that failed has no pid and never emits `exit`.
+  if (!registryDir || !Number.isInteger(pid)) return Promise.resolve();
+  const recorded = recordGuestService(registryDir, { pid, ...service });
+  const exited = new Promise((resolve) => {
+    child.once('exit', resolve);
+  });
+  return Promise.all([recorded, exited]).then(() => releaseGuestService(registryDir, pid));
 };
 
 /**
@@ -373,9 +418,14 @@ const startGuestService = async ({
   entry,
   socketBindings = [],
   socketOverrides = {},
+  hostCallback = false,
   epoch,
   lifecycle,
 }) => {
+  assertGuestHostActive(lifecycle);
+  // A service a dead host left running may still hold what this one needs (a
+  // socket, a profile lock), so it is gone before anything spawns.
+  await lifecycle.orphansReaped;
   assertGuestHostActive(lifecycle);
   // A replacement must not occupy the same guest slot while its previous
   // child is still stopping; host shutdown must be able to drain both.
@@ -420,11 +470,16 @@ const startGuestService = async ({
   const env = {
     ...inheritedServiceEnv(process.env),
     OPENCHAMBER_SERVICE_PORT: String(port),
-    OPENCHAMBER_SERVICE_TOKEN: token,
+    [SERVICE_TOKEN_ENV]: token,
     ELECTRON_RUN_AS_NODE: '1',
   };
   if (Object.keys(socketEnv).length > 0) {
     env.OPENCHAMBER_SERVICE_SOCKETS = JSON.stringify(socketEnv);
+  }
+  // Only a service that stands in for a Git host may call OpenChamber back
+  // (`host-callback.js`); every other service never learns the listener.
+  if (hostCallback) {
+    env[OPENCHAMBER_HOST_CALLBACK_URL] = await hostCallbackUrl();
   }
   if (cancelled()) {
     throw stoppedError();
@@ -435,6 +490,8 @@ const startGuestService = async ({
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
+  // Ownership starts at spawn, including a child that never becomes ready.
+  const released = recordServiceProcess(lifecycle.registryDir, child, { guestId, token, entry: absoluteEntry });
   const output = collectProcessOutput(child);
 
   /** @type {ServiceRuntime} */
@@ -445,6 +502,7 @@ const startGuestService = async ({
     status: 'starting',
     packageRoot,
     entry,
+    released,
   };
   runtimes.set(guestId, runtime);
 
@@ -504,7 +562,7 @@ const INHERITED_SERVICE_ENV_NAMES = new Set([
 ]);
 
 /** @param {NodeJS.ProcessEnv} source */
-export const inheritedServiceEnv = (source) => {
+const inheritedServiceEnv = (source) => {
   /** @type {Record<string, string>} */
   const env = {};
   for (const [name, value] of Object.entries(source)) {
@@ -619,6 +677,7 @@ export const openGuestServiceRequest = async ({
       entry: service.entry,
       socketBindings,
       socketOverrides,
+      hostCallback: serviceProvides(service, 'source-control'),
       epoch,
       lifecycle,
     });
@@ -694,14 +753,14 @@ export const openGuestServiceRequest = async ({
 };
 
 /**
- * Panel-shaped proxy: text answer, capped. Same params as
+ * Panel-shaped proxy: text answer, refused over `responseMax`. Same params as
  * `openGuestServiceRequest` plus `responseMax`.
  */
 export const proxyGuestServiceRequest = async ({ responseMax = GUEST_REQUEST_RESPONSE_MAX, ...params }) => {
   const { response, finished } = await openGuestServiceRequest(params);
-  let text;
+  let body;
   try {
-    text = await response.text();
+    body = await readBoundedResponseText(response, responseMax);
   } catch {
     finished();
     if (params.signal?.aborted) {
@@ -712,10 +771,11 @@ export const proxyGuestServiceRequest = async ({ responseMax = GUEST_REQUEST_RES
     throw new GuestServiceError('Guest service request failed.', 'REQUEST_FAILED');
   }
   finished();
+  if (body.tooLarge) {
+    throw new GuestServiceError(`The service answered with more than ${responseMax} bytes.`, 'RESPONSE_TOO_LARGE');
+  }
   return {
     status: response.status,
-    body: text.length <= responseMax
-      ? text
-      : text.slice(0, responseMax),
+    body: body.text,
   };
 };

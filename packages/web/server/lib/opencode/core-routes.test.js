@@ -2,9 +2,92 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import { createTunnelAuth } from './tunnel-auth.js';
-import { registerAuthAndAccessRoutes, registerCommonRequestMiddleware, registerServerStatusRoutes } from './core-routes.js';
+import { registerAuthAndAccessRoutes, registerCommonRequestMiddleware, registerHttpResponseDiagnostics, registerServerStatusRoutes } from './core-routes.js';
+import { createServerDiagnosticJournal } from '../diagnostics/server-journal.js';
 
 describe('core-routes', () => {
+  it('captures the final response status, including missing routes and parser errors, without request data', async () => {
+    const journal = createServerDiagnosticJournal();
+    const app = express();
+    registerHttpResponseDiagnostics(app, journal);
+    app.use(express.json({ limit: '16b' }));
+    app.get('/api/session/:sessionID', (_req, res) => res.sendStatus(404));
+    await request(app).get('/api/session/ses_private?token=secret').expect(404);
+    await request(app).post('/api/other').send({ prompt: 'private prompt private prompt' }).expect(413);
+    const details = journal.snapshot().events.map((event) => event.detail);
+    expect(details).toEqual([
+      'method=GET route=/api/session/:sessionID stage=downstream_response http=404',
+      'method=POST route=/api/other stage=downstream_response http=413',
+    ]);
+    expect(JSON.stringify(journal.snapshot())).not.toMatch(/ses_private|token|secret|prompt/);
+  });
+
+  it('does not report an aborted response as a completed HTTP status', async () => {
+    const journal = createServerDiagnosticJournal();
+    const app = express();
+    registerHttpResponseDiagnostics(app, journal);
+    app.get('/api/aborted', (_req, res) => res.destroy());
+    await expect(request(app).get('/api/aborted')).rejects.toThrow();
+    expect(journal.snapshot().events).toEqual([]);
+  });
+
+  it('requires authentication for local file diagnostics', async () => {
+    const app = express();
+    const requireAuth = vi.fn((_req, res) => res.status(401).json({ error: 'Unauthorized' }));
+    registerServerStatusRoutes(app, {
+      express,
+      getHealthSnapshot: () => ({}),
+      gracefulShutdown: vi.fn(),
+      uiAuthController: { requireAuth },
+    });
+    await request(app).get('/api/diagnostics/local-files').expect(401);
+    expect(requireAuth).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects tunneled diagnostics even when the proxy connects through loopback', async () => {
+    const app = express();
+    const requireAuth = vi.fn((_req, _res, next) => next());
+    registerServerStatusRoutes(app, {
+      express,
+      getHealthSnapshot: () => ({}),
+      gracefulShutdown: vi.fn(),
+      tunnelAuthController: { classifyRequestScope: () => 'tunnel' },
+      uiAuthController: { requireAuth },
+    });
+    await request(app).get('/api/diagnostics/local-files').expect(403);
+    expect(requireAuth).not.toHaveBeenCalled();
+  });
+
+  it('rejects diagnostics forwarded by the private relay over loopback', async () => {
+    const app = express();
+    const requireAuth = vi.fn((_req, _res, next) => next());
+    registerServerStatusRoutes(app, {
+      express,
+      getHealthSnapshot: () => ({}),
+      gracefulShutdown: vi.fn(),
+      tunnelAuthController: { classifyRequestScope: () => 'local' },
+      uiAuthController: { requireAuth },
+    });
+    await request(app).get('/api/diagnostics/local-files').set('x-openchamber-relay-connection', 'conn-1').expect(403);
+    expect(requireAuth).not.toHaveBeenCalled();
+  });
+
+  it('serves the OpenCode load under the same local-only gate', async () => {
+    const app = express();
+    const readOpenCodeLoad = vi.fn(async () => ({ locations: 2, processes: null }));
+    registerServerStatusRoutes(app, {
+      express,
+      getHealthSnapshot: () => ({}),
+      gracefulShutdown: vi.fn(),
+      tunnelAuthController: { classifyRequestScope: () => 'local' },
+      uiAuthController: { requireAuth: (_req, _res, next) => next() },
+      readOpenCodeLoad,
+    });
+    await request(app).get('/api/diagnostics/opencode-load').set('x-openchamber-relay-connection', 'conn-1').expect(403);
+    expect(readOpenCodeLoad).not.toHaveBeenCalled();
+    const response = await request(app).get('/api/diagnostics/opencode-load').expect(200);
+    expect(response.body).toEqual({ locations: 2, processes: null });
+  });
   afterEach(() => {
     vi.useRealTimers();
   });
@@ -278,7 +361,7 @@ describe('core-routes', () => {
     }
   });
 
-  it('lets only GET html-preview file reads past API auth; the grant in the path is checked by the fs route', async () => {
+  it('lets only GET html-preview and extension-frame file reads past API auth; the grant in the path is checked by the owning route', async () => {
     const app = express();
     const requireAuth = vi.fn((_req, res) => res.status(401).json({ error: 'Unauthorized' }));
     registerAuthAndAccessRoutes(app, {
@@ -309,12 +392,20 @@ describe('core-routes', () => {
     app.get(/^\/api\/fs\/preview\/.+$/, (_req, res) => res.json({ reached: true }));
     app.post('/api/fs/preview', (_req, res) => res.json({ reached: true }));
     app.get('/api/fs/read', (_req, res) => res.json({ reached: true }));
+    app.get(/^\/api\/guest-files\/.+$/, (_req, res) => res.json({ reached: true }));
+    app.post(/^\/api\/guest-files\/.+$/, (_req, res) => res.json({ reached: true }));
+    app.post('/api/guests/panel/frame-grant', (_req, res) => res.json({ reached: true }));
 
     await request(app).get('/api/fs/preview/grant-1/repo/index.html').expect(200, { reached: true });
     await request(app).post('/api/fs/preview').send({ path: '/repo/index.html' }).expect(401);
     await request(app).get('/api/fs/preview/grant-1').expect(401);
     await request(app).get('/api/fs/read?path=/repo/index.html').expect(401);
-    expect(requireAuth).toHaveBeenCalledTimes(3);
+    // An extension frame reads its package by the grant in its path, and nothing more.
+    await request(app).get('/api/guest-files/grant-1/index.html').expect(200, { reached: true });
+    await request(app).get('/api/guest-files/grant-1').expect(401);
+    await request(app).post('/api/guest-files/grant-1/index.html').expect(401);
+    await request(app).post('/api/guests/panel/frame-grant').expect(401);
+    expect(requireAuth).toHaveBeenCalledTimes(6);
   });
 
   it('should probe loopback preview URLs and return ok: true for status codes 200-599', async () => {
@@ -680,6 +771,7 @@ describe('client auth routes', () => {
         handlePasskeyRegistrationVerify: (_req, res) => res.json({}),
         handlePasskeyList: (_req, res) => res.json({ passkeys: [] }),
         handlePasskeyRevoke: (_req, res) => res.json({ revoked: true }),
+        handlePasskeyRename: (_req, res) => res.json({ renamed: true }),
         handleResetAuth: (_req, res) => res.json({ cleared: true }),
       },
       remoteClientAuthRuntime: {
@@ -905,6 +997,40 @@ describe('client auth routes', () => {
     expect(dependencies.testHooks.requireAuth).not.toHaveBeenCalled();
   });
 
+  it('renames a passkey through the UI-session route', async () => {
+    const app = express();
+    const dependencies = createDependencies();
+    registerAuthAndAccessRoutes(app, dependencies);
+
+    await request(app)
+      .patch('/api/passkeys/credential-1')
+      .send({ label: 'Office laptop' })
+      .expect(200, { renamed: true });
+
+    expect(dependencies.testHooks.requireSessionAuth).toHaveBeenCalledTimes(1);
+    expect(dependencies.testHooks.requireAuth).not.toHaveBeenCalled();
+  });
+
+  it('keeps passkey renames off the tunnel scope', async () => {
+    const app = express();
+    const dependencies = createDependencies();
+    const tunnelAuthController = createTunnelAuth();
+    tunnelAuthController.setActiveTunnel({ tunnelId: 'tunnel-1', publicUrl: 'https://tunnel.example.com' });
+    dependencies.tunnelAuthController = tunnelAuthController;
+    dependencies.uiAuthController.handlePasskeyRename = vi.fn((_req, res) => res.json({ renamed: true }));
+
+    registerAuthAndAccessRoutes(app, dependencies);
+
+    const response = await request(app)
+      .patch('/api/passkeys/credential-1')
+      .set('Host', 'tunnel.example.com')
+      .send({ label: 'Office laptop' });
+
+    expect(response.status).toBe(403);
+    expect(response.body.tunnelLocked).toBe(true);
+    expect(dependencies.uiAuthController.handlePasskeyRename).not.toHaveBeenCalled();
+  });
+
   it('treats private LAN hosts as local even when a tunnel is active', async () => {
     const app = express();
     const dependencies = createDependencies();
@@ -923,6 +1049,28 @@ describe('client auth routes', () => {
       .expect(200, { enabled: true, hasPasskeys: true, passkeyCount: 1, rpID: 'example.com' });
 
     expect(dependencies.uiAuthController.handlePasskeyStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not trust a local Host header that a tunnel forwarded for a remote client', () => {
+    const tunnelAuthController = createTunnelAuth();
+    tunnelAuthController.setActiveTunnel({ tunnelId: 'tunnel-1', publicUrl: 'https://box.tail1234.ts.net' });
+    // Tailscale routes by SNI, keeps the client's Host and connects from loopback.
+    const throughTailscale = (host, forwardedFor) => tunnelAuthController.classifyRequestScope({
+      headers: { host, 'x-forwarded-for': forwardedFor },
+      socket: { remoteAddress: '127.0.0.1' },
+    });
+
+    expect(throughTailscale('localhost', '203.0.113.10')).toBe('unknown-public');
+    expect(throughTailscale('192.168.1.5', 'fd7a:115c:a1e0::1234')).toBe('unknown-public');
+    expect(throughTailscale('box.tail1234.ts.net', '203.0.113.10')).toBe('tunnel');
+    expect(throughTailscale('localhost', '127.0.0.1')).toBe('local');
+  });
+
+  it('keeps a forwarded local request local while no tunnel is active', () => {
+    expect(createTunnelAuth().classifyRequestScope({
+      headers: { host: 'localhost', 'x-forwarded-for': '203.0.113.10' },
+      socket: { remoteAddress: '127.0.0.1' },
+    })).toBe('local');
   });
 
   it('does not trust a private Host header from a public socket peer', () => {

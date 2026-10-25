@@ -4,7 +4,7 @@ import type {
 } from '@/lib/desktopSsh';
 import type { IconName } from "@/components/icon/icons";
 
-export type ProjectActionIconKey =
+type ProjectActionIconKey =
   | 'play'
   | 'build'
   | 'lint'
@@ -23,6 +23,9 @@ export type ProjectActionIconKey =
   | 'robot'
   | 'command'
   | 'file';
+
+/** The id of the built-in action that detects the dev server command and opens what it serves. */
+export const AUTO_DISCOVER_ACTION_ID = '__openchamber_auto_discover_preview__';
 
 export const PROJECT_ACTION_ICONS: Array<{
   key: ProjectActionIconKey;
@@ -70,7 +73,7 @@ export const toProjectActionRunKey = (directory: string, actionId: string): stri
   return `${normalizeProjectActionDirectory(directory)}::${actionId}`;
 };
 
-export type ProjectActionDesktopForwardOption = {
+type ProjectActionDesktopForwardOption = {
   id: string;
   label: string;
   url: string;
@@ -148,4 +151,12 @@ export const resolveProjectActionDesktopForwardUrl = (
   const options = buildProjectActionDesktopForwardOptions(instances);
   const matched = options.find((entry) => entry.id === key);
   return matched?.url || null;
+};
+
+export const resolveProjectActionIconName = (action: { id: string; icon?: string | null }): IconName => {
+  if (action.id === AUTO_DISCOVER_ACTION_ID) {
+    return 'scan-2';
+  }
+  const matchedIcon = PROJECT_ACTION_ICONS.find((entry) => entry.key === action.icon);
+  return matchedIcon?.Icon ?? 'play';
 };

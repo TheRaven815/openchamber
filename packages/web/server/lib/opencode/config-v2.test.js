@@ -10,6 +10,9 @@ import {
   formatModelSelection,
   toAgentEntity,
   writeWarmingEnabled,
+  writeWarmingDuration,
+  skillSwitchRequestSchema,
+  writeSkillDisabled,
   fromAgentEntity,
   isLegacyAgentFrontmatter,
   toCommandEntity,
@@ -466,6 +469,46 @@ describe('findWebSearchProjectOverride', () => {
   });
 });
 
+describe('skill switches', () => {
+  const deny = (id) => ({ action: 'integration.use', resource: `skill:${id}`, effect: 'deny' });
+
+  it('accepts a skill id and refuses wildcards, separators and padding', () => {
+    const parse = (id) => skillSwitchRequestSchema.safeParse({ id, enabled: false, scope: 'user' }).success;
+    expect(parse('deploy-docs')).toBe(true);
+    expect(parse('déploy')).toBe(true);
+    for (const id of ['', ' deploy', 'deploy*', 'de?ploy', 'a/b', 'a\\b', 'a\nb', 7, null]) {
+      expect(parse(id)).toBe(false);
+    }
+    expect(skillSwitchRequestSchema.safeParse({ id: 'deploy', enabled: 'no', scope: 'user' }).success).toBe(false);
+    expect(skillSwitchRequestSchema.safeParse({ id: 'deploy', enabled: true, scope: 'global' }).success).toBe(false);
+  });
+
+  it('turns a skill off once and back on, leaving other statements alone', () => {
+    const wildcard = { action: 'integration.use', resource: 'skill:internal-*', effect: 'deny' };
+    const allow = { action: 'integration.use', resource: 'skill:review', effect: 'allow' };
+    const config = { model: 'openai/gpt-5', policies: [wildcard, allow] };
+
+    expect(writeSkillDisabled(config, 'deploy', true)).toBe(true);
+    expect(config.policies).toEqual([wildcard, allow, deny('deploy')]);
+    expect(writeSkillDisabled(config, 'deploy', true)).toBe(false);
+
+    expect(writeSkillDisabled(config, 'deploy', false)).toBe(true);
+    expect(config).toEqual({ model: 'openai/gpt-5', policies: [wildcard, allow] });
+    expect(writeSkillDisabled(config, 'deploy', false)).toBe(false);
+  });
+
+  it('turns on a deny written by hand, in the deprecated key too, and drops what it empties', () => {
+    const config = { policies: [deny('deploy')], experimental: { policies: [deny('deploy')] } };
+    expect(writeSkillDisabled(config, 'deploy', true)).toBe(false);
+    expect(writeSkillDisabled(config, 'deploy', false)).toBe(true);
+    expect(config).toEqual({});
+
+    const kept = { experimental: { policies: [deny('deploy')], other: true } };
+    expect(writeSkillDisabled(kept, 'deploy', false)).toBe(true);
+    expect(kept).toEqual({ experimental: { other: true } });
+  });
+});
+
 describe('session warming', () => {
   it('turns warming on and off, keeping a hand-tuned object', () => {
     const config = { model: 'openai/gpt-5' };
@@ -478,6 +521,22 @@ describe('session warming', () => {
 
     const tuned = { warming: { interval: '3 minutes' } };
     expect(writeWarmingEnabled(tuned, true)).toBe(false);
+    expect(tuned.warming).toEqual({ interval: '3 minutes' });
+  });
+
+  it('sets the warm duration only while warming is on, back to plain true at the default', () => {
+    const off = { model: 'openai/gpt-5' };
+    expect(writeWarmingDuration(off, 60)).toBe(false);
+    expect(off).toEqual({ model: 'openai/gpt-5' });
+
+    const on = { warming: true };
+    expect(writeWarmingDuration(on, 120)).toBe(true);
+    expect(on.warming).toEqual({ duration: '120 minutes' });
+    expect(writeWarmingDuration(on, 30)).toBe(true);
+    expect(on.warming).toBe(true);
+
+    const tuned = { warming: { interval: '3 minutes', duration: '45 minutes' } };
+    expect(writeWarmingDuration(tuned, 30)).toBe(true);
     expect(tuned.warming).toEqual({ interval: '3 minutes' });
   });
 });

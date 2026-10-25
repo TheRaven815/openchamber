@@ -21,13 +21,13 @@
 
 import { createReadStream } from "node:fs"
 import { createServer } from "node:http"
-import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import process from "node:process"
 
-import { CdpClient, createPageTarget, launchChrome, reservePort, resolveChrome, wait } from "./perf/cdp.mjs"
+import { CdpClient, createPageTarget, launchChrome, reservePort, resolveChrome, resolveProfileDir, wait } from "./perf/cdp.mjs"
 import { metricMap, round } from "./perf/metrics.mjs"
+import { startFrameCount } from "./perf/frame-count.mjs"
 import { createProcessCpuSampler, openBrowserClient } from "./perf/process-cpu.mjs"
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url))
@@ -71,7 +71,8 @@ Options:
   --filler <n>         Static elements added to the page, to measure a variant
                        against a realistically sized document (default: 0)
   --chrome <path>      Chrome/Chromium executable
-  --profile-dir <path> Reusable isolated Chrome profile
+  --profile-dir <path> Chrome profile to reuse (default: a fresh temporary
+                       profile per run, removed afterwards)
   --headed             Show the browser (default: headless). Headless runs
                        without a GPU, so compare process CPU only with --headed.
   --json               Print results as JSON
@@ -88,7 +89,7 @@ const parseArgs = (argv) => {
     settle: 3,
     filler: 0,
     chrome: null,
-    profileDir: join(homedir(), ".openchamber", "browser-profile-google-chrome"),
+    profileDir: null,
     headless: true,
     json: false,
   }
@@ -142,10 +143,12 @@ const measureVariant = async (client, browserClient, url, options) => {
   const processCpu = createProcessCpuSampler({ browserClient, serverProcesses: [] })
   const before = metricMap((await client.send("Performance.getMetrics")).metrics)
   await processCpu.sample()
+  const frameCount = await startFrameCount(client)
   const startedAt = Date.now()
   await wait(options.duration * 1000)
   const elapsedSeconds = (Date.now() - startedAt) / 1000
   await processCpu.sample()
+  const { framesPerSecond } = await frameCount.stop()
   const after = metricMap((await client.send("Performance.getMetrics")).metrics)
   const cpu = processCpu.summarize()
   const cpuOf = (type) => round(cpu.processes
@@ -154,6 +157,7 @@ const measureVariant = async (client, browserClient, url, options) => {
 
   const delta = (name) => Number(after[name] ?? 0) - Number(before[name] ?? 0)
   return {
+    framesPerSecond,
     recalcStylePerSecond: round(delta("RecalcStyleCount") / elapsedSeconds),
     layoutsPerSecond: round(delta("LayoutCount") / elapsedSeconds),
     mainThreadBusyPercent: round((delta("TaskDuration") / elapsedSeconds) * 100),
@@ -174,9 +178,10 @@ const main = async () => {
   const chrome = resolveChrome(options.chrome)
   const { server, port: fixturePort } = await startFixtureServer()
   const debuggingPort = await reservePort()
+  const profile = resolveProfileDir(options.profileDir, "animation")
   const chromeProcess = launchChrome({
     chrome,
-    profileDir: resolve(options.profileDir),
+    profileDir: profile.dir,
     port: debuggingPort,
     headless: options.headless,
   })
@@ -205,7 +210,8 @@ const main = async () => {
       results.push({ variant, ...measured })
       if (!options.json) {
         console.log(
-          `${variant.padEnd(30)} recalc/s ${String(measured.recalcStylePerSecond).padStart(8)}`
+          `${variant.padEnd(30)} frames/s ${String(measured.framesPerSecond).padStart(6)}`
+          + `   recalc/s ${String(measured.recalcStylePerSecond).padStart(8)}`
           + `   layout/s ${String(measured.layoutsPerSecond).padStart(6)}`
           + `   busy% ${String(measured.mainThreadBusyPercent).padStart(6)}`
           + `   cpu% renderer ${String(measured.rendererCpuPercent).padStart(6)}`
@@ -231,6 +237,7 @@ const main = async () => {
     client?.close()
     browserClient?.close()
     if (!chromeProcess.killed) chromeProcess.kill("SIGTERM")
+    profile.removeAfter(chromeProcess)
     server.close()
   }
 }

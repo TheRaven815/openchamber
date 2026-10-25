@@ -4,6 +4,7 @@ import {
   areFilesEqual,
   areOptionsEqual,
   FileDiff as PierreFileDiff,
+  parseDiffFromFile,
   VirtualizedFileDiff,
   Virtualizer,
   type FileContents,
@@ -13,6 +14,7 @@ import {
   type SelectedLineRange,
   type AnnotationSide,
   type ExpansionDirections,
+  type OnDiffLineClickProps,
   type VirtualFileMetrics,
 } from '@pierre/diffs';
 import type { WorkerPoolManager } from '@pierre/diffs/worker';
@@ -20,6 +22,7 @@ import {
   buildPierreLineAnnotations,
   type PierreAnnotationData,
   PierreDiffCommentOverlays,
+  isWholeFileComment,
   toPierreAnnotationId,
   useInlineCommentController,
 } from '@/components/comments';
@@ -28,12 +31,20 @@ import { useOptionalThemeSystem } from '@/contexts/useThemeSystem';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { useWorkerPool } from '@/contexts/DiffWorkerProvider';
 import { ensurePierreThemeRegistered, getResolvedShikiTheme } from '@/lib/shiki/appThemeRegistry';
+import { DIFFS_HIGHLIGHTER } from '@/lib/shiki/diffsHighlighter';
 import { getDefaultTheme } from '@/lib/theme/themes';
 
 import { useDeviceInfo } from '@/lib/device';
 import { useI18n } from '@/lib/i18n';
-import { cn } from '@/lib/utils';
+import { cn, isMacOS } from '@/lib/utils';
+import { hideWhitespaceChanges } from '@/lib/diff/hideWhitespaceChanges';
 import type { PatchHunkAnchor } from '@/lib/diff/patchFileDiff';
+import { getDiffLinesText } from '@/lib/diff/selectedDiffLines';
+import { findWordAtOffset } from '@/lib/diff/findWord';
+import type { DiffFindSide } from '@/lib/diff/diffFind';
+import { PIERRE_DIFF_TINT_CSS } from '@/lib/shiki/pierreDiffTint';
+import { DiffStickyScrollbar } from './DiffStickyScrollbar';
+import type { DiffCommentOrigin } from '@/lib/diffCommentOrigin';
 
 /**
  * A click on a collapsed-context expander of a partial (patch-only) diff.
@@ -62,6 +73,13 @@ const HUNK_ACTION_OVERLAY_CSS = `
   [data-code] { min-height: 2.5rem; align-content: start; }
 `;
 
+// The inline layout draws the columns' horizontal scrollbar outside the
+// shadow root, sticky to the panel (DiffStickyScrollbar).
+const HIDE_COLUMN_SCROLLBAR_CSS = `
+  [data-code] { scrollbar-width: none; }
+  [data-code]::-webkit-scrollbar { display: none; }
+`;
+
 
 // Threshold (bytes) above which syntax highlighting is degraded for performance
 const LARGE_CONTENT_BYTES = 500_000;
@@ -72,10 +90,17 @@ interface PierreDiffViewerProps {
   fileDiff?: FileDiffMetadata;
   language: string;
   fileName?: string;
+  /** The diff this is, for comments; absent for uncommitted changes. */
+  commentOrigin?: DiffCommentOrigin;
   renderSideBySide: boolean;
   wrapLines?: boolean;
   layout?: 'fill' | 'inline';
   enableComments?: boolean;
+  /**
+   * Shows lines that changed only by whitespace as unchanged. Hunk actions are
+   * dropped meanwhile: they act on the whole hunk, whitespace included.
+   */
+  hideWhitespace?: boolean;
   hunkActions?: DiffHunkActions;
   /**
    * Present when the owner can replace a partial diff with full file contents.
@@ -87,7 +112,54 @@ interface PierreDiffViewerProps {
   pendingContextExpansion?: ContextExpansionRequest | null;
   /** The owner is fetching the full file for `pendingContextExpansion`. */
   contextLoading?: boolean;
+  /**
+   * A primary-modifier click on a word (Cmd on macOS, Ctrl elsewhere) reports
+   * that word so the owner can open find and jump to the next match.
+   */
+  onFindWordRequest?: (request: DiffFindWordRequest) => void;
 }
+
+/** A primary-modifier click on a word inside a diff line. */
+export interface DiffFindWordRequest {
+  /** The word under the pointer, expanded to its boundaries. */
+  word: string;
+  /** 1-based line number of the clicked row, on that row's side. */
+  lineNumber: number;
+  /** The clicked row's side: deletion and addition rows can share a line number. */
+  side: DiffFindSide;
+  /** 0-based offset of `word` inside that line's text — the same offset space as DiffFindMatch.spanStart. */
+  spanStart: number;
+}
+
+/**
+ * Read-only handle for find-in-diff. Both members work on the live rendered
+ * diff; `setFindHighlights` also re-applies itself after virtualized rebuilds.
+ */
+export interface PierreDiffViewerHandle {
+  /**
+   * Bring this side's `lineNumber` into view. False while its row is not
+   * rendered yet (the diff is still loading, or a collapsed gap or a
+   * virtualized window is being moved to it): call again on a later frame.
+   */
+  scrollToLine(target: { lineNumber: number; side: DiffFindSide; align?: 'start' | 'center' }): boolean;
+  /** Paint matches on the rendered rows, distinguishing `currentIndex`; [] clears. */
+  setFindHighlights(
+    matches: ReadonlyArray<{ lineNumber: number; side: DiffFindSide; spanStart: number; spanLength: number }>,
+    currentIndex: number,
+  ): void;
+}
+
+const FIND_MARK_ATTR = 'data-oc-find-mark';
+const FIND_CURRENT_ATTR = 'data-oc-find-current';
+const FIND_STYLE_ATTR = 'data-oc-find-style';
+
+// Injected into the diff's shadow root, so it must not rely on Tailwind. The
+// theme's custom properties inherit through the shadow boundary; the tints
+// match the Markdown preview's find marks (MarkdownPreviewSearch).
+const FIND_MARK_CSS = `
+  mark[${FIND_MARK_ATTR}] { background-color: color-mix(in srgb, var(--status-warning) 30%, transparent); color: inherit; border-radius: 2px; }
+  mark[${FIND_CURRENT_ATTR}] { background-color: color-mix(in srgb, var(--status-warning) 60%, transparent); }
+`;
 
 /**
  * Base CSS injected into Pierre's Shadow DOM. Pins font-family/size to the
@@ -124,6 +196,7 @@ const PIERRE_RUNTIME_BASE_CSS = `
 // as they break resize behavior.
 const WEBKIT_SCROLL_FIX_CSS = `
   ${PIERRE_RUNTIME_BASE_CSS}
+  ${PIERRE_DIFF_TINT_CSS}
 
   /* While a multi-line content drag is being mapped to a line selection the
      row highlight is the feedback; the native blue text selection on top of
@@ -150,6 +223,23 @@ const WEBKIT_SCROLL_FIX_CSS = `
     --diffs-bg-separator-override: var(--surface-elevated);
   }
 
+  /* Selected rows: Pierre mixes the selection colour in at 18-25%, and the
+     theme's selection is a soft neutral, so the selection barely showed on
+     dark themes. Half the selection colour stays readable while added and
+     deleted rows keep their tint. */
+  [data-line][data-selected-line],
+  [data-line-annotation][data-selected-line],
+  [data-no-newline][data-selected-line] {
+    --mix-selection-light: 62%;
+    --mix-selection-dark: 50%;
+  }
+
+  [data-gutter-buffer][data-selected-line],
+  [data-column-number][data-selected-line] {
+    --mix-selection-light: 55%;
+    --mix-selection-dark: 40%;
+  }
+
   [data-diff-header],
   [data-diff] {
     [data-separator] {
@@ -157,10 +247,25 @@ const WEBKIT_SCROLL_FIX_CSS = `
     }
   }
 
+  /* A faint tint and hairlines above and below, across every column of both
+     sides, so two hunks read as two even where the label shows on one side
+     only. Inset shadows, not borders: the row keeps the height Pierre lays
+     out with. */
   [data-separator="line-info-basic"] {
     height: 24px !important;
-    background: var(--diffs-bg) !important;
+    background: color-mix(in srgb, var(--diffs-fg) 2%, var(--diffs-bg)) !important;
     position: relative;
+    box-shadow:
+      inset 0 1px 0 var(--interactive-border),
+      inset 0 -1px 0 var(--interactive-border);
+  }
+
+  [data-separator="line-info-basic"][data-separator-first] {
+    box-shadow: inset 0 -1px 0 var(--interactive-border);
+  }
+
+  [data-separator="line-info-basic"][data-separator-last] {
+    box-shadow: inset 0 1px 0 var(--interactive-border);
   }
 
   [data-diff-type="single"] [data-gutter],
@@ -404,19 +509,14 @@ const extractSelectedCode = (
 ): string => {
   // Default to modified if side is ambiguous, as users mostly comment on new code
   const isOriginal = range.side === 'deletions';
-  const content = fileDiff
-    ? (isOriginal ? fileDiff.deletionLines : fileDiff.additionLines).join('')
-    : (isOriginal ? original : modified);
-  const lines = content.split('\n');
-
-  // Ensure bounds
   const from = Math.min(range.start, range.end);
   const to = Math.max(range.start, range.end);
+  if (fileDiff) return getDiffLinesText(fileDiff, isOriginal ? 'deletions' : 'additions', from, to);
+
+  const lines = (isOriginal ? original : modified).split('\n');
   const startLine = Math.max(1, from);
   const endLine = Math.min(lines.length, to);
-
   if (startLine > endLine) return '';
-
   return lines.slice(startLine - 1, endLine).join('\n');
 };
 
@@ -586,6 +686,179 @@ const waitForDiffReady = (
   };
 };
 
+const getDiffShadowRoot = (container: HTMLElement | null): ShadowRoot | null => {
+  const host = container?.querySelector('diffs-container');
+  return host?.shadowRoot ?? null;
+};
+
+const clearFindHighlights = (root: ShadowRoot): void => {
+  const parents = new Set<Node>();
+  root.querySelectorAll(`mark[${FIND_MARK_ATTR}]`).forEach((mark) => {
+    const parent = mark.parentNode;
+    if (!parent) return;
+    mark.replaceWith(...Array.from(mark.childNodes));
+    parents.add(parent);
+  });
+  parents.forEach((parent) => parent.normalize());
+};
+
+const rowMatchesSide = (row: Element, side: DiffFindSide): boolean => {
+  const lineType = row.getAttribute('data-line-type');
+  if (lineType === 'deletion' || lineType === 'change-deletion') return side === 'deletions';
+  if (lineType === 'addition' || lineType === 'change-addition') return side === 'additions';
+  // A context row. Split view renders one in each column, numbered on that
+  // column's side, so a row only answers for its own column; the unified
+  // column numbers context rows on the additions side.
+  const column = row.closest('[data-deletions], [data-additions]');
+  if (!column) return side === 'additions';
+  return column.hasAttribute('data-deletions') ? side === 'deletions' : side === 'additions';
+};
+
+/** A line inside a hunk is always rendered; gaps and trailing context may not be. */
+const isWithinHunk = (fileDiff: FileDiffMetadata | undefined, lineNumber: number, side: DiffFindSide): boolean => {
+  if (!fileDiff) return false;
+  return fileDiff.hunks.some((hunk) => side === 'additions'
+    ? lineNumber >= hunk.additionStart && lineNumber < hunk.additionStart + hunk.additionCount
+    : lineNumber >= hunk.deletionStart && lineNumber < hunk.deletionStart + hunk.deletionCount);
+};
+
+/**
+ * The library's renderability oracle is additions-only, so a deletions line in
+ * a collapsed gap is translated to the additions line sharing its row region
+ * (the old/new offset is constant across an unchanged gap). Returns undefined
+ * when the line is not in a gap.
+ */
+const deletionGapToAdditionLine = (hunks: FileDiffMetadata['hunks'], deletionLine: number): number | undefined => {
+  for (let index = 0; index <= hunks.length; index += 1) {
+    const next = hunks[index];
+    const prev = hunks[index - 1];
+    const gapStart = prev ? prev.deletionStart + prev.deletionCount : 1;
+    const gapEnd = next ? next.deletionStart : Number.POSITIVE_INFINITY;
+    if (deletionLine < gapStart || deletionLine >= gapEnd) continue;
+    const anchor = next ?? prev;
+    return anchor ? deletionLine + (anchor.additionStart - anchor.deletionStart) : undefined;
+  }
+  return undefined;
+};
+
+// A row's text nodes in order — the offset space `wrapRowSpan` and matches share.
+const rowTextNodes = (row: HTMLElement): Text[] => {
+  const nodes: Text[] = [];
+  const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    if (node instanceof Text) nodes.push(node);
+  }
+  return nodes;
+};
+
+/**
+ * Wrap an absolute [spanStart, spanStart + spanLength) range of a row's text in
+ * marks: one per text node it covers, each inside that node's own syntax token,
+ * so clearing (unwrap, then normalize) gives the row back its exact structure.
+ * Wrapping across token boundaries would split the tokens, and the row would
+ * collect fragments with every repaint.
+ */
+const wrapRowSpan = (row: HTMLElement, spanStart: number, spanLength: number, current: boolean): void => {
+  const end = spanStart + spanLength;
+  let offset = 0;
+  for (const node of rowTextNodes(row)) {
+    const nodeStart = offset;
+    const length = node.nodeValue?.length ?? 0;
+    offset += length;
+    const from = Math.max(spanStart, nodeStart) - nodeStart;
+    const to = Math.min(end, nodeStart + length) - nodeStart;
+    if (to <= from) continue;
+    let segment = node;
+    if (from > 0) segment = segment.splitText(from);
+    if (to - from < segment.length) segment.splitText(to - from);
+    const mark = document.createElement('mark');
+    mark.setAttribute(FIND_MARK_ATTR, '');
+    if (current) mark.setAttribute(FIND_CURRENT_ATTR, '');
+    segment.replaceWith(mark);
+    mark.appendChild(segment);
+    if (offset >= end) break;
+  }
+};
+
+/**
+ * The word under a primary-modifier click, read from the row's own text so its
+ * `spanStart` matches `DiffFindMatch.spanStart`. Returns null when the caret
+ * APIs are unavailable or the point does not land on this row's text.
+ */
+const findWordAtPoint = (row: HTMLElement, clientX: number, clientY: number): { word: string; spanStart: number } | null => {
+  const root = row.getRootNode();
+  if (!(root instanceof ShadowRoot)) return null;
+  // SAFETY: Chromium exposes the caret APIs and getSelection on ShadowRoot
+  // (CSSOM View's DocumentOrShadowRoot mixin) but lib.dom declares the caret
+  // APIs only on Document and omits getSelection from ShadowRoot entirely.
+  const host = root as ShadowRoot & {
+    caretPositionFromPoint?: (x: number, y: number) => CaretPosition | null;
+    caretRangeFromPoint?: (x: number, y: number) => Range | null;
+    getSelection?: () => Selection | null;
+  };
+  const caret = host.caretPositionFromPoint?.(clientX, clientY);
+  const range = caret ? null : host.caretRangeFromPoint?.(clientX, clientY);
+  let node: Node | null = caret?.offsetNode ?? range?.startContainer ?? null;
+  let nodeOffset = caret?.offset ?? range?.startOffset ?? 0;
+  if (node === null) {
+    // Neither caret API is implemented on ShadowRoot in current Chromium; the
+    // collapsed caret the browser placed on mousedown is the same information.
+    const selection = host.getSelection?.();
+    if (!selection?.isCollapsed) return null;
+    node = selection.focusNode;
+    nodeOffset = selection.focusOffset;
+  }
+  if (!(node instanceof Text) || node.parentElement?.closest('[data-line]') !== row) return null;
+
+  const nodes = rowTextNodes(row);
+  const text = nodes.map((textNode) => textNode.nodeValue ?? '').join('');
+  let offset = 0;
+  for (const candidate of nodes) {
+    if (candidate === node) return findWordAtOffset(text, offset + nodeOffset);
+    offset += candidate.nodeValue?.length ?? 0;
+  }
+  return null;
+};
+
+const ensureFindStyle = (root: ShadowRoot): void => {
+  if (root.querySelector(`style[${FIND_STYLE_ATTR}]`)) return;
+  const style = document.createElement('style');
+  style.setAttribute(FIND_STYLE_ATTR, '');
+  style.textContent = FIND_MARK_CSS;
+  root.appendChild(style);
+};
+
+const applyFindHighlightsToContainer = (
+  container: HTMLElement | null,
+  matches: ReadonlyArray<{ lineNumber: number; side: DiffFindSide; spanStart: number; spanLength: number }>,
+  currentIndex: number,
+): void => {
+  const root = getDiffShadowRoot(container);
+  if (!root) return;
+  clearFindHighlights(root);
+  if (matches.length === 0) {
+    root.querySelector(`style[${FIND_STYLE_ATTR}]`)?.remove();
+    return;
+  }
+  ensureFindStyle(root);
+  // One pass over the rendered rows: a virtualized diff renders a window of a
+  // file whose matches can run into the thousands.
+  const rowsByLine = new Map<string, HTMLElement[]>();
+  for (const row of root.querySelectorAll('[data-line]')) {
+    const line = row.getAttribute('data-line');
+    if (line === null || !(row instanceof HTMLElement)) continue;
+    const rows = rowsByLine.get(line);
+    if (rows) rows.push(row);
+    else rowsByLine.set(line, [row]);
+  }
+  matches.forEach((match, index) => {
+    for (const row of rowsByLine.get(String(match.lineNumber)) ?? []) {
+      if (rowMatchesSide(row, match.side)) wrapRowSpan(row, match.spanStart, match.spanLength, index === currentIndex);
+    }
+  });
+};
+
 type SharedVirtualizer = {
   virtualizer: Virtualizer;
   root: Document | HTMLElement;
@@ -702,12 +975,47 @@ const wakeVirtualizer = (
   };
 };
 
-export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
+export const PierreDiffViewer = React.forwardRef<PierreDiffViewerHandle, PierreDiffViewerProps>(
+  function PierreDiffViewer({ hideWhitespace = false, ...props }, ref) {
+    const { t } = useI18n();
+    const { original, modified, fileDiff, fileName } = props;
+    const sourceDiff = useMemo(() => {
+      if (!hideWhitespace || fileDiff) return fileDiff;
+      return parseDiffFromFile({ name: fileName ?? '', contents: original }, { name: fileName ?? '', contents: modified });
+    }, [fileDiff, fileName, hideWhitespace, modified, original]);
+    const visibleDiff = useMemo(
+      () => (hideWhitespace && sourceDiff ? hideWhitespaceChanges(sourceDiff) : fileDiff),
+      [fileDiff, hideWhitespace, sourceDiff],
+    );
+
+    if (hideWhitespace && sourceDiff && sourceDiff.hunks.length > 0 && visibleDiff?.hunks.length === 0) {
+      return (
+        <div className="px-3 py-2 typography-meta text-muted-foreground">
+          {t('diffView.state.whitespaceOnly')}
+        </div>
+      );
+    }
+
+    return (
+      <PierreDiffViewerBody
+        {...props}
+        handleRef={ref}
+        fileDiff={visibleDiff}
+        hunkActions={hideWhitespace ? undefined : props.hunkActions}
+      />
+    );
+  },
+);
+
+const PierreDiffViewerBody: React.FC<
+  Omit<PierreDiffViewerProps, 'hideWhitespace'> & { handleRef?: React.Ref<PierreDiffViewerHandle> }
+> = ({
   original,
   modified,
   fileDiff: incomingFileDiff,
   language,
   fileName,
+  commentOrigin,
   renderSideBySide,
   wrapLines,
   layout = 'fill',
@@ -716,6 +1024,8 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
   onExpandContextRequest,
   pendingContextExpansion = null,
   contextLoading = false,
+  onFindWordRequest,
+  handleRef,
 }) => {
   const themeContext = useOptionalThemeSystem();
   const { t } = useI18n();
@@ -737,6 +1047,7 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
   const diffCommentController = useInlineCommentController<SelectedLineRange>({
     source: 'diff',
     fileLabel: fileName || 'unknown',
+    origin: commentOrigin,
     language,
     getCodeForRange: (range) => extractSelectedCode(original, modified, incomingFileDiff, range),
     toStoreRange: (range) => ({
@@ -752,7 +1063,7 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
   });
 
   const {
-    drafts: fileDrafts,
+    drafts: diffDrafts,
     selection,
     setSelection,
     commentText,
@@ -763,6 +1074,8 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
     startEdit,
     deleteDraft,
   } = diffCommentController;
+  // Whole-file comments have no lines to sit under; the file header shows them.
+  const fileDrafts = useMemo(() => diffDrafts.filter((draft) => !isWholeFileComment(draft)), [diffDrafts]);
 
   const selectionRef = useRef<SelectedLineRange | null>(null);
   const editingDraftIdRef = useRef<string | null>(null);
@@ -771,6 +1084,14 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
   // to avoid loop with onLineSelected callback
   const isApplyingSelectionRef = useRef(false);
   const lastAppliedSelectionRef = useRef<SelectedLineRange | null>(null);
+  // True for the gesture that dragged across lines, so the click ending it
+  // does not read as a find-word request.
+  const dragSelectionRef = useRef(false);
+  const onFindWordRequestRef = useRef(onFindWordRequest);
+
+  useEffect(() => {
+    onFindWordRequestRef.current = onFindWordRequest;
+  }, [onFindWordRequest]);
 
   useEffect(() => {
     selectionRef.current = selection;
@@ -872,6 +1193,9 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
           let bounds = columns.get(column);
           if (!bounds) {
             bounds = column.getBoundingClientRect();
+            // Wrapped split view lays the column out as `display: contents`,
+            // which has no box. Its content grid spans the same rows.
+            if (bounds.height === 0) bounds = slot.closest('[data-content]')?.getBoundingClientRect() ?? bounds;
             columns.set(column, bounds);
           }
           const markerTop = target.getBoundingClientRect().top;
@@ -978,6 +1302,7 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
 
     const handlePointerDown = (event: PointerEvent) => {
       if (event.button !== 0 || event.pointerType !== 'mouse') return;
+      dragSelectionRef.current = false;
       const hit = lineFromPoint(event.clientX, event.clientY);
       // Number-column drags belong to Pierre's own selection handling.
       if (!hit || hit.numberColumn) {
@@ -999,6 +1324,7 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
         // selection, not a text selection. Drop the native selection and
         // block new one from forming for the rest of the drag.
         engaged = true;
+        dragSelectionRef.current = true;
         setDragAttribute(true);
         window.getSelection()?.removeAllRanges();
         const shadowRoot = getShadowRoot();
@@ -1069,7 +1395,19 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
 
   // Clicking anywhere on a diff line (not only its number cell) toggles a
   // single-line comment selection, matching the "+" utility's target.
-  const handleLineClick = useCallback((props: { lineNumber: number; annotationSide: AnnotationSide; numberColumn: boolean }) => {
+  const handleLineClick = useCallback((props: OnDiffLineClickProps) => {
+    const { event } = props;
+    const primaryModifier = isMacOS() ? event.metaKey : event.ctrlKey;
+    // Where find is wired, a primary-modifier click on a word is a find
+    // request, never a comment.
+    const requestFindWord = onFindWordRequestRef.current;
+    if (primaryModifier && requestFindWord) {
+      if (!event.shiftKey && !event.altKey && event.button === 0 && !props.numberColumn && !dragSelectionRef.current) {
+        const hit = findWordAtPoint(props.lineElement, event.clientX, event.clientY);
+        if (hit) requestFindWord({ word: hit.word, lineNumber: props.lineNumber, side: props.annotationSide, spanStart: hit.spanStart });
+      }
+      return;
+    }
     if (!enableComments || props.numberColumn) return;
     // Ignore when the user selected text on the way to this click (copying
     // code must not pop the comment editor).
@@ -1159,9 +1497,95 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
   const instanceFileDiffRef = useRef<FileDiffMetadata | undefined>(undefined);
   const instanceOldFileRef = useRef<FileContents | undefined>(undefined);
   const instanceNewFileRef = useRef<FileContents | undefined>(undefined);
+
+  const findMatchesRef = useRef<ReadonlyArray<{ lineNumber: number; side: DiffFindSide; spanStart: number; spanLength: number }>>([]);
+  const findCurrentIndexRef = useRef(-1);
+
+  // The shadow-root observer below, and its pass, shared so highlight surgery
+  // can keep its own mutations out of the observer.
+  const shadowObserverRef = useRef<MutationObserver | null>(null);
+  const scheduleShadowPassRef = useRef<(() => void) | null>(null);
+  const applyFindHighlights = useCallback(() => {
+    const observer = shadowObserverRef.current;
+    // Records queued before the surgery are the library's and keep their pass.
+    const pending = observer?.takeRecords() ?? [];
+    applyFindHighlightsToContainer(diffContainerRef.current, findMatchesRef.current, findCurrentIndexRef.current);
+    // The surgery's own records are dropped: its text splits and merges look
+    // like the library's, and a pass for them would re-apply the highlights
+    // and re-render the viewer for nothing.
+    observer?.takeRecords();
+    if (pending.length > 0) scheduleShadowPassRef.current?.();
+  }, []);
+
+  const setFindHighlights = useCallback((
+    matches: ReadonlyArray<{ lineNumber: number; side: DiffFindSide; spanStart: number; spanLength: number }>,
+    currentIndex: number,
+  ) => {
+    findMatchesRef.current = matches;
+    findCurrentIndexRef.current = currentIndex;
+    applyFindHighlights();
+  }, [applyFindHighlights]);
+
   const [, forceUpdate] = React.useReducer((x) => x + 1, 0);
   const workerPool = useWorkerPool(isLargeContent ? 'unified' : (renderSideBySide ? 'split' : 'unified'));
   const fileDiff = useDiffSwapAfterHighlight(incomingFileDiff, workerPool);
+
+  const scrollToLine = useCallback((target: { lineNumber: number; side: DiffFindSide; align?: 'start' | 'center' }): boolean => {
+    const instance = diffInstanceRef.current;
+    const { lineNumber, side, align = 'start' } = target;
+    if (!instance || lineNumber < 1) return false;
+
+    // `isLineRenderable` wraps the library's additions-only oracle, so a
+    // deletions gap line is translated to its additions counterpart first.
+    const oracleLine = side === 'additions'
+      ? lineNumber
+      : deletionGapToAdditionLine(fileDiff?.hunks ?? [], lineNumber);
+
+    const isRenderable = (): boolean => {
+      if (isWithinHunk(fileDiff, lineNumber, side)) return true;
+      // A partial diff has no file contents, so collapsed gaps never hydrate.
+      if (fileDiff?.isPartial) return false;
+      return oracleLine !== undefined && instance.isLineRenderable(oracleLine);
+    };
+
+    // The rendered row is the authority on where the line is: it is centered
+    // directly. A virtualized diff may not have rendered it yet, so the
+    // virtualizer is first moved to the line's estimated position (its cached
+    // geometry can be stale right after the file expanded), and the next
+    // attempt centers the row it renders there.
+    const scrollNow = (): boolean => {
+      const root = getDiffShadowRoot(diffContainerRef.current);
+      for (const row of root?.querySelectorAll(`[data-line="${lineNumber}"]`) ?? []) {
+        if (!(row instanceof HTMLElement) || !rowMatchesSide(row, side)) continue;
+        // The active mark when it is painted: aligning the whole row would
+        // also scroll a wide line sideways, under the line numbers.
+        const target = row.querySelector(`mark[${FIND_CURRENT_ATTR}]`) ?? row;
+        target.scrollIntoView({ block: align === 'center' ? 'center' : 'start', inline: 'nearest' });
+        return true;
+      }
+      if (!(instance instanceof VirtualizedFileDiff)) return false;
+      const position = instance.getLinePosition(lineNumber, side);
+      const virtualizer = instanceVirtualizerRef.current ?? sharedVirtualizerRef.current?.virtualizer ?? null;
+      if (!position || !virtualizer) return false;
+      const scrollRoot = virtualizer.getRoot();
+      const viewportHeight = scrollRoot instanceof Document ? globalThis.innerHeight : (scrollRoot?.getBoundingClientRect().height ?? 0);
+      const base = (instance.top ?? 0) + position.top;
+      // Re-read the scroll height the virtualizer clamps against: it predates
+      // a file that just expanded.
+      virtualizer.markDOMDirty();
+      virtualizer.scrollTo({ top: base - Math.max(0, (viewportHeight - position.height) / 2), behavior: 'auto' });
+      return false;
+    };
+
+    if (isRenderable()) return scrollNow();
+    // A collapsed gap is not rendered until expanded; revealLine is
+    // additions-indexed and only works for a full diff. Either way the line is
+    // not on screen yet, so the caller tries again on a later frame.
+    if (!fileDiff?.isPartial && oracleLine !== undefined) instance.revealLine(oracleLine);
+    return false;
+  }, [fileDiff]);
+
+  React.useImperativeHandle(handleRef, () => ({ scrollToLine, setFindHighlights }), [scrollToLine, setFindHighlights]);
   // Partial diff + an owner that can load the file: the separators become
   // expand buttons (see the on-demand CSS) and report the gap on click.
   const expandOnDemand = Boolean(onExpandContextRequest) && fileDiff?.isPartial === true;
@@ -1246,12 +1670,22 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
   }, [darkResolvedTheme, diffThemeKey, isDark, lightResolvedTheme]);
 
 
+  // Rows exist only once the library has rendered them, so find marks set
+  // before that (a viewer registered while its diff was still loading) are
+  // painted here, and again after every re-render that replaced the rows.
+  const hasHunkAnchors = hunkAnchors.length > 0;
+  const handlePostRender = useCallback<NonNullable<FileDiffOptions<DiffAnnotation, undefined>['onPostRender']>>((node, instance, phase) => {
+    if (hasHunkAnchors) captureHunkTargets(node, instance, phase);
+    if (phase !== 'unmount' && findMatchesRef.current.length > 0) applyFindHighlights();
+  }, [applyFindHighlights, captureHunkTargets, hasHunkAnchors]);
+
   const options = useMemo<FileDiffOptions<DiffAnnotation, undefined>>(() => ({
     theme: {
       dark: darkTheme.metadata.id,
       light: lightTheme.metadata.id,
     },
     themeType: isDark ? 'dark' : 'light',
+    preferredHighlighter: DIFFS_HIGHLIGHTER,
     diffStyle: renderSideBySide ? 'split' : 'unified',
     diffIndicators: 'none',
     hunkSeparators: 'line-info-basic',
@@ -1268,12 +1702,16 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
     enableLineSelection: enableComments,
     enableGutterUtility: enableComments,
     onGutterUtilityClick: enableComments ? handleGutterUtilityClick : undefined,
-    onLineClick: enableComments ? handleLineClick : undefined,
+    onLineClick: enableComments || onFindWordRequest ? handleLineClick : undefined,
     onLineSelected: enableComments ? handleSelectionChange : undefined,
-    unsafeCSS: hunkAnchors.length > 0 ? `${WEBKIT_SCROLL_FIX_CSS}\n${HUNK_ACTION_OVERLAY_CSS}` : WEBKIT_SCROLL_FIX_CSS,
+    unsafeCSS: [
+      WEBKIT_SCROLL_FIX_CSS,
+      hunkAnchors.length > 0 ? HUNK_ACTION_OVERLAY_CSS : '',
+      layout === 'inline' ? HIDE_COLUMN_SCROLLBAR_CSS : '',
+    ].join('\n'),
     renderAnnotation: enableComments || hunkAnchors.length > 0 || expandOnDemand ? renderAnnotation : undefined,
-    onPostRender: hunkAnchors.length > 0 ? captureHunkTargets : undefined,
-  }), [captureHunkTargets, hunkAnchors.length, darkTheme.metadata.id, enableComments, expandOnDemand, isDark, isLargeContent, lightTheme.metadata.id, renderSideBySide, wrapLines, handleSelectionChange, handleGutterUtilityClick, handleLineClick, renderAnnotation]);
+    onPostRender: handlePostRender,
+  }), [handlePostRender, hunkAnchors.length, darkTheme.metadata.id, enableComments, expandOnDemand, isDark, isLargeContent, layout, lightTheme.metadata.id, renderSideBySide, wrapLines, handleSelectionChange, handleGutterUtilityClick, handleLineClick, onFindWordRequest, renderAnnotation]);
 
 
   const lineAnnotations = useMemo<DiffLineAnnotation<DiffAnnotation>[]>(() => {
@@ -1550,13 +1988,20 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
 
       const shadowRoot = diffsContainer.shadowRoot;
 
-      observer = new MutationObserver(() => {
+      // A rebuild of the rows drops their find marks, so the pass paints them
+      // again. The surgery takes its own records (applyFindHighlights), so this
+      // never fires for it.
+      const schedulePass = () => {
         if (rafId) cancelAnimationFrame(rafId);
         rafId = requestAnimationFrame(() => {
-          forceUpdate();
           rafId = null;
+          forceUpdate();
+          if (findMatchesRef.current.length > 0) applyFindHighlights();
         });
-      });
+      };
+      observer = new MutationObserver(schedulePass);
+      shadowObserverRef.current = observer;
+      scheduleShadowPassRef.current = schedulePass;
 
       observer.observe(diffsContainer, { childList: true, subtree: true });
       if (shadowRoot) {
@@ -1570,8 +2015,12 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
       clearTimeout(timeoutId);
       if (rafId) cancelAnimationFrame(rafId);
       observer?.disconnect();
+      if (shadowObserverRef.current === observer) {
+        shadowObserverRef.current = null;
+        scheduleShadowPassRef.current = null;
+      }
     };
-  }, [diffThemeKey, fileName]);
+  }, [applyFindHighlights, diffThemeKey, fileName]);
 
   useEffect(() => {
     requestTrailingExpansionRef.current = () => {
@@ -1697,6 +2146,7 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
       <div ref={diffRootRef} className="pierre-diff-wrapper w-full overflow-x-auto overflow-y-visible relative">
       <div ref={diffContainerRef} className="w-full" />
     </div>
+    <DiffStickyScrollbar containerRef={diffContainerRef} />
     {commentOverlays}
     {hunkActionPortals}
   </div>

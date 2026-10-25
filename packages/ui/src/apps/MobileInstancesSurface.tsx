@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import { useI18n } from '@/lib/i18n';
 import { isRelayModeActive } from '@/lib/relay/runtime-tunnel';
 import { cn } from '@/lib/utils';
+import { useWaitingBlink } from '@/hooks/useDurationTicker';
 
 import { connectionDisplayUrl, isActiveRuntimeConnection, useMobileConnection } from './mobileConnections';
 import { useDebugPanelLongPress } from './mobileConnectionDebug';
@@ -31,6 +32,7 @@ export const MobileInstancesSurface: React.FC<{
   const [clientToken, setClientToken] = React.useState('');
   const [password, setPassword] = React.useState('');
   const [isScanning, setIsScanning] = React.useState(false);
+  const scanBlink = useWaitingBlink(isScanning);
   const [isCompletingScan, setIsCompletingScan] = React.useState(false);
   const scanAbortRef = React.useRef<AbortController | null>(null);
   const qrScanSupported = React.useMemo(() => isQrScanSupported(), []);
@@ -222,7 +224,7 @@ export const MobileInstancesSurface: React.FC<{
                   >
                     <button
                       type="button"
-                      className="flex min-w-0 flex-1 items-center gap-3 px-3.5 py-3 text-left transition-colors active:bg-interactive-active focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:opacity-60"
+                      className="flex min-w-0 flex-1 items-center gap-3 px-3.5 py-3 text-start transition-colors active:bg-interactive-active focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring disabled:opacity-60"
                       onClick={() => {
                         if (isActive) return;
                         setConnectingId(connection.id);
@@ -234,7 +236,7 @@ export const MobileInstancesSurface: React.FC<{
                       <span className="relative flex size-9 shrink-0 items-center justify-center rounded-[12px] bg-interactive-hover text-foreground">
                         <Icon name="server" className="size-[18px]" />
                         {isActive ? (
-                          <span className="absolute -right-0.5 -top-0.5 size-2.5 rounded-full border-2 border-[var(--surface-elevated)] bg-[var(--status-success)]" aria-hidden />
+                          <span className="absolute -inset-e-0.5 -top-0.5 size-2.5 rounded-full border-2 border-[var(--surface-elevated)] bg-[var(--status-success)]" aria-hidden />
                         ) : null}
                       </span>
                       <span className="min-w-0 flex-1">
@@ -248,7 +250,7 @@ export const MobileInstancesSurface: React.FC<{
                       </span>
                       {isConnectingRow ? <Icon name="loader-4" className="size-5 shrink-0 animate-spin text-muted-foreground" /> : null}
                     </button>
-                    <div className="flex items-center gap-0.5 pr-2">
+                    <div className="flex items-center gap-0.5 pe-2">
                       {confirming ? (
                         <button
                           type="button"
@@ -311,7 +313,7 @@ export const MobileInstancesSurface: React.FC<{
                   onClick={() => void handleScanInstance()}
                   disabled={isScanning}
                 >
-                  <Icon name="scan-2" className={cn('size-[18px]', isScanning && 'animate-pulse')} />
+                  <Icon name="scan-2" className={cn('size-[18px]', scanBlink)} />
                   {t('mobile.connect.scanQr')}
                 </Button>
               ) : null}

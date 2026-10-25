@@ -11,6 +11,8 @@
  * Reference: OpenCode `packages/core/src/config/normalize.ts`,
  * `packages/core/src/v1/config/migrate.ts`, and `services/www` migrate-v1 docs.
  */
+import { z } from 'zod';
+import { isRecord } from '../shared/guards.js';
 
 // ============== SECTIONS ==============
 
@@ -18,15 +20,12 @@
  * Config section keys per entity. `v2` is what OpenChamber writes; `v1` is the
  * legacy key OpenCode still decodes and OpenChamber still reads.
  */
+
 const SECTIONS = {
   agents: { v2: 'agents', v1: 'agent' },
   commands: { v2: 'commands', v1: 'command' },
   providers: { v2: 'providers', v1: 'provider' },
 };
-
-function isRecord(value) {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
 
 function sectionKeys(kind) {
   const section = SECTIONS[kind];
@@ -782,6 +781,22 @@ function writeWarmingEnabled(config, enabled) {
   return JSON.stringify(config.warming) !== before;
 }
 
+/**
+ * Sets how long OpenCode keeps a session warm after its last turn, while
+ * warming is on; leaves the key alone while it is off. OpenCode's default (30
+ * minutes) goes back to the plain `true` when nothing else was tuned. Returns
+ * whether the config changed.
+ */
+function writeWarmingDuration(config, minutes) {
+  if (!config.warming) return false;
+  const before = JSON.stringify(config.warming);
+  const tuned = isRecord(config.warming) ? { ...config.warming } : {};
+  delete tuned.duration;
+  if (minutes !== 30) tuned.duration = `${minutes} minutes`;
+  config.warming = Object.keys(tuned).length > 0 ? tuned : true;
+  return JSON.stringify(config.warming) !== before;
+}
+
 const hasWebSearchKey = (config) => config != null && Object.hasOwn(config, 'websearch');
 
 /**
@@ -801,6 +816,60 @@ function findWebSearchProjectOverride(layers, projectFiles) {
     if (hasWebSearchKey(file.config)) return file.path;
   }
   return null;
+}
+
+// ============== SKILL SWITCHES ==============
+
+/**
+ * A `PUT /api/config/skill-switch` body. The id is OpenCode's id for a skill,
+ * the folder of its `SKILL.md`; wildcard characters and path separators are
+ * refused, so the statement a switch writes can only ever match that one skill.
+ */
+const skillSwitchRequestSchema = z.object({
+  id: z.string().min(1).max(200).refine((id) => id.trim() === id && !/[*?/\\\n\r]/.test(id)),
+  enabled: z.boolean(),
+  scope: z.enum(['user', 'project']),
+});
+
+const isSkillDeny = (statement, id) => isRecord(statement)
+  && statement.action === 'integration.use'
+  && statement.resource === `skill:${id}`
+  && statement.effect === 'deny';
+
+/**
+ * Turns a skill off or back on in one config object, in place, through
+ * OpenCode's `integration.use` policy. Off appends an exact deny to the
+ * top-level `policies` unless the file already has one; on removes every
+ * exact deny for that id, from `policies` and the deprecated
+ * `experimental.policies`, and nothing else: wildcards, allows and other
+ * statements stay. A list it empties is removed. Returns whether the config
+ * changed.
+ */
+function writeSkillDisabled(config, id, disabled) {
+  const lists = [
+    { owner: config, key: 'policies' },
+    ...(isRecord(config.experimental) ? [{ owner: config.experimental, key: 'policies' }] : []),
+  ].filter(({ owner, key }) => Array.isArray(owner[key]));
+
+  if (disabled) {
+    if (lists.some(({ owner, key }) => owner[key].some((statement) => isSkillDeny(statement, id)))) return false;
+    const policies = Array.isArray(config.policies) ? config.policies : [];
+    config.policies = [...policies, { action: 'integration.use', resource: `skill:${id}`, effect: 'deny' }];
+    return true;
+  }
+
+  let changed = false;
+  for (const { owner, key } of lists) {
+    const kept = owner[key].filter((statement) => !isSkillDeny(statement, id));
+    if (kept.length === owner[key].length) continue;
+    changed = true;
+    if (kept.length > 0) owner[key] = kept;
+    else delete owner[key];
+  }
+  if (changed && isRecord(config.experimental) && Object.keys(config.experimental).length === 0) {
+    delete config.experimental;
+  }
+  return changed;
 }
 
 export {
@@ -840,4 +909,7 @@ export {
   writeWebSearchSelection,
   findWebSearchProjectOverride,
   writeWarmingEnabled,
+  writeWarmingDuration,
+  skillSwitchRequestSchema,
+  writeSkillDisabled,
 };

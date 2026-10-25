@@ -1,5 +1,5 @@
 /**
- * A linked issue or change request (GitHub, GitLab) or Linear issue, shown as a chip
+ * A linked issue or change request (GitHub, GitLab) or tracker item, shown as a chip
  * inside the composer next to the attached files.
  *
  * Linking one attaches its body — and for a PR its diff — as context on the
@@ -43,13 +43,13 @@ export function LinkedReferenceRow(props: LinkedReferenceRowProps) {
 
     return (
         <div
-            className="inline-flex h-7 max-w-full min-w-0 items-center gap-1.5 rounded-lg border border-border/80 bg-background pl-2 pr-1 text-xs"
+            className="inline-flex h-7 max-w-full min-w-0 items-center gap-1.5 rounded-lg border border-border/80 bg-background ps-2 pe-1 text-xs"
             title={title}
         >
             <button
                 type="button"
                 onClick={onReopenPicker}
-                className="flex min-w-0 flex-1 items-center gap-1.5 text-left hover:opacity-80 transition-opacity"
+                className="flex min-w-0 flex-1 items-center gap-1.5 text-start hover:opacity-80 transition-opacity"
             >
                 {author?.avatarUrl ? (
                     <img
@@ -61,7 +61,7 @@ export function LinkedReferenceRow(props: LinkedReferenceRowProps) {
                 <span className="text-muted-foreground flex-shrink-0">
                     {numberLabel}
                     {author ? (
-                        <span className="ml-1">
+                        <span className="ms-1">
                             {t('chat.chatInput.linked.byAuthor', { author: author.login })}
                         </span>
                     ) : null}

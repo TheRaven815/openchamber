@@ -40,7 +40,10 @@ const NON_RESUMABLE_LANGUAGES = new Set(['ansi']);
 
 const WRAPPER = /^([\s\S]*?<code[^>]*>)([\s\S]*)(<\/code>[\s\S]*)$/;
 
-const splitRendered = (html: string): { open: string; lines: string[]; close: string } | null => {
+type RenderedLines = { open: string; lines: string[]; close: string };
+
+/** Splits Shiki `<pre>` HTML into its wrapper and one entry per line. */
+const splitRendered = (html: string): RenderedLines | null => {
   const match = WRAPPER.exec(html);
   if (!match) return null;
   const [, open = '', inner = '', close = ''] = match;
@@ -105,7 +108,7 @@ export const createIncrementalCodeHighlighter = ({
     if (!last) return null;
 
     if (lineage.stable !== '') remember(lineage);
-    return `${last.open}${[...lineage.lines, ...last.lines].join('\n')}${last.close}`;
+    return `${last.open}${lineage.lines.concat(last.lines).join('\n')}${last.close}`;
   };
 
   return {

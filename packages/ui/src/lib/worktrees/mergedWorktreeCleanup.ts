@@ -1,3 +1,4 @@
+import type { GitStatus } from '@/lib/api/types';
 import type { Session } from '@/lib/opencode/model';
 import { normalizePath } from '@/lib/pathNormalization';
 import type { WorktreeMetadata } from '@/types/worktree';
@@ -14,33 +15,26 @@ export type MergedWorktreeCandidate = {
   mergedHeadSha: string | null;
 };
 
-export type MergedWorktreeDecision =
-  /** Someone is still there: a running agent or the session on screen. Ask again later. */
-  | { action: 'wait' }
-  /** Nothing can be lost: archive the sessions, remove the worktree and its local branch. */
-  | { action: 'remove' }
-  /** Something exists only here (uncommitted work or commits after the merge): archive, keep the worktree. */
-  | { action: 'archive-only' };
-
 /**
- * The worktree is removable only when it holds nothing the merged PR does
- * not: no uncommitted changes, and its checkout sits exactly on the PR's last
- * commit. That second test is stronger than "pushed": GitHub often deletes
- * the remote branch on merge, while the PR keeps every one of those commits.
+ * Whether the checkout has commits the merged PR lacks. The PR's last commit
+ * answers it when this clone has that commit. A checkout behind a PR that
+ * gained commits on the host may lack it, and then a branch with nothing left
+ * to push has lost nothing either. Null when neither can tell.
  */
-export const decideMergedWorktreeCleanup = (input: {
-  sessionsBusyOrUnknown: boolean;
-  sessionOpen: boolean;
-  isDirty: boolean | null;
-  headCommit: string | null;
+export const hasUnmergedCommits = async (input: {
   mergedHeadSha: string | null;
-}): MergedWorktreeDecision => {
-  if (input.sessionsBusyOrUnknown || input.sessionOpen) return { action: 'wait' };
-  const nothingToLose = input.isDirty === false
-    && Boolean(input.headCommit)
-    && Boolean(input.mergedHeadSha)
-    && input.headCommit === input.mergedHeadSha;
-  return nothingToLose ? { action: 'remove' } : { action: 'archive-only' };
+  status: Pick<GitStatus, 'tracking' | 'ahead'>;
+  /** Rejects when `sha` is not in this clone. */
+  hasCommitsAfter: (sha: string) => Promise<boolean>;
+}): Promise<boolean | null> => {
+  if (input.mergedHeadSha) {
+    try {
+      return await input.hasCommitsAfter(input.mergedHeadSha);
+    } catch {
+      // The PR's last commit was never fetched into this clone.
+    }
+  }
+  return input.status.tracking ? input.status.ahead > 0 : null;
 };
 
 /** Sessions working in the worktree, its subdirectories included. */
@@ -54,13 +48,12 @@ const sessionsInWorktree = (sessions: readonly Session[], worktreePath: string):
 };
 
 export type MergedWorktreeOutcome =
-  | { kind: 'removed'; candidate: MergedWorktreeCandidate; archivedCount: number }
   | { kind: 'archived'; candidate: MergedWorktreeCandidate; archivedCount: number }
   | { kind: 'failed'; candidate: MergedWorktreeCandidate; error: Error };
 
 export type MergedWorktreeCleanupDeps = {
   listCandidates: () => MergedWorktreeCandidate[];
-  /** Done once per worktree and PR, so work continued in a kept worktree is never archived again. */
+  /** A worktree is tried once per PR: one that failed to archive is not tried again on every pass. */
   isHandled: (candidate: MergedWorktreeCandidate) => boolean;
   markHandled: (candidate: MergedWorktreeCandidate) => void;
   getActiveSessions: () => readonly Session[];
@@ -68,53 +61,39 @@ export type MergedWorktreeCleanupDeps = {
   isSessionOpen: (sessionId: string) => boolean;
   /** The worktree is the directory on screen, e.g. a new-session draft there. */
   isWorktreeOpen: (path: string) => boolean;
-  readWorktreeState: (path: string) => Promise<{ isDirty: boolean | null; headCommit: string | null }>;
-  archiveSessions: (sessionIds: string[]) => Promise<{ failedIds: string[] }>;
-  removeWorktree: (candidate: MergedWorktreeCandidate) => Promise<void>;
+  /** Something here archives or removes it right now (Done, a delete). */
+  isWorktreeRemoving: (path: string) => boolean;
+  /** The user restored it from the archive since the last pass; answers once. */
+  takeRestored: (path: string) => boolean;
+  /** Archives the worktree with these sessions; rejects when either does not go. */
+  archiveWorktree: (candidate: MergedWorktreeCandidate, sessions: readonly Session[]) => Promise<void>;
   report: (outcome: MergedWorktreeOutcome) => void;
 };
 
 /**
- * One pass over the merged worktrees. Each is handled at most once; one
- * still in use is left for a later pass, and one failure never stops the
- * others.
+ * One pass over the merged worktrees: each one nobody works in is archived
+ * with its sessions. An archive keeps every change and commit, so nothing has
+ * to be checked for loss first. One still in use is left for a later pass,
+ * and one failure never stops the others.
  */
 export async function runMergedWorktreeCleanup(deps: MergedWorktreeCleanupDeps): Promise<void> {
   for (const candidate of deps.listCandidates()) {
-    if (deps.isHandled(candidate)) continue;
-    const sessions = sessionsInWorktree(deps.getActiveSessions(), candidate.worktree.path);
-    const sessionIds = sessions.map((session) => session.id);
-
-    let decision: MergedWorktreeDecision;
-    try {
-      const state = await deps.readWorktreeState(candidate.worktree.path);
-      decision = decideMergedWorktreeCleanup({
-        // Re-read after the git round trip: an agent may have started meanwhile.
-        sessionsBusyOrUnknown: sessionIds.some((id) => !deps.isSessionIdle(id)),
-        sessionOpen: sessionIds.some((id) => deps.isSessionOpen(id)) || deps.isWorktreeOpen(candidate.worktree.path),
-        isDirty: state.isDirty,
-        headCommit: state.headCommit,
-        mergedHeadSha: candidate.mergedHeadSha,
-      });
-    } catch {
-      // Git could not answer; nothing is decided on a guess. Try again next pass.
+    if (deps.isHandled(candidate) || deps.isWorktreeRemoving(candidate.worktree.path)) continue;
+    // Restoring a merged worktree is the user taking it back: this PR is done
+    // with, and only a later one cleans it up again.
+    if (deps.takeRestored(candidate.worktree.path)) {
+      deps.markHandled(candidate);
       continue;
     }
-    if (decision.action === 'wait') continue;
+    const sessions = sessionsInWorktree(deps.getActiveSessions(), candidate.worktree.path);
+    const busy = sessions.some((session) => !deps.isSessionIdle(session.id));
+    const open = sessions.some((session) => deps.isSessionOpen(session.id)) || deps.isWorktreeOpen(candidate.worktree.path);
+    if (busy || open) continue;
 
     deps.markHandled(candidate);
     try {
-      if (sessionIds.length > 0) {
-        const { failedIds } = await deps.archiveSessions(sessionIds);
-        if (failedIds.length > 0) throw new Error(`Could not archive ${failedIds.length} session(s)`);
-      }
-      if (decision.action === 'remove') {
-        await deps.removeWorktree(candidate);
-        deps.report({ kind: 'removed', candidate, archivedCount: sessionIds.length });
-      } else if (sessionIds.length > 0) {
-        // A kept worktree with no sessions changed nothing worth a toast.
-        deps.report({ kind: 'archived', candidate, archivedCount: sessionIds.length });
-      }
+      await deps.archiveWorktree(candidate, sessions);
+      deps.report({ kind: 'archived', candidate, archivedCount: sessions.length });
     } catch (error) {
       deps.report({ kind: 'failed', candidate, error: error instanceof Error ? error : new Error(String(error)) });
     }

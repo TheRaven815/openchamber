@@ -1,4 +1,4 @@
-import type { Message } from '@/lib/opencode/model';
+import type { Message, StructuredError } from '@/lib/opencode/model';
 
 export type LastMessageState = {
   role: Message['role'];
@@ -29,6 +29,21 @@ export const readLastMessageState = (last: Message | null | undefined): LastMess
 };
 
 /**
+ * The error OpenCode recorded for the session's last turn (2.0.27+): the
+ * newest `idle` record after the last prompt or reply decides, and only a
+ * `failed` one carries an error. Older OpenCode records the outcome alone.
+ */
+export const findRecordedTurnError = (messages: readonly Message[] | undefined): StructuredError | null => {
+  if (!messages) return null;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role === 'user' || message.role === 'assistant') return null;
+    if (message.role === 'idle') return message.outcome === 'failed' ? message.error ?? null : null;
+  }
+  return null;
+};
+
+/**
  * When a prompt looks unanswered, the store may simply have missed the reply:
  * a live stream that drops or never delivers the turn's message events leaves
  * the prompt as the last message even though OpenCode answered it, and nothing
@@ -40,7 +55,7 @@ export const readLastMessageState = (last: Message | null | undefined): LastMess
  * The later reads keep running under a visible notice so a late reply still
  * replaces it; a genuine no-reply stops costing requests after the last offset.
  */
-export const UNANSWERED_RECHECK_DELAYS_MS: readonly number[] = [0, 10_000, 30_000];
+const UNANSWERED_RECHECK_DELAYS_MS: readonly number[] = [0, 10_000, 30_000];
 
 type RecheckScheduler = {
   setTimeout: (callback: () => void, ms: number) => number;

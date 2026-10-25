@@ -55,7 +55,8 @@ export const VirtualizedCodeBlock: React.FC<VirtualizedCodeBlockProps> = React.m
   // Tokenize the whole block in one worker call; rows index into the result.
   const fullText = React.useMemo(() => lines.map((line) => line.text).join('\n'), [lines]);
   const highlightResult = useWorkerHighlightedLines(fullText, language);
-  const highlighted = highlightResult.lines;
+  // Unchanged lines keep their colours while an update tokenizes.
+  const highlighted = highlightResult.status === 'loading' ? highlightResult.carriedLines : highlightResult.lines;
 
   const shouldVirtualize = lines.length > VIRTUALIZE_THRESHOLD;
 
@@ -97,7 +98,7 @@ VirtualizedCodeBlock.displayName = 'VirtualizedCodeBlock';
 // ── Virtualised container (extracted so the hook is top-level) ────────
 interface VirtualizedRowsProps {
   lines: CodeLine[];
-  highlighted: string[] | null;
+  highlighted: readonly (string | undefined)[] | null;
   syntaxVars: Record<string, string>;
   maxHeight: string;
   showLineNumbers: boolean;
@@ -172,7 +173,7 @@ const Row: React.FC<RowProps> = React.memo(({ line, html, showLineNumbers, style
     >
       {showLineNumbers && (
         <span
-          className="w-10 flex-shrink-0 text-right pr-3 select-none border-r mr-3 -my-0.5 py-0.5"
+          className="w-10 flex-shrink-0 text-end pe-3 select-none border-e me-3 -my-0.5 py-0.5"
           style={{ color: 'var(--syntax-line-number)', borderColor: 'var(--interactive-border)' }}
         >
           {!line.isInfo && line.lineNumber != null ? line.lineNumber : ''}

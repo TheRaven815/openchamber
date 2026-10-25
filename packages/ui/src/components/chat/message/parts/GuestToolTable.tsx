@@ -9,9 +9,8 @@ const GUEST_TOOL_TABLE_ROWS_MAX = 200;
 /** Characters per cell; the column paths are short by contract, values are not. */
 const GUEST_TOOL_TABLE_CELL_MAX = 200;
 
-// Same classes the markdown decorator puts on assistant tables
-// (`components/chat/markdown/decorate.ts`), minus the copy/download toolbar.
-const TABLE_CELL_CLASS = 'min-w-[120px] max-w-[320px] whitespace-normal [overflow-wrap:anywhere] border-r border-border/60 px-4 py-2.5 align-middle last:border-r-0';
+// Tool-output cells use bounded widths and wrapping without Markdown controls.
+const TABLE_CELL_CLASS = 'min-w-[120px] max-w-[320px] whitespace-normal [overflow-wrap:anywhere] border-e border-border/60 px-4 py-2.5 align-middle last:border-e-0';
 
 interface GuestToolTableProps {
     rows: readonly JsonValue[];
@@ -30,12 +29,12 @@ export const GuestToolTable: React.FC<GuestToolTableProps> = ({ rows, columns })
 
     return (
         <div className="flex w-fit max-w-full flex-col gap-1">
-            <div className="overflow-x-auto rounded-lg border border-border/80 bg-[var(--surface-elevated)]">
+            <div className="oc-tile overflow-x-auto rounded-lg">
                 <table className="w-max border-collapse text-sm">
                     <thead>
                         <tr className="border-b border-border/60">
                             {columns.map((column) => (
-                                <th key={column} className={`${TABLE_CELL_CLASS} text-left font-semibold text-foreground`}>
+                                <th key={column} className={`${TABLE_CELL_CLASS} text-start font-semibold text-foreground`}>
                                     {column}
                                 </th>
                             ))}

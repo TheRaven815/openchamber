@@ -24,12 +24,16 @@ const effects = (overrides: Partial<BridgeEffects> = {}): BridgeEffects => ({
   workspaceRead: overrides.workspaceRead ?? (() => ({ kind: 'projects', state: 'ready', projects: [] })),
   workspaceSubscribe: overrides.workspaceSubscribe ?? (() => {}),
   workspaceUnsubscribe: overrides.workspaceUnsubscribe ?? (() => {}),
+  shellsSubscribe: overrides.shellsSubscribe ?? (() => {}),
+  shellsUnsubscribe: overrides.shellsUnsubscribe ?? (() => {}),
+  shellOutput: overrides.shellOutput ?? (async () => ({ output: '', cursor: 0, skipped: false })),
+  shellStop: overrides.shellStop ?? (async () => ({ stopped: true })),
   storage: overrides.storage ?? (async () => ({ storage: true, op: 'keys', keys: [] })),
   setStatusControls: overrides.setStatusControls ?? (() => {}),
   openSession: overrides.openSession ?? (() => {}),
   toast: overrides.toast ?? (() => {}),
   openUrl: overrides.openUrl ?? (async () => true),
-  openSurface: overrides.openSurface ?? (() => {}),
+  openSurface: overrides.openSurface ?? (() => ({ ok: true })),
   writeClipboard: overrides.writeClipboard ?? (async () => true),
   compose: overrides.compose ?? (() => {}),
   attach: overrides.attach ?? (() => {}),
@@ -116,6 +120,17 @@ describe('answerGuestMessage', () => {
     }, effects());
     expect(reply?.type).toBe('result');
     expect(reply && reply.type === 'result' && reply.ok).toBe(false);
+  });
+
+  test('a surface that did not open is a failed result with its code', async () => {
+    const reply = await answerGuestMessage({
+      channel: OPENCHAMBER_SDK_CHANNEL,
+      v: 1,
+      type: 'open-surface',
+      id: 'oc-3b',
+      payload: { surfaceId: 'git' },
+    }, effects({ openSurface: () => ({ ok: false, code: 'NO_DIRECTORY', message: 'No chat or project is open.' }) }));
+    expect(reply).toMatchObject({ type: 'result', id: 'oc-3b', ok: false, code: 'NO_DIRECTORY' });
   });
 
   test('writes clipboard text', async () => {
@@ -552,6 +567,37 @@ describe('answerGuestMessage', () => {
       error: 'Allow this extension\'s local service in Settings → Extensions.',
       code: 'NO_SERVICE',
     });
+  });
+
+  test('routes shells calls and turns failures into coded results', async () => {
+    const calls: string[] = [];
+    const stopMessage: GuestMessage = { channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'shell-stop', id: 'oc-9', payload: { shellId: 'sh_1' } };
+    const refused = await answerGuestMessage(stopMessage, effects({ shellStop: async () => { throw new HostRequestError('NOT_GRANTED', 'Not allowed'); } }));
+    expect(refused).toMatchObject({ ok: false, code: 'NOT_GRANTED' });
+    const allowed = await answerGuestMessage(stopMessage, effects({ shellStop: async ({ shellId }) => { calls.push(shellId); return { stopped: true }; } }));
+    expect(allowed).toMatchObject({ ok: true, payload: { stopped: true } });
+    expect(calls).toEqual(['sh_1']);
+
+    const subscribeMessage: GuestMessage = { channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'shells-subscribe', id: 'oc-10', payload: { subscriptionId: 's1', scope: { kind: 'session', sessionId: 'ses_1' } } };
+    let subscribed = '';
+    await answerGuestMessage(subscribeMessage, effects({ shellsSubscribe: ({ subscriptionId }) => { subscribed = subscriptionId; } }));
+    expect(subscribed).toBe('s1');
+    let routedScope = '';
+    await answerGuestMessage({ channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'shells-subscribe', id: 'oc-10b', payload: { subscriptionId: 's2', scope: { kind: 'project', projectId: 'path_/repo' } } }, effects({ shellsSubscribe: (subscription) => { routedScope = subscription.scope.kind; } }));
+    expect(routedScope).toBe('project');
+    const refusedSubscribe = await answerGuestMessage(subscribeMessage, effects({ shellsSubscribe: () => { throw new HostRequestError('NOT_FOUND', 'Project is not registered.'); } }));
+    expect(refusedSubscribe).toMatchObject({ ok: false, code: 'NOT_FOUND' });
+    let unsubscribed = '';
+    await answerGuestMessage({ channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'shells-unsubscribe', id: 'oc-11', payload: { subscriptionId: 's1' } }, effects({ shellsUnsubscribe: (id) => { unsubscribed = id; } }));
+    expect(unsubscribed).toBe('s1');
+
+    const outputMessage: GuestMessage = { channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'shell-output', id: 'oc-12', payload: { shellId: 'sh_1', cursor: 4 } };
+    const output = await answerGuestMessage(outputMessage, effects({ shellOutput: async ({ shellId, cursor }) => ({ output: `${shellId}:${cursor}`, cursor: 6, skipped: false }) }));
+    expect(output).toMatchObject({ ok: true, payload: { output: 'sh_1:4', cursor: 6 } });
+    const missingOutput = await answerGuestMessage(outputMessage, effects({ shellOutput: async () => { throw new HostRequestError('NOT_FOUND', 'That shell is not running.'); } }));
+    expect(missingOutput).toMatchObject({ ok: false, code: 'NOT_FOUND' });
+    const missingStop = await answerGuestMessage(stopMessage, effects({ shellStop: async () => { throw new HostRequestError('NOT_FOUND', 'That shell is not running.'); } }));
+    expect(missingStop).toMatchObject({ ok: false, code: 'NOT_FOUND' });
   });
 });
 

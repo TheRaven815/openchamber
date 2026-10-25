@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { gitlabLikeDescriptor } from '@/lib/source-control/providers/descriptor.fixture';
+import type { SourceControlProviderDescriptor } from '@/lib/source-control/providers/descriptor';
 import type { GitTransportBindingIntent, GitTransportBindingRemovalIntent, GitTransportBindingRemovalResult, GitTransportBindingResult, SourceControlAuthStatus, SourceControlBindingRead, SourceControlIdentity, SourceControlProviderBindingMutation, SourceControlRepositoryBindingResetIntent } from '@/lib/api/types';
 
 type TestNode = ElementNode | TestNode[] | string | number | boolean | null | undefined;
@@ -125,7 +127,8 @@ function useSyncExternalStore<Value>(subscribe: (listener: () => void) => () => 
   return snapshot();
 }
 
-const ReactMock = { useCallback, useEffect, useLayoutEffect: useEffect, useRef, useState, useMemo, useSyncExternalStore };
+const memo = <Props extends object>(component: Component<Props>): Component<Props> => component;
+const ReactMock = { useCallback, useEffect, useLayoutEffect: useEffect, useRef, useState, useMemo, useSyncExternalStore, memo, useDebugValue: () => {} };
 const jsxRuntime = { Fragment: fragment, jsx, jsxs: jsx, jsxDEV: jsx };
 
 let runtimeKey = 'runtime-a';
@@ -151,6 +154,7 @@ const availableCapabilities = {
 let readCapabilities = async () => availableCapabilities;
 let disconnectedAccountIds: string[] = [];
 let cliDisabledValues: boolean[] = [];
+let activatedAccounts: string[] = [];
 let disconnectAuth: () => Promise<void> = async () => undefined;
 let setCliDisabledAuth: () => Promise<void> = async () => undefined;
 const translate = (key: string) => key;
@@ -227,7 +231,10 @@ const sourceControl = {
     disconnectedAccountIds.push(accountId);
     await disconnectAuth();
   },
-  authActivate: async () => ({ status: 'disconnected' as const, connected: false }),
+  authActivate: async (identity: SourceControlIdentity, accountId: string) => {
+    activatedAccounts.push(`${identity.provider}:${accountId}`);
+    return { status: 'disconnected' as const, connected: false };
+  },
   authSetCliDisabled: async (_identity: SourceControlIdentity, disabled: boolean) => {
     cliDisabledValues.push(disabled);
     await setCliDisabledAuth();
@@ -328,6 +335,7 @@ mock.module('@/components/ui', () => ({
   },
 }));
 mock.module('@/components/icon/Icon', () => ({ Icon: () => null }));
+mock.module('@/components/ui/busy-dots', () => ({ BusyDots: () => null }));
 mock.module('@/components/ui/collapsible', () => ({
   Collapsible: ({ children }: ElementProps) => children ?? null,
   CollapsibleTrigger: ({ children }: ElementProps) => children ?? null,
@@ -338,8 +346,9 @@ mock.module('@/components/sections/shared/SettingsSection', () => ({
   SETTINGS_FIELDS_STACK_CLASS: '',
   SETTINGS_HELPER_CLASS: '',
   SETTINGS_SELECT_ROW_TRIGGER_CLASS: '',
-  SETTINGS_SELECT_SIZE: 'sm',
   SettingsControlGroup: ({ children }: ElementProps) => children ?? null,
+  SettingsChipGroup: ({ options, onChange }: { options: Array<{ value: string; label: string }>; onChange: (value: string) => void }) =>
+    options.map((option) => jsx('button', { children: option.label, onClick: () => onChange(option.value) })),
   SettingsFieldRow: ({ children, description }: ElementProps) => [description ?? null, children ?? null],
   SettingsStackedField: ({ children }: ElementProps) => children ?? null,
   SettingsCheckboxRow: ({ label, onChange, checked, disabled }: { label: string; onChange: (checked: boolean) => void; checked: boolean; disabled?: boolean }) =>
@@ -362,11 +371,13 @@ mock.module('@/stores/useSourceControlAuthStore', () => ({
 mock.module('@/lib/device', () => ({ useDeviceInfo: () => ({ isMobile: false }) }));
 mock.module('@/lib/i18n', () => ({ useI18n: () => ({ t: translate }) }));
 mock.module('@/lib/url', () => ({ openExternalUrl: async () => undefined }));
+mock.module('@/lib/worktrees/worktreeBootstrap', () => ({ waitForWorktreeGitReady: async () => undefined }));
 mock.module('@/lib/utils', () => ({
   cn: (...values: Array<string | false | null | undefined>) => values.filter(Boolean).join(' '),
 }));
 mock.module('@/lib/runtime-switch', () => ({
   getRuntimeKey: () => runtimeKey,
+  isTransientRuntimeKey: () => false,
   subscribeRuntimeEndpointWillChange: (listener: () => void) => {
     runtimeWillChange = listener;
     return () => {
@@ -379,13 +390,19 @@ mock.module('@/lib/runtime-switch', () => ({
   },
 }));
 
-const { GitHubSettings } = await import('./GitHubSettings');
-const { GitLabSettings } = await import('./GitLabSettings');
+const { GitHubComAccountSection } = await import('./GitHubComAccountSection');
+const { SourceControlProviderCard } = await import('../integrations/SourceControlProviderCard');
 const { repositoryBindingOwner } = await import('@/lib/source-control/repository-binding');
 // SAFETY: These synchronous function components render through the mocked JSX runtime above.
-const GitHubSettingsHarness = GitHubSettings as Component;
+const GitHubSettingsHarness = GitHubComAccountSection as Component;
+// The GitLab-shaped provider card, as the server's GitLab descriptor serves it.
+const gitLabDescriptor: SourceControlProviderDescriptor = {
+  ...gitlabLikeDescriptor(),
+  auth: { methods: ['device', 'pat', 'cli'], cliName: 'glab', cliTransport: false, token: { scopes: ['api'] } },
+};
 // SAFETY: These synchronous function components render through the mocked JSX runtime above.
-const GitLabSettingsHarness = GitLabSettings as Component;
+const ProviderCardHarness = SourceControlProviderCard as Component<{ descriptor: SourceControlProviderDescriptor }>;
+const GitLabSettingsHarness: Component = () => jsx(ProviderCardHarness, { descriptor: gitLabDescriptor });
 const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
 
 const flush = async (): Promise<void> => {
@@ -453,6 +470,12 @@ const findInput = (node: TestNode, ariaLabel: string): ElementNode | null => {
   return findInput(node.props.children, ariaLabel);
 };
 
+// GitLab offers a device code first; the token form shows once its chip is chosen.
+const renderWithTokenForm = async (): Promise<TestNode> => {
+  await click(await renderSettled(GitLabSettingsHarness), 'settings.sourceControl.token.label');
+  return renderSettled(GitLabSettingsHarness);
+};
+
 
 const runNextTimer = async (): Promise<void> => {
   const entry = timers.entries().next().value;
@@ -503,6 +526,7 @@ beforeEach(() => {
   gitLabAuthEntry.isLoading = false;
   disconnectedAccountIds = [];
   cliDisabledValues = [];
+  activatedAccounts = [];
   disconnectAuth = async () => undefined;
   setCliDisabledAuth = async () => undefined;
   completeAuth = async () => ({ status: 'pending' });
@@ -599,7 +623,7 @@ describe('source-control OAuth polling', () => {
     refreshStatusCalls = 0;
     refreshInstancesCalls = 0;
 
-    await click(tree, 'settings.gitlab.actions.connect');
+    await click(tree, 'settings.sourceControl.actions.connect');
     tree = await renderSettled(GitLabSettingsHarness);
     expect(collectText(tree)).toContain('ABCD-1234');
 
@@ -722,8 +746,8 @@ describe('GitLab auth lifecycle', () => {
     test(`ignores late PAT ${outcome} and associated UI effects after a runtime round trip`, async () => {
       const completion = deferred<SourceControlAuthStatus>();
       setTokenAuth = () => completion.promise;
-      let tree = await renderSettled(GitLabSettingsHarness);
-      const input = findInput(tree, 'settings.gitlab.token.label');
+      let tree = await renderWithTokenForm();
+      const input = findInput(tree, 'settings.sourceControl.token.label');
       expect(input?.props.onChange).toBeDefined();
       input?.props.onChange?.({ target: { value: 'test-token' } });
       tree = await renderSettled(GitLabSettingsHarness);
@@ -742,15 +766,15 @@ describe('GitLab auth lifecycle', () => {
       expect(setStatusCalls).toBe(0);
       expect(refreshStatusCalls).toBe(0);
       expect(refreshInstancesCalls).toBe(0);
-      expect(findInput(tree, 'settings.gitlab.token.label')?.props.value).toBe('test-token');
+      expect(findInput(tree, 'settings.sourceControl.token.label')?.props.value).toBe('test-token');
       expect(findButton(tree, 'settings.common.actions.saveChanges')?.props.disabled).toBe(true);
-      expect(collectText(tree)).not.toContain('settings.gitlab.status.operationFailed');
+      expect(collectText(tree)).not.toContain('settings.sourceControl.instance.status.operationFailed');
     });
   }
 
   test('stops PAT follow-up discovery if the runtime switches during status refresh', async () => {
-    let tree = await renderSettled(GitLabSettingsHarness);
-    findInput(tree, 'settings.gitlab.token.label')?.props.onChange?.({ target: { value: 'test-token' } });
+    let tree = await renderWithTokenForm();
+    findInput(tree, 'settings.sourceControl.token.label')?.props.onChange?.({ target: { value: 'test-token' } });
     tree = await renderSettled(GitLabSettingsHarness);
     const statusRead = deferred<SourceControlAuthStatus | null>();
     refreshAuthStatus = () => statusRead.promise;
@@ -767,8 +791,8 @@ describe('GitLab auth lifecycle', () => {
   });
 
   test('same-runtime PAT success updates inventory and clears the input', async () => {
-    let tree = await renderSettled(GitLabSettingsHarness);
-    findInput(tree, 'settings.gitlab.token.label')?.props.onChange?.({ target: { value: 'test-token' } });
+    let tree = await renderWithTokenForm();
+    findInput(tree, 'settings.sourceControl.token.label')?.props.onChange?.({ target: { value: 'test-token' } });
     tree = await renderSettled(GitLabSettingsHarness);
     refreshStatusCalls = 0;
     refreshInstancesCalls = 0;
@@ -778,26 +802,26 @@ describe('GitLab auth lifecycle', () => {
     expect(setStatusCalls).toBe(1);
     expect(refreshStatusCalls).toBe(1);
     expect(refreshInstancesCalls).toBe(1);
-    expect(findInput(tree, 'settings.gitlab.token.label')?.props.value).toBe('');
+    expect(findInput(tree, 'settings.sourceControl.token.label')?.props.value).toBe('');
   });
 
   test('preserves valid capabilities after deferred read failure and retries without a request loop', async () => {
     authStoreState.identities = [gitLabIdentity];
-    let tree = await renderSettled(GitLabSettingsHarness);
-    expect(findInput(tree, 'settings.gitlab.token.label')).not.toBeNull();
+    let tree = await renderWithTokenForm();
+    expect(findInput(tree, 'settings.sourceControl.token.label')).not.toBeNull();
 
     const capabilitiesRead = deferred<typeof availableCapabilities>();
     let capabilityCalls = 0;
     readCapabilities = () => { capabilityCalls += 1; return capabilitiesRead.promise; };
     authStoreState.identities = [{ ...gitLabIdentity }];
     tree = await renderSettled(GitLabSettingsHarness);
-    expect(findInput(tree, 'settings.gitlab.token.label')).not.toBeNull();
+    expect(findInput(tree, 'settings.sourceControl.token.label')).not.toBeNull();
     capabilitiesRead.reject(new Error('offline'));
     await flush();
     tree = await renderSettled(GitLabSettingsHarness);
 
-    expect(findInput(tree, 'settings.gitlab.token.label')).not.toBeNull();
-    expect(collectText(tree)).toContain('settings.gitlab.status.operationFailed');
+    expect(findInput(tree, 'settings.sourceControl.token.label')).not.toBeNull();
+    expect(collectText(tree)).toContain('settings.sourceControl.instance.status.operationFailed');
     expect(findButton(tree, 'sessionAuth.error.retry')).not.toBeNull();
     await renderSettled(GitLabSettingsHarness);
     expect(capabilityCalls).toBe(1);
@@ -806,21 +830,24 @@ describe('GitLab auth lifecycle', () => {
     await click(tree, 'sessionAuth.error.retry');
     tree = await renderSettled(GitLabSettingsHarness);
     expect(capabilityCalls).toBe(2);
-    expect(collectText(tree)).not.toContain('settings.gitlab.status.operationFailed');
+    expect(collectText(tree)).not.toContain('settings.sourceControl.instance.status.operationFailed');
     expect(findButton(tree, 'sessionAuth.error.retry')).toBeNull();
   });
 
   test('initial capability failure exposes retry instead of silently hiding all connection methods', async () => {
     readCapabilities = async () => { throw new Error('offline'); };
     let tree = await renderSettled(GitLabSettingsHarness);
-    expect(collectText(tree)).toContain('settings.gitlab.status.operationFailed');
-    expect(findInput(tree, 'settings.gitlab.token.label')).toBeNull();
+    expect(collectText(tree)).toContain('settings.sourceControl.instance.status.operationFailed');
+    expect(findButton(tree, 'settings.sourceControl.actions.connect')).toBeNull();
+    expect(findButton(tree, 'settings.sourceControl.token.label')).toBeNull();
 
     readCapabilities = async () => availableCapabilities;
     await click(tree, 'sessionAuth.error.retry');
     tree = await renderSettled(GitLabSettingsHarness);
-    expect(findInput(tree, 'settings.gitlab.token.label')).not.toBeNull();
-    expect(collectText(tree)).not.toContain('settings.gitlab.status.operationFailed');
+    // The methods come back: the switch and the device code it starts on.
+    expect(findButton(tree, 'settings.sourceControl.token.label')).not.toBeNull();
+    expect(findButton(tree, 'settings.sourceControl.actions.connect')).not.toBeNull();
+    expect(collectText(tree)).not.toContain('settings.sourceControl.instance.status.operationFailed');
   });
 
   test('ignores capability failure after a runtime switch', async () => {
@@ -831,7 +858,7 @@ describe('GitLab auth lifecycle', () => {
     capabilitiesRead.reject(new Error('old runtime offline'));
     await flush();
     const tree = renderComponent(GitLabSettingsHarness, {});
-    expect(collectText(tree)).not.toContain('settings.gitlab.status.operationFailed');
+    expect(collectText(tree)).not.toContain('settings.sourceControl.instance.status.operationFailed');
   });
 });
 
@@ -847,14 +874,36 @@ describe('source-control account presentation', () => {
     };
     const tree = await renderSettled(GitLabSettingsHarness);
     expect(collectText(tree)).toContain('octocat');
-    expect(collectText(tree)).toContain('settings.github.page.accountSource.oauth');
-    expect(collectText(tree)).toContain('settings.gitlab.cli.label');
-    expect(collectText(tree)).toContain('settings.gitlab.status.operationFailed');
+    expect(collectText(tree)).toContain('settings.sourceControl.accountSource.oauth');
+    expect(collectText(tree)).toContain('settings.sourceControl.cli.label');
+    expect(collectText(tree)).toContain('settings.sourceControl.instance.status.operationFailed');
 
     await click(tree, 'settings.sourceControl.actions.remove');
-    await click(tree, 'settings.gitlab.actions.disableCli');
+    await click(tree, 'settings.sourceControl.cli.disable');
     expect(disconnectedAccountIds).toEqual(['account-one']);
     expect(cliDisabledValues).toEqual([true]);
+  });
+
+  test('a CLI login that is not in use can be switched to while the saved account needs authentication', async () => {
+    const oauth = { ...connectedStatus.accounts[0], status: 'invalid' as const, current: false };
+    const cli = { ...oauth, id: 'account-cli', credentialId: 'account-cli', source: 'cli' as const, status: 'valid' as const };
+    gitLabAuthEntry.status = {
+      ...gitLabIdentity,
+      status: 'disconnected',
+      connected: false,
+      accounts: [oauth, cli],
+      cli: { available: true, disabled: false, active: false },
+    };
+    authStoreState.entries.github.status = { provider: 'github', instance: 'github.com', status: 'disconnected', connected: false, accounts: [oauth, cli] };
+
+    const gitlabTree = await renderSettled(GitLabSettingsHarness);
+    await click(gitlabTree, 'settings.sourceControl.cli.use');
+    const githubTree = await renderSettled(GitHubSettingsHarness);
+    await click(githubTree, 'settings.sourceControl.actions.use');
+    expect(activatedAccounts).toEqual(['gitlab:account-cli', 'github:account-cli']);
+
+    gitLabAuthEntry.status = { ...gitLabAuthEntry.status, accounts: [oauth, { ...cli, current: true }] };
+    expect(findButton(await renderSettled(GitLabSettingsHarness), 'settings.sourceControl.cli.use')).toBeNull();
   });
 
   test('groups credentials that belong to the same provider user', async () => {
@@ -874,8 +923,8 @@ describe('source-control account presentation', () => {
     const usernames = collectText(tree).match(/octocat/g) ?? [];
 
     expect(usernames).toHaveLength(4);
-    expect(collectText(tree)).toContain('settings.github.page.accountSource.oauth');
-    expect(collectText(tree)).toContain('settings.github.page.accountSource.cli');
+    expect(collectText(tree)).toContain('settings.sourceControl.accountSource.oauth');
+    expect(collectText(tree)).toContain('settings.sourceControl.accountSource.cli');
   });
 
   test('keeps credential actions scoped to their exact account source', async () => {

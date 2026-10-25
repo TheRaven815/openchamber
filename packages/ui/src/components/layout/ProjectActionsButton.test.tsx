@@ -7,6 +7,7 @@ import { I18nProvider } from '@/lib/i18n';
 import type { CreateTerminalOptions, TerminalHandlers, TerminalStreamEvent } from '@/lib/api/types';
 import { useTerminalStore } from '@/stores/useTerminalStore';
 import type { OpenChamberProjectAction } from '@/lib/openchamberConfig';
+import { getSafeStorage } from '@/stores/utils/safeStorage';
 
 const toastCalls = {
   error: new Array<string>(),
@@ -20,6 +21,7 @@ const openExternalCalls: string[] = [];
 const detectedDevServer: MockedDetectedDevServer = { command: null, previewUrlHint: null };
 const mockedDeviceInfo = { isMobile: false, isTablet: false, hasTouchOnlyPointer: false };
 let effectiveDirectory = '/repo';
+const projectSetupReads: Array<{ id: string; path: string }> = [];
 
 const uiState = {
   terminalShell: 'zsh',
@@ -57,6 +59,7 @@ interface MockedActionsState {
 interface MockedDetectedDevServer {
   command: string | null;
   previewUrlHint: string | null;
+  actionId?: string;
 }
 
 const createCalls: CreateTerminalOptions[] = [];
@@ -124,7 +127,7 @@ const terminal = {
 
 mock.module('@/components/ui/dropdown-menu', () => ({
   DropdownMenu: ({ children }: { children: React.ReactNode }) => React.createElement(React.Fragment, null, children),
-  DropdownMenuContent: ({ children }: { children: React.ReactNode }) => React.createElement('div', null, children),
+  DropdownMenuContent: ({ children, ...props }: React.ComponentProps<'div'>) => React.createElement('div', props, children),
   DropdownMenuItem: ({ children, onClick, className }: { children: React.ReactNode; onClick?: () => void; className?: string }) => React.createElement('button', { type: 'button', onClick, className }, children),
   DropdownMenuSeparator: () => React.createElement('hr'),
   DropdownMenuTrigger: ({ children }: { children: React.ReactNode }) => React.createElement(React.Fragment, null, children),
@@ -153,17 +156,21 @@ mock.module('@/stores/useDesktopSshStore', () => ({ useDesktopSshStore: useDeskt
 mock.module('@/lib/url', () => ({ openExternalUrl: async (url: string) => { openExternalCalls.push(url); } }));
 mock.module('@/lib/openchamberConfig', () => ({
   getProjectActionsState: async () => mockedActionsState,
-  // The button loads the merged setup; the test's actions are personal, so nothing asks for trust.
-  getProjectSetup: async () => ({
-    trust: { hash: null, trusted: true },
+  getProjectSetup: async (projectRef: { id: string; path: string }) => {
+    projectSetupReads.push(projectRef);
+    return {
+    trust: mockedActionsState.actions.some((action) => action.source === 'shared')
+      ? { hash: 'sha256:shared', trusted: false }
+      : { hash: null, trusted: true },
     setupWorktree: [],
     setupWorktreeWait: false,
-    projectActions: mockedActionsState.actions.map((action) => ({ ...action, source: 'personal' })),
+    projectActions: mockedActionsState.actions.map((action) => ({ ...action, source: action.source ?? 'personal' })),
     projectActionsPrimaryId: null,
     draftStarters: [],
-    shared: { status: 'missing', path: '.openchamber/project.json', setupWorktree: [], setupWorktreeWait: null, projectActions: [], draftStarters: [], plansDir: null },
-    personal: { setupWorktree: [], setupWorktreeWait: null, setupWorktreeMode: 'append', projectActions: mockedActionsState.actions, projectActionsPrimaryId: null, draftStarters: [], hiddenSharedActionIds: [], sharedTrust: null },
-  }),
+    shared: { status: 'missing', path: '.openchamber/project.json', setupWorktree: [], setupWorktreeWait: null, projectActions: mockedActionsState.actions.filter((action) => action.source === 'shared'), draftStarters: [], plansDir: null },
+    personal: { setupWorktree: [], setupWorktreeWait: null, setupWorktreeMode: 'append', projectActions: mockedActionsState.actions.filter((action) => action.source !== 'shared'), projectActionsPrimaryId: null, draftStarters: [], hiddenSharedActionIds: [], sharedTrust: null },
+    };
+  },
   updateProjectSetup: async () => true,
 }));
 mock.module('@/lib/browser/announcedServers', () => ({ setAnnouncedDevServers: () => undefined }));
@@ -171,13 +178,15 @@ mock.module('@/hooks/useEffectiveDirectory', () => ({ useEffectiveDirectory: () 
 mock.module('@/lib/detectDevServer', () => ({
   detectDevServerCommand: async () => (
     detectedDevServer.command
-      ? { command: detectedDevServer.command, previewUrlHint: detectedDevServer.previewUrlHint ?? undefined }
+      ? { command: detectedDevServer.command, previewUrlHint: detectedDevServer.previewUrlHint ?? undefined, actionId: detectedDevServer.actionId }
       : null
   ),
   readPackageJsonScripts: async () => ({}),
 }));
 
 const { ProjectActionsButton } = await import('./ProjectActionsButton');
+const { ProjectActionsScope } = await import('./ProjectActionsScope');
+const { getSharedTrustConfirmationSnapshot, settleSharedTrustConfirmation } = await import('@/lib/sharedTrustConfirmation');
 
 describe('ProjectActionsButton lifecycle', () => {
   let windowInstance: Window;
@@ -236,10 +245,13 @@ describe('ProjectActionsButton lifecycle', () => {
     openExternalCalls.length = 0;
     detectedDevServer.command = null;
     detectedDevServer.previewUrlHint = null;
+    detectedDevServer.actionId = undefined;
     mockedDeviceInfo.isMobile = true;
     effectiveDirectory = '/repo';
+    projectSetupReads.length = 0;
     sessionCounter = 0;
     mockedActionsState.actions = [{ id: 'build', name: 'Build', command: 'echo hello', icon: 'build' }];
+    getSafeStorage().clear();
   });
 
   afterEach(async () => {
@@ -253,11 +265,11 @@ describe('ProjectActionsButton lifecycle', () => {
     await act(async () => {
       root.render(
         React.createElement(I18nProvider, null,
-          React.createElement(ProjectActionsButton, {
+          React.createElement(ProjectActionsScope, {
             projectRef: { id: 'project-1', path: projectPath },
             directory,
             allowMobile: true,
-          }),
+          }, React.createElement(ProjectActionsButton)),
         ),
       );
     });
@@ -266,6 +278,128 @@ describe('ProjectActionsButton lifecycle', () => {
 
 
 
+
+  test('the action picker menu carries the work-status popup marker', async () => {
+    await renderButton();
+    expect(host.querySelector('[data-work-status-popup]')).not.toBeNull();
+  });
+
+  const primaryLabel = () => host.querySelector('button')?.getAttribute('aria-label') ?? '';
+  const menuItem = (name: string) => [...host.querySelectorAll('button')]
+    .find((button) => button.textContent === name);
+
+  test('the first project action is the default, with auto-discovery last in the menu', async () => {
+    mockedDeviceInfo.isMobile = false;
+    mockedActionsState.actions = [
+      { id: 'dev', name: 'Dev', command: 'bun run dev' },
+      { id: 'build', name: 'Build', command: 'echo hello' },
+    ];
+    await renderButton();
+
+    expect(primaryLabel()).toContain('Dev');
+    const items = [...host.querySelectorAll('button')].map((button) => button.textContent);
+    expect(items.slice(-3)).toEqual(['Dev', 'Build', 'Auto-discover dev server']);
+  });
+
+  test('auto-discovery is the default when the project has no actions', async () => {
+    mockedDeviceInfo.isMobile = false;
+    mockedActionsState.actions = [];
+    await renderButton();
+
+    expect(primaryLabel()).toContain('Auto-discover dev server');
+  });
+
+  test('auto-discovery does not run an untrusted shared dev action when trust is skipped', async () => {
+    mockedDeviceInfo.isMobile = false;
+    mockedActionsState.actions = [{ id: 'dev', name: 'Dev server', command: 'bun run dev', source: 'shared' }];
+    detectedDevServer.command = 'bun run dev';
+    detectedDevServer.actionId = 'dev';
+    await renderButton();
+
+    await act(async () => {
+      menuItem('Auto-discover dev server')?.click();
+      await Promise.resolve();
+    });
+
+    expect(getSharedTrustConfirmationSnapshot()?.actions).toEqual([
+      { id: 'dev', name: 'Dev server', command: 'bun run dev' },
+    ]);
+    expect(createCalls).toHaveLength(0);
+
+    await act(async () => {
+      settleSharedTrustConfirmation('skip');
+      await Promise.resolve();
+    });
+    expect(createCalls).toHaveLength(0);
+
+    await act(async () => {
+      menuItem('Auto-discover dev server')?.click();
+      await Promise.resolve();
+    });
+    expect(getSharedTrustConfirmationSnapshot()?.actions).toHaveLength(1);
+    await act(async () => {
+      settleSharedTrustConfirmation('trust');
+      await Promise.resolve();
+    });
+    const created = createCalls[0];
+    if (created?.mode !== 'command') throw new Error('expected command terminal');
+    expect(created.command).toBe('bun run dev');
+  });
+
+  test('auto-discovery in a worktree session reads the project\'s setup and trust', async () => {
+    mockedDeviceInfo.isMobile = false;
+    mockedActionsState.actions = [{ id: 'dev', name: 'Dev server', command: 'bun run dev', source: 'shared' }];
+    detectedDevServer.command = 'bun run dev';
+    detectedDevServer.actionId = 'dev';
+    effectiveDirectory = '/worktrees/feature';
+    await renderButton({ projectPath: '/repo', directory: '/worktrees/feature' });
+
+    await act(async () => {
+      menuItem('Auto-discover dev server')?.click();
+      await Promise.resolve();
+    });
+
+    // The same config the menu reads, so trust given in one counts in the other.
+    expect(projectSetupReads.at(-1)).toEqual({ id: 'project-1', path: '/repo' });
+    await act(async () => {
+      settleSharedTrustConfirmation('skip');
+      await Promise.resolve();
+    });
+  });
+
+  test('the picked action is still selected after the button mounts again', async () => {
+    mockedDeviceInfo.isMobile = false;
+    mockedActionsState.actions = [
+      { id: 'dev', name: 'Dev', command: 'bun run dev' },
+      { id: 'build', name: 'Build', command: 'echo hello' },
+    ];
+    await renderButton();
+    await act(async () => {
+      menuItem('Auto-discover dev server')?.dispatchEvent(new Event('click', { bubbles: true }));
+      await Promise.resolve();
+    });
+
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    await renderButton();
+
+    expect(primaryLabel()).toContain('Auto-discover dev server');
+  });
+
+  test('a running action takes the row over the first idle one', async () => {
+    mockedDeviceInfo.isMobile = false;
+    const originalList = terminal.listSessions;
+    Object.assign(terminal, { listSessions: async () => [{
+      sessionId: 'peer-run', cwd: '/repo', status: 'running', createdAt: 1, mode: 'command',
+      purpose: { type: 'project-action', actionId: 'build', executionId: 'peer-execution' },
+    }] });
+    try {
+      await renderButton();
+      await act(async () => { await Promise.resolve(); });
+      const primary = host.querySelector('button');
+      expect(primary?.getAttribute('aria-label') ?? '').toContain('Build');
+    } finally { terminal.listSessions = originalList; }
+  });
 
   test('adopting a saved URL action does not auto-open a different output URL', async () => {
     mockedActionsState.actions = [{ id: 'build', name: 'Build', command: 'echo hello', autoOpenUrl: true, openUrl: 'http://localhost:4000' }];
@@ -471,6 +605,7 @@ describe('ProjectActionsButton lifecycle', () => {
 
   test('auto-discover without a preview hint settles on an announced localhost URL in context preview only', async () => {
     mockedDeviceInfo.isMobile = false;
+    mockedActionsState.actions = [];
     detectedDevServer.command = 'bun run dev';
     await renderButton();
 
@@ -507,6 +642,7 @@ describe('ProjectActionsButton lifecycle', () => {
 
   test('auto-discover opens its terminal when no preview URL appears before the fallback timeout', async () => {
     mockedDeviceInfo.isMobile = false;
+    mockedActionsState.actions = [];
     detectedDevServer.command = 'bun run dev';
     effectiveDirectory = '/repo-worktree';
     await renderButton({ projectPath: '/repo', directory: '/repo' });
@@ -529,6 +665,7 @@ describe('ProjectActionsButton lifecycle', () => {
 
   test('unmount closes active subscriptions and cancels pending preview timeouts', async () => {
     mockedDeviceInfo.isMobile = false;
+    mockedActionsState.actions = [];
     detectedDevServer.command = 'bun run dev';
     effectiveDirectory = '/repo-worktree';
     await renderButton({ projectPath: '/repo', directory: '/repo' });

@@ -2,18 +2,22 @@
  * Provider credential helpers.
  *
  * OpenCode v2 moved provider sign-in behind *integrations*: `GET /api/integration`
- * lists, per integration, the methods it accepts (`oauth`, `key`, `command`,
- * `env`) and the connections that are already live (a stored credential, or an
+ * lists, per integration, the methods it accepts (`oauth`, `key`, `external`,
+ * `command`, `env`) and the connections that are already live (a stored credential, or an
  * environment variable the server can see). There is no `auth.json` any more,
  * so "does this provider have credentials" is answered by its integration's
  * connections rather than by a local file.
  */
 
-import type { ConnectionInfo, IntegrationInfo, IntegrationKeyMethod, IntegrationOAuthMethod } from '@opencode/client';
+import type {
+  ConnectionInfo,
+  IntegrationExternalMethod,
+  IntegrationInfo,
+  IntegrationKeyMethod,
+  IntegrationOAuthMethod,
+} from '@opencode/client';
 import { z } from 'zod';
 import type { Provider } from '@/lib/opencode/model';
-
-export type ProviderIntegration = IntegrationInfo;
 
 export type CredentialConnection = Extract<ConnectionInfo, { type: 'credential' }>;
 
@@ -26,6 +30,20 @@ export type CredentialConnection = Extract<ConnectionInfo, { type: 'credential' 
 const providerApiKeySetting = z.string();
 export const readProviderApiKeySetting = (provider: Pick<Provider, 'settings'> | undefined): string | null =>
   providerApiKeySetting.safeParse(provider?.settings?.apiKey).data ?? null;
+
+/**
+ * Vertex signs in through Google Application Default Credentials on the server
+ * machine, which OpenCode neither stores nor reports as a connection. OpenCode's
+ * Vertex plugin switches the provider on once it resolves a project (from config
+ * or `GOOGLE_CLOUD_PROJECT` and its aliases) and writes that project into the
+ * provider's settings, so a resolved project is what makes Vertex usable. The
+ * plugin matches Vertex by package, so a config alias on that package counts too.
+ */
+const vertexProjectSetting = z.string().min(1);
+export const usesMachineCredentials = (provider: Pick<Provider, 'id' | 'package' | 'settings'> | undefined): boolean =>
+  provider !== undefined
+  && (provider.id === 'google-vertex' || provider.package.startsWith('@opencode/ai/providers/google-vertex'))
+  && vertexProjectSetting.safeParse(provider.settings?.project).success;
 
 /** Integrations are keyed by their own id; a provider matches on the same id. */
 export const findIntegrationForProvider = (
@@ -58,10 +76,17 @@ export const getProviderConnections = (
   return [...(own ?? []), ...(signIn ?? [])];
 };
 
-export const getOAuthMethods = (
+/**
+ * Methods that sign in with a button rather than a pasted key: OAuth, and
+ * external credentials OpenCode references outside its store (2.0.25+: an
+ * Azure CLI login, an AWS profile). Kept in the integration's declared order.
+ */
+export type SignInMethod = IntegrationOAuthMethod | IntegrationExternalMethod;
+
+export const getSignInMethods = (
   integration: IntegrationInfo | undefined,
-): IntegrationOAuthMethod[] =>
-  (integration?.methods ?? []).filter((method): method is IntegrationOAuthMethod => method.type === 'oauth');
+): SignInMethod[] =>
+  (integration?.methods ?? []).filter((method): method is SignInMethod => method.type === 'oauth' || method.type === 'external');
 
 export const getKeyMethod = (
   integration: IntegrationInfo | undefined,
@@ -85,7 +110,7 @@ export const getCredentialConnections = (
     (connection): connection is CredentialConnection => connection.type === 'credential',
   );
 
-export interface ProviderCredentialInput {
+interface ProviderCredentialInput {
   /**
    * Connections the provider's integration reports. A stored credential or a
    * resolved environment variable both count as a usable login.
@@ -97,15 +122,18 @@ export interface ProviderCredentialInput {
    * integration connection but is still logged in.
    */
   optionsApiKey?: string | null;
+  /** Signs in through credentials on the server machine (`usesMachineCredentials`). */
+  machineCredentials?: boolean;
 }
 
 /**
  * Prefer authoritative credential signals: the server either reports a
- * connection for the integration or it does not. An inline `options.apiKey` is
- * the one case the server cannot see as a connection.
+ * connection for the integration or it does not. An inline `options.apiKey` and
+ * credentials on the server machine are the cases the server cannot see as a
+ * connection.
  */
 export const providerHasCredentials = (input: ProviderCredentialInput): boolean => {
-  if ((input.connections?.length ?? 0) > 0) {
+  if ((input.connections?.length ?? 0) > 0 || input.machineCredentials) {
     return true;
   }
   return typeof input.optionsApiKey === 'string' && input.optionsApiKey.trim().length > 0;
@@ -136,6 +164,7 @@ export const getProviderCardStatus = (input: {
   integrations: readonly IntegrationInfo[] | null;
   providerId: string;
   optionsApiKey?: string | null;
+  machineCredentials?: boolean;
 }): ProviderCardStatus | null => {
   if (input.integrations === null) return null;
   const connections = getProviderConnections(input.integrations, input.providerId);
@@ -143,8 +172,22 @@ export const getProviderCardStatus = (input: {
   const credentialCount = (connections ?? []).filter((connection) => connection.type === 'credential').length;
   if (credentialCount > 1) return { kind: 'accounts', count: credentialCount };
   if (credentialCount === 1 || (input.optionsApiKey?.trim().length ?? 0) > 0) return { kind: 'connected' };
-  if ((connections ?? []).some((connection) => connection.type === 'env')) return { kind: 'environment' };
+  if (input.machineCredentials || (connections ?? []).some((connection) => connection.type === 'env')) return { kind: 'environment' };
   return connections === undefined ? null : { kind: 'signInNeeded' };
+};
+
+/**
+ * Judged over all of a provider's accounts, which the page splits across
+ * cards. With a single usable account there is nothing to switch between, so
+ * it carries no Use button; the Active mark still shows when idle ones sit next
+ * to it.
+ */
+export const getAccountSwitching = (connections: readonly ConnectionInfo[], unusedIds: ReadonlySet<string>) => {
+  const credentials = connections.filter((connection) => connection.type === 'credential');
+  return {
+    canSwitch: credentials.filter((connection) => !unusedIds.has(connection.id)).length > 1,
+    showActive: credentials.length > 1,
+  };
 };
 
 export const shouldShowModelsSection = (input: {
@@ -161,19 +204,3 @@ export const shouldShowModelsSection = (input: {
 }): boolean =>
   input.modelCount > 0 &&
   (!input.integrationsLoaded || input.hasCredentials || Boolean(input.isEditableCustomProvider));
-
-export const shouldAutoOpenAuthPanel = (input: {
-  integrationsLoaded: boolean;
-  hasCredentials: boolean;
-  userDismissed: boolean;
-  /**
-   * Config-defined custom providers do not auto-open the auth panel: the
-   * provider is editable directly in the form, and a stale `Credentials
-   * missing` summary would be misleading.
-   */
-  isEditableCustomProvider?: boolean;
-}): boolean =>
-  input.integrationsLoaded &&
-  !input.hasCredentials &&
-  !input.userDismissed &&
-  !input.isEditableCustomProvider;

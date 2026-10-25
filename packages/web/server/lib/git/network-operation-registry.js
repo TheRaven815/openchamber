@@ -1,3 +1,6 @@
+import { isPlainObject, isString } from '../shared/guards.js';
+import { isProviderId } from '../source-control/provider-id.js';
+
 const DEFAULT_MAX_ENTRIES = 256;
 const DEFAULT_TERMINAL_RETENTION_MS = 60 * 60 * 1000;
 const DEFAULT_PLANNED_RETENTION_MS = 15 * 60 * 1000;
@@ -11,11 +14,11 @@ const ERROR_CODES = new Set([
   'INVALID_REQUEST', 'NOT_FOUND', 'STALE_REPOSITORY', 'STALE_BINDING', 'STALE_CONFIG',
   'REMOTE_CHANGED', 'AUTHENTICATION_REQUIRED', 'AUTHENTICATION_FAILED', 'TRANSPORT_FAILED',
   'CONFLICT', 'CANCELLED', 'TIMEOUT', 'OUTCOME_UNKNOWN', 'RUNTIME_UNSUPPORTED', 'UNKNOWN',
-  'GIT_LFS_CLIENT_MISSING',
+  'GIT_LFS_CLIENT_MISSING', 'CHECKOUT_TOO_LARGE',
 ]);
 const FAILURE_ERROR_CODES = new Set([
   'INVALID_REQUEST', 'AUTHENTICATION_REQUIRED', 'AUTHENTICATION_FAILED', 'TRANSPORT_FAILED',
-  'RUNTIME_UNSUPPORTED', 'GIT_LFS_CLIENT_MISSING', 'UNKNOWN',
+  'RUNTIME_UNSUPPORTED', 'GIT_LFS_CLIENT_MISSING', 'CHECKOUT_TOO_LARGE', 'UNKNOWN',
 ]);
 const STATE_ERROR_CODES = Object.freeze({
   partial: FAILURE_ERROR_CODES,
@@ -74,10 +77,6 @@ const isValidHydration = (value) => isPlainObject(value)
   && value.lfs.length <= 256
   && value.lfs.every((entry) => isHydrationPart(entry, true))
   && expectedHydrationStatus([...value.submodules, ...value.lfs]) === value.status;
-const isPlainObject = (value) => value === Object(value)
-  && !Array.isArray(value)
-  && Object.getPrototypeOf(value) === Object.prototype;
-const isString = (value) => Object.prototype.toString.call(value) === '[object String]';
 const isBoundedString = (value, max) => isString(value) && value.trim() === value
   && value.length > 0 && value.length <= max && !/[\0\r\n]/.test(value);
 const isSafeDisplayEndpoint = (value) => {
@@ -121,7 +120,7 @@ const parseTransportMetadata = (value) => {
     return { kind: 'ssh-key', fingerprint: value.fingerprint };
   }
   if (hasExactKeys(value, ['provider', 'instance', 'accountId', 'login'])
-    && ['github', 'gitlab'].includes(value.provider)
+    && isProviderId(value.provider)
     && isBoundedString(value.instance, 4096)
     && isBoundedString(value.accountId, 512)
     && (value.login === null || isBoundedString(value.login, 512))) {

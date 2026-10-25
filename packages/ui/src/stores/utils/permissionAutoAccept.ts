@@ -9,7 +9,7 @@ import type { Session } from "@/lib/opencode/model";
  * - `safety`: accepted unless the safety net (Jev) says the user should decide.
  * - `auto`: every request is accepted.
  */
-export const permissionModeSchema = z.enum(["ask", "safety", "auto"]);
+const permissionModeSchema = z.enum(["ask", "safety", "auto"]);
 
 export type PermissionMode = z.infer<typeof permissionModeSchema>;
 
@@ -29,6 +29,20 @@ export const nextPermissionMode = (mode: PermissionMode, safetyAvailable: boolea
   if (shown === "safety") return "auto";
   return "ask";
 };
+
+/**
+ * The mode the UI writes onto a session it has just created: the user's own
+ * choice, else, in an isolated space, the Settings default the composer showed.
+ * The host's server writes that default itself when the session is created,
+ * and so does the server inside a space from the file the host keeps there;
+ * this write covers a space still running a server from before that file.
+ * `undefined` writes nothing.
+ */
+export const permissionModeForNewSession = (
+  choice: PermissionMode | undefined,
+  inSpace: boolean,
+  defaultMode: PermissionMode,
+): PermissionMode | undefined => choice ?? (inSpace && defaultMode !== "ask" ? defaultMode : undefined);
 
 export type PermissionPolicySnapshot = {
   modes: PermissionModeMap;

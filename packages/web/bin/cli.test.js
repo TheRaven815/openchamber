@@ -8,11 +8,12 @@ import { spawn } from 'child_process';
 import { pathToFileURL } from 'url';
 
 import { isModuleCliExecution, normalizeCliEntryPath } from './cli-entry.js';
+import { INJECTED_ENV_KEY, assignInjectedEnv } from '../server/lib/injected-env.js';
 import { requestJson } from './lib/cli-http.js';
 import { requestControlAction } from './lib/cli-control.js';
 import { inspectTunnelAttachability } from './lib/cli-lifecycle.js';
 import { startupCommand } from './lib/commands-startup.js';
-import { formatGoal } from './lib/commands-schedule.js';
+import { formatGoal, scheduleCommand } from './lib/commands-schedule.js';
 import {
   buildSessionCreatePayload,
   buildSessionPromptPayload,
@@ -26,6 +27,7 @@ import { DEFAULT_TUNNEL_PROVIDER_CAPABILITIES } from './lib/cli-tunnel-capabilit
 import {
   TUNNEL_PROVIDER_CLOUDFLARE,
   TUNNEL_PROVIDER_NGROK,
+  TUNNEL_PROVIDER_TAILSCALE,
 } from '../server/lib/tunnels/types.js';
 import {
   assertAuthenticatedNetworkExposure,
@@ -198,7 +200,13 @@ describe('cli args', () => {
     expect(DEFAULT_TUNNEL_PROVIDER_CAPABILITIES.map((provider) => provider.provider)).toEqual([
       TUNNEL_PROVIDER_CLOUDFLARE,
       TUNNEL_PROVIDER_NGROK,
+      TUNNEL_PROVIDER_TAILSCALE,
     ]);
+  });
+
+  it('parses --https-port as a number and refuses anything else', () => {
+    expect(parseArgs(['tunnel', 'start', '--https-port', '8443']).options.httpsPort).toBe(8443);
+    expect(() => parseArgs(['tunnel', 'start', '--https-port', 'abc'])).toThrow('Missing or invalid value for --https-port.');
   });
 
   it('accepts legacy daemon flags as no-ops', () => {
@@ -757,15 +765,31 @@ describe('serve UI password resolution', () => {
 
 describe('serve host resolution', () => {
   it('uses OPENCHAMBER_HOST when --host is not provided', () => {
-    const previous = process.env.OPENCHAMBER_HOST;
+    const previous = { OPENCHAMBER_HOST: process.env.OPENCHAMBER_HOST, [INJECTED_ENV_KEY]: process.env[INJECTED_ENV_KEY] };
+    delete process.env[INJECTED_ENV_KEY];
     process.env.OPENCHAMBER_HOST = '192.0.2.20';
     try {
       expect(resolveServeHost(undefined)).toBe('192.0.2.20');
     } finally {
-      if (typeof previous === 'string') {
-        process.env.OPENCHAMBER_HOST = previous;
-      } else {
-        delete process.env.OPENCHAMBER_HOST;
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it('ignores an OPENCHAMBER_HOST that OpenChamber put into the shell', () => {
+    const previous = { OPENCHAMBER_HOST: process.env.OPENCHAMBER_HOST, [INJECTED_ENV_KEY]: process.env[INJECTED_ENV_KEY] };
+    delete process.env[INJECTED_ENV_KEY];
+    delete process.env.OPENCHAMBER_HOST;
+    assignInjectedEnv(process.env, { OPENCHAMBER_HOST: '0.0.0.0' });
+    try {
+      expect(resolveServeHost(undefined)).toBe('127.0.0.1');
+      expect(resolveServeHost('192.0.2.21')).toBe('192.0.2.21');
+    } finally {
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
       }
     }
   });
@@ -829,6 +853,27 @@ describe('compatibility exports', () => {
       }));
     });
   });
+
+  it('starts Tailscale in its own first mode, Serve, when no mode is given', async () => {
+    await withTempOpenChamberDataDir(async () => {
+      const output = await captureStdout(async () => {
+        await commands.tunnel({
+          json: true,
+          dryRun: true,
+          explicitPort: true,
+          port: 3003,
+          provider: 'tailscale',
+          httpsPort: 8443,
+        }, 'start');
+      });
+
+      expect(JSON.parse(output)).toEqual(expect.objectContaining({
+        provider: 'tailscale',
+        mode: 'serve',
+        httpsPort: 8443,
+      }));
+    });
+  });
 });
 
 describe('CLI HTTP helpers', () => {
@@ -848,6 +893,22 @@ describe('CLI HTTP helpers', () => {
         sessionId: 'ses_1',
         directory: '/repo',
       })).resolves.toEqual({ status: 'ok', sessionStatus: { type: 'idle' } });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('reports the enabled state the server saved and fails when it did not change', async () => {
+    const originalFetch = globalThis.fetch;
+    let saved = { task: { id: 'loop:user:mine', name: 'mine', enabled: true }, enabled: true };
+    globalThis.fetch = async () => createMockJsonResponse(saved);
+    const options = { port: 45680, explicitPort: true, directory: '/repo', task: 'loop:user:mine', json: true };
+    try {
+      const output = await captureStdout(() => scheduleCommand(options, 'enable'));
+      expect(JSON.parse(output)).toMatchObject(saved);
+
+      saved = { task: { id: 'loop:user:mine', name: 'mine', enabled: false }, enabled: false };
+      await expect(scheduleCommand(options, 'enable')).rejects.toThrow('mine is still disabled.');
     } finally {
       globalThis.fetch = originalFetch;
     }

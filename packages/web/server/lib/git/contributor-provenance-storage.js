@@ -1,15 +1,13 @@
+import { isPlainObject, isString } from '../shared/guards.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { constants as fsConstants } from 'node:fs';
 import { withSourceControlFileLock } from '../source-control/file-lock.js';
+import { isProviderId } from '../source-control/provider-id.js';
 
 const VERSION = 1;
 const DEFAULT_MAX_RECORDS = 512;
-const isPlainObject = (value) => value === Object(value)
-  && !Array.isArray(value)
-  && Object.getPrototypeOf(value) === Object.prototype;
-const isString = (value) => Object.prototype.toString.call(value) === '[object String]';
 const isIdentifier = (value) => isString(value) && value.length > 0 && value.length <= 512
   && value.trim() === value && !/[\0\r\n]/.test(value);
 const exactKeys = (value, keys) => {
@@ -47,9 +45,10 @@ const parseRecord = (record) => {
     || !isIdentifier(provenance.endpointFingerprint)
     || !isIdentifier(provenance.sourceRef) || !provenance.sourceRef.startsWith('refs/heads/')
     || !isIdentifier(provenance.sourceProjectId) || !isIdentifier(provenance.targetProjectId)
-    || !['github', 'gitlab'].includes(provenance.provider) || !isIdentifier(provenance.instance)
+    || !isProviderId(provenance.provider) || !isIdentifier(provenance.instance)
+    // An unbound repository reads with the signed-in account at binding revision 0.
     || !isIdentifier(provenance.accountId) || !Number.isSafeInteger(provenance.bindingRevision)
-    || provenance.bindingRevision < 1 || !isIdentifier(provenance.primaryRemote)
+    || provenance.bindingRevision < 0 || !isIdentifier(provenance.primaryRemote)
     || !isIdentifier(provenance.projectId) || !isString(provenance.setupCommand)
     || provenance.setupCommand.length > 65536 || /[\0]/.test(provenance.setupCommand)
     || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(provenance.sourceSha)) throw invalidStore();
@@ -163,10 +162,16 @@ export function createContributorProvenanceStore({
     return enqueue(async () => {
       const [state, identities] = await Promise.all([
         readState(),
-        Promise.all(directories.map(resolveIdentity)),
+        // A listing entry whose git directory no longer resolves (a worktree
+        // deleted outside git, a bare repository root, a broken .git link)
+        // has no identity to look up. It reads as no provenance rather than
+        // failing the whole listing; action-time reads stay strict.
+        Promise.all(directories.map((directory) => resolveIdentity(directory).catch(() => null))),
       ]);
       const recordsByWorktree = new Map(state.records.map((record) => [record.worktreeId, record]));
-      return identities.map((identity) => recordForIdentity(recordsByWorktree.get(identity.worktreeId), identity));
+      return identities.map((identity) => (identity
+        ? recordForIdentity(recordsByWorktree.get(identity.worktreeId), identity)
+        : { revision: 0, provenance: null }));
     });
   };
   const compareAndSwap = (directory, expectedRevision, provenance) => {

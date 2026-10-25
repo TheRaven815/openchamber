@@ -620,6 +620,22 @@ export class ElectronSshManager {
     };
   }
 
+  /** A ready SSH listener for this API origin, optionally belonging to one host. */
+  isForwardedApiUrl(url, instanceId = null) {
+    if (!url) return false;
+    try {
+      const origin = new URL(url).origin;
+      const matches = (status) => status?.phase === 'ready' && status.localUrl === origin;
+      if (instanceId) return Boolean(matches(this.statuses.get(instanceId)));
+      for (const status of this.statuses.values()) {
+        if (matches(status)) return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
   setStatus(id, phase, detail = null, localUrl = null, localPort = null, remotePort = null, startedByUs = false, retryAttempt = 0, requiresUserAction = false) {
     const level = phase === 'error' ? 'ERROR' : (phase === 'degraded' ? 'WARN' : 'INFO');
     this.appendLogWithLevel(
@@ -667,6 +683,22 @@ export class ElectronSshManager {
   logsForInstance(id, limit = 200) {
     const lines = [...(this.logs.get(id) || [])];
     return limit > 0 && lines.length > limit ? lines.slice(-limit) : lines;
+  }
+
+  /** Raw data stays in main; callers must classify before crossing IPC. */
+  diagnosticLogSnapshots() {
+    const ids = [...new Set([...this.logs.keys(), ...this.statuses.keys()])];
+    const entries = ids.slice(-20).map((id) => {
+      const status = this.statuses.get(id);
+      return {
+        lines: this.logsForInstance(id),
+        phase: status?.phase,
+        updatedAtMs: status?.updatedAtMs,
+        retryAttempt: status?.retryAttempt,
+        requiresUserAction: status?.requiresUserAction,
+      };
+    });
+    return { entries, omittedSources: Math.max(0, ids.length - entries.length) };
   }
 
   clearLogsForInstance(id) {

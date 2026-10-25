@@ -107,6 +107,24 @@ describe("translateWireEvent", () => {
     expect(done.map((e) => e.type)).toEqual(["session.patched", "session.idle"])
   })
 
+  test("a view moves the watermark to the turn the viewer saw, not to when it was recorded", () => {
+    const viewed = translateWireEvent({ ...base, type: "session.viewed", durable, data: { sessionID: "ses_1", idle: 400 } })
+    expect(viewed).toEqual([
+      { type: "session.patched", properties: { sessionID: "ses_1", patch: { time: { viewed: 400 } } } },
+    ])
+  })
+
+  test("archive and unarchive stamp the archive time from the event and move the update time", () => {
+    const archived = translateWireEvent({ ...base, type: "session.archived", durable, data: { sessionID: "ses_1" } })
+    expect(archived).toEqual([
+      { type: "session.patched", properties: { sessionID: "ses_1", patch: { time: { archived: 1000, updated: 1000 } } } },
+    ])
+    const restored = translateWireEvent({ ...base, type: "session.unarchived", durable, data: { sessionID: "ses_1" } })
+    expect(restored).toEqual([
+      { type: "session.patched", properties: { sessionID: "ses_1", patch: { time: { archived: null, updated: 1000 } } } },
+    ])
+  })
+
   test("a user prompt entering the inbox becomes a user message with projected parts", () => {
     const events = translateWireEvent({
       ...base,
@@ -415,12 +433,15 @@ describe("shell commands", () => {
     expect(translateWireEvent({ ...base, type: "shell.created", data: { info: { ...info, metadata: {} } } })).toEqual([])
   })
 
-  test("exit and removal both end the command", () => {
+  test("exit and removal both end the command, saying how and when", () => {
     expect(translateWireEvent({ ...base, type: "shell.exited", data: { id: "sh_1", exit: 0, status: "exited" } })).toEqual([
-      { type: "shell.ended", properties: { shellID: "sh_1" } },
+      { type: "shell.ended", properties: { shellID: "sh_1", end: { kind: "exited", status: "exited", exit: 0 }, endedAt: 1000 } },
+    ])
+    expect(translateWireEvent({ ...base, type: "shell.exited", data: { id: "sh_1", status: "timeout" } })).toEqual([
+      { type: "shell.ended", properties: { shellID: "sh_1", end: { kind: "exited", status: "timeout" }, endedAt: 1000 } },
     ])
     expect(translateWireEvent({ ...base, type: "shell.deleted", data: { id: "sh_1" } })).toEqual([
-      { type: "shell.ended", properties: { shellID: "sh_1" } },
+      { type: "shell.ended", properties: { shellID: "sh_1", end: { kind: "removed" }, endedAt: 1000 } },
     ])
   })
 
@@ -434,6 +455,19 @@ describe("shell commands", () => {
     expect(event.type === "message.updated" ? event.properties.info : undefined).toMatchObject({
       role: "synthetic",
       metadata: { notice: "restart" },
+    })
+  })
+
+  test("a live instruction update carries the sources OpenCode stores with it", () => {
+    const [event] = translateWireEvent({
+      ...base,
+      type: "session.instructions.updated",
+      durable: { ...durable, version: 2 as const },
+      data: { sessionID: "ses_1", text: "The environment you are running in is now:", delta: { "core/environment": "h1", "core/date": "h2" } },
+    })
+    expect(event.type === "message.updated" ? event.properties.info : undefined).toMatchObject({
+      role: "system",
+      metadata: { notice: "instructions", instructionSources: ["core/environment", "core/date"] },
     })
   })
 })

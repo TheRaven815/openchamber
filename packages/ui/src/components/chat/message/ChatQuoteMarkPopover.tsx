@@ -27,6 +27,8 @@ export interface ChatQuoteMarkPopoverProps {
     onEditingChange: (editing: boolean) => void;
     onSave: (text: string) => void;
     onRemove: () => void;
+    /** Where to render: the open modal dialog for a quote in a full-screen page; the body otherwise. */
+    portalTarget?: HTMLElement | null;
 }
 
 export function ChatQuoteMarkPopover({
@@ -37,6 +39,7 @@ export function ChatQuoteMarkPopover({
     onEditingChange,
     onSave,
     onRemove,
+    portalTarget,
 }: ChatQuoteMarkPopoverProps) {
     const { t } = useI18n();
     const [draft, setDraft] = React.useState(comment);
@@ -60,7 +63,7 @@ export function ChatQuoteMarkPopover({
             resizeInput();
         });
         // The comment at edit start is the baseline.
-        // eslint-disable-next-line react-hooks/exhaustive-deps
+        // oxlint-disable-next-line react-hooks/exhaustive-deps
     }, [editing]);
 
     const save = () => {
@@ -80,7 +83,7 @@ export function ChatQuoteMarkPopover({
             // The glass card's shadow lives here, off its backdrop-filter
             // element; this box hugs the card, so the radius matches it.
             className={cn(
-                'app-region-no-drag fixed z-50 shadow-[0_4px_16px_-4px_rgb(0_0_0_/_0.12)]',
+                'app-region-no-drag fixed z-50',
                 editing ? 'rounded-3xl' : 'rounded-2xl',
             )}
             style={{
@@ -90,7 +93,7 @@ export function ChatQuoteMarkPopover({
             }}
         >
             {editing ? (
-                <div className="oc-glass-popover flex items-end gap-2 rounded-3xl border border-[var(--interactive-border)] py-1 pl-4 pr-1">
+                <div className="oc-glass-popover oc-glass-floating flex items-end gap-2 rounded-3xl py-1 ps-4 pe-1">
                     <textarea
                         ref={inputRef}
                         rows={1}
@@ -124,11 +127,11 @@ export function ChatQuoteMarkPopover({
                     </button>
                 </div>
             ) : (
-                <div className="oc-glass-popover flex max-w-[min(360px,80vw)] items-start gap-1 rounded-2xl border border-[var(--interactive-border)] py-1 pl-3 pr-1">
+                <div className="oc-glass-popover oc-glass-floating flex max-w-[min(360px,80vw)] items-start gap-1 rounded-2xl py-1 ps-3 pe-1">
                     {comment ? (
                         <div className="min-w-0 flex-1 whitespace-pre-wrap break-words py-1 text-sm text-foreground">{comment}</div>
                     ) : null}
-                    <div className={cn('flex shrink-0 items-center', !comment && '-ml-2')}>
+                    <div className={cn('flex shrink-0 items-center', !comment && '-ms-2')}>
                         <button
                             type="button"
                             className={ACTION_CLASS}
@@ -153,6 +156,6 @@ export function ChatQuoteMarkPopover({
                 </div>
             )}
         </div>,
-        document.body,
+        portalTarget ?? document.body,
     );
 }

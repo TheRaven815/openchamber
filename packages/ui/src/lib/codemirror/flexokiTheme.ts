@@ -163,7 +163,7 @@ export function createFlexokiCodeMirrorTheme(
       backgroundColor: theme.colors.surface.elevated,
       color: theme.colors.surface.mutedForeground,
       fontFamily: 'var(--font-mono)',
-      fontSize: '12px',
+      fontSize: '0.75rem',
       minHeight: '22px',
       padding: '2px 8px',
     },
@@ -190,7 +190,7 @@ export function createFlexokiCodeMirrorTheme(
       width: '100%',
       color: theme.colors.surface.elevatedForeground,
       fontFamily: 'inherit',
-      fontSize: '13px',
+      fontSize: '0.8125rem',
       lineHeight: '1',
     },
 
@@ -206,7 +206,9 @@ export function createFlexokiCodeMirrorTheme(
     /* ── Text input base: border-radius matches action buttons (4px) ── */
     '.cm-search .cm-textfield': {
       appearance: 'none',
-      height: '26px',
+      // 26px at the default interface size, like the buttons beside it; the
+      // text scales with the interface size, so the field grows with it.
+      height: 'calc(1em + 14px)',
       margin: 0,
       padding: '0 8px',
       borderRadius: '6px !important',
@@ -214,7 +216,7 @@ export function createFlexokiCodeMirrorTheme(
       backgroundColor: theme.colors.surface.elevated,
       color: theme.colors.surface.elevatedForeground,
       fontFamily: 'inherit',
-      fontSize: '12px',
+      fontSize: '0.75rem',
       lineHeight: '1',
       outline: 'none',
       transition: 'border-color 150ms ease',
@@ -338,7 +340,7 @@ export function createFlexokiCodeMirrorTheme(
       border: 'none',
       borderRadius: '0',
       padding: '0 6px',
-      fontSize: '11px',
+      fontSize: '0.6875rem',
       whiteSpace: 'nowrap' as const,
       lineHeight: '26px',
     },
@@ -504,7 +506,7 @@ export function createFlexokiCodeMirrorTheme(
     /* Other occurrences of the word at the cursor or of the selected text */
     '.cm-selectionMatch': {
       backgroundColor: theme.colors.interactive.selection,
-      boxShadow: `inset 0 0 0 1px ${theme.colors.interactive.borderFocus}`,
+      boxShadow: `inset 0 0 0 1px ${theme.colors.interactive.border}`,
       borderRadius: '2px',
     },
     // The word at the cursor (or the selection itself) is outlined only, so it

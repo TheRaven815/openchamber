@@ -53,6 +53,9 @@ export function createPermissionAutoAcceptRuntime({
   // What a pre-modes `true` becomes: `safety` when the old global safety-net
   // switch was on, else `auto`. Asked only while converting such a policy.
   resolveLegacyEnabledMode = async () => 'auto',
+  // The mode a new top-level session starts in. The server inside an isolated space reads the
+  // file the host writes instead, since its own settings hold no default.
+  readDefaultMode = async () => (await readSettingsFromDiskMigrated())?.[DEFAULT_MODE_SETTINGS_KEY],
   fetchImpl = fetch,
   retryDelaysMs = RETRY_DELAYS_MS,
   requestTimeoutMs = REQUEST_TIMEOUT_MS,
@@ -103,7 +106,7 @@ export function createPermissionAutoAcceptRuntime({
   };
 
   const persistUpdate = (update) => {
-    writePromise = writePromise.then(async () => {
+    const result = writePromise.then(async () => {
       const next = update(policy);
       await persistSettings({ [SETTINGS_KEY]: next });
       policy = next;
@@ -114,7 +117,9 @@ export function createPermissionAutoAcceptRuntime({
       });
       return snapshot();
     });
-    return writePromise;
+    // Only this caller sees a failed save; the next update still writes.
+    writePromise = result.catch(() => {});
+    return result;
   };
 
   /**
@@ -145,8 +150,7 @@ export function createPermissionAutoAcceptRuntime({
   const applyDefaultMode = async (sessionId) => {
     await load();
     if (Object.hasOwn(policy.sessions, sessionId)) return;
-    const settings = await readSettingsFromDiskMigrated();
-    const mode = settings?.[DEFAULT_MODE_SETTINGS_KEY];
+    const mode = await readDefaultMode();
     if (!isPermissionMode(mode) || mode === 'ask') return;
     await persistUpdate((current) => (Object.hasOwn(current.sessions, sessionId) ? current : {
       ...current,
@@ -155,12 +159,19 @@ export function createPermissionAutoAcceptRuntime({
     }));
   };
 
-  const rememberSession = (info, directoryHint) => {
+  /**
+   * `complete` marks a full session record (`session.created`, or the session
+   * fetched from OpenCode), the only kind whose missing `parentID` proves a
+   * top-level session. Otherwise the parent stays unknown (`undefined`).
+   */
+  const rememberSession = (info, directoryHint, { complete = false } = {}) => {
     if (!info || typeof info.id !== 'string' || !info.id) return;
     // v2 session updates are partial (a rename carries only the title), so a
     // field the update does not name keeps what an earlier record said.
     const previous = sessions.get(info.id);
-    const parentID = typeof info.parentID === 'string' && info.parentID ? info.parentID : previous?.parentID ?? null;
+    const parentID = typeof info.parentID === 'string' && info.parentID
+      ? info.parentID
+      : (previous?.parentID !== undefined ? previous.parentID : (complete ? null : undefined));
     // v2 keeps the directory on `location`; translated events already flatten it.
     const directory = typeof info.directory === 'string' && info.directory
       ? info.directory
@@ -199,14 +210,15 @@ export function createPermissionAutoAcceptRuntime({
 
   const getSession = async (sessionId, directory) => {
     const cached = sessions.get(sessionId);
-    if (cached) return cached;
-    const info = await request(`/api/session/${encodeURIComponent(sessionId)}`, { directory });
-    rememberSession(info?.data ?? info, directory);
+    // Only a partial update was seen: its parent is unknown, so ask OpenCode.
+    if (cached && cached.parentID !== undefined) return cached;
+    const info = await request(`/api/session/${encodeURIComponent(sessionId)}`, { directory: directory ?? cached?.directory });
+    rememberSession(info?.data ?? info, directory, { complete: true });
     return sessions.get(sessionId) ?? null;
   };
 
-  /** The nearest explicit mode up the session's lineage; unknown lineage fails closed to `ask`. */
-  const resolveSessionMode = async (sessionId, directory) => {
+  /** The nearest explicit mode up the session's lineage. Throws when a session lookup fails. */
+  const resolveLineageMode = async (sessionId, directory) => {
     await load();
     // A default being written for a just-created session must be visible to
     // its first permission request.
@@ -217,24 +229,23 @@ export function createPermissionAutoAcceptRuntime({
     while (current && !seen.has(current)) {
       if (Object.hasOwn(policy.sessions, current)) return policy.sessions[current];
       seen.add(current);
-      let info;
-      try {
-        info = await getSession(current, currentDirectory);
-      } catch {
-        return 'ask';
-      }
+      const info = await getSession(current, currentDirectory);
       current = info?.parentID ?? null;
       currentDirectory = info?.directory ?? currentDirectory;
     }
     return 'ask';
   };
 
+  /** The nearest explicit mode up the session's lineage; unknown lineage fails closed to `ask`. */
+  const resolveSessionMode = (sessionId, directory) => resolveLineageMode(sessionId, directory).catch(() => 'ask');
+
   const isSessionAutoAccepting = async (sessionId, directory) => isAutoAnsweringMode(await resolveSessionMode(sessionId, directory));
 
   /** `replied`, `held` (left for the user by the safety net), or `ignored` (an `ask` session). */
   const replyOnce = async (permission, directory) => {
     if (!permission?.id || !permission?.sessionID) return 'ignored';
-    const mode = await resolveSessionMode(permission.sessionID, directory);
+    // A failed lineage lookup throws, so the request is retried like a failed reply.
+    const mode = await resolveLineageMode(permission.sessionID, directory);
     if (mode === 'ask') return 'ignored';
     if (mode === 'safety') {
       const verdict = evaluatePermission ? await evaluatePermission(permission, directory) : null;
@@ -293,11 +304,20 @@ export function createPermissionAutoAcceptRuntime({
    * answered automatically. A held or unanswered request is not.
    */
   const isPermissionAutoAnswered = async (sessionId, directory, permissionId) => {
-    const mode = await resolveSessionMode(sessionId, directory);
+    const wasReplied = async () => {
+      const outcome = permissionId ? outcomes.get(permissionId) : undefined;
+      return outcome ? (await outcome) === 'replied' : false;
+    };
+    let mode;
+    try {
+      mode = await resolveLineageMode(sessionId, directory);
+    } catch {
+      // The reply path retries the lookup; its outcome is the answer.
+      return wasReplied();
+    }
     if (mode === 'auto') return true;
     if (mode === 'ask') return false;
-    const outcome = permissionId ? outcomes.get(permissionId) : undefined;
-    return outcome ? (await outcome) === 'replied' : false;
+    return wasReplied();
   };
 
   // A pending request belongs to a turn that is still running, so the
@@ -351,7 +371,7 @@ export function createPermissionAutoAcceptRuntime({
     for (const payload of event?.translated?.() ?? []) {
       if (payload.type === 'session.created' || payload.type === 'session.updated') {
         const info = payload.properties?.info;
-        rememberSession(info, directory ?? payload.properties?.directory);
+        rememberSession(info, directory ?? payload.properties?.directory, { complete: payload.type === 'session.created' });
         const created = payload.type === 'session.created' ? createdSessionSchema.safeParse(info) : null;
         if (created?.success && !created.data.parentID) {
           void applyDefaultMode(created.data.id).catch((error) => {

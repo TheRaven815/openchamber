@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
-import { isSpaceCreationRequest, startSpaceCreation, type SpaceModelAccess } from './space-creation';
+import { startSpaceCreation, type SpaceModelAccess } from './space-creation';
+import { draftSpaceTarget, isSpaceCreationRequest } from './space-creation-requests';
 import { spaceModelRefusal } from './space-model-access';
 import type { SpaceEntry } from './spaces-api';
 import { useSpacesStore } from './spaces-store';
@@ -15,6 +16,7 @@ const originalFetch = globalThis.fetch;
 const entry: SpaceEntry = {
   id: ID,
   name: 'Fix login',
+  placeId: 'docker', machine: null,
   projectDirectory: PROJECT,
   projectFolder: { path: PROJECT, found: null },
   directory: DIRECTORY,
@@ -26,38 +28,36 @@ const entry: SpaceEntry = {
   grants: [],
   access: null,
   needsAccess: [],
+  accessFailures: [],
   damage: null,
   setup: null,
 };
 
 const openai: SpaceModelAccess = { kind: 'model', provider: 'openai', upstream: 'https://api.openai.com/v1', secret: { kind: 'env', name: 'OPENAI_API_KEY' } };
 
-// The host: the creation answers the entry, a grant answers what `grantAnswer` says, and the list
-// answers the space running with the grants that went through.
+// The host: the creation answers the entry and carries the access; the list answers the space
+// running with the access given, or, when `grantAnswer` is a refusal, with that refusal listed.
 const host = (grantAnswer: { status: number; body: { grant?: unknown; code?: string; message?: string } }, listedSetup: SpaceEntry['setup'] = null, createdSetup: SpaceEntry['setup'] = null) => {
-  const grants: unknown[] = [];
   const created: unknown[] = [];
-  const given: unknown[] = [];
+  let carried = false;
   globalThis.fetch = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = new URL(input instanceof Request ? input.url : String(input), 'http://127.0.0.1');
-    if (url.pathname.endsWith('/grants')) {
-      grants.push(JSON.parse(String(init?.body)));
-      if (grantAnswer.status === 200 && grantAnswer.body.grant) given.push(grantAnswer.body.grant);
-      return new Response(JSON.stringify(grantAnswer.body), { status: grantAnswer.status });
-    }
     if ((init?.method ?? 'GET') === 'GET') {
-      const listed = { ...entry, state: 'running', step: null, grants: given, access: given.length > 0 ? 'granted' : null, setup: listedSetup };
+      const given = carried && grantAnswer.status === 200 && grantAnswer.body.grant ? [grantAnswer.body.grant] : [];
+      const accessFailures = carried && grantAnswer.status !== 200 ? [{ provider: 'openai', code: grantAnswer.body.code ?? '', message: grantAnswer.body.message ?? '' }] : [];
+      const listed = { ...entry, state: 'running', step: null, grants: given, access: given.length > 0 ? 'granted' : null, accessFailures, setup: listedSetup };
       return new Response(JSON.stringify({ spaces: [listed] }), { status: 200 });
     }
-    created.push(JSON.parse(String(init?.body)));
+    const body = String(init?.body);
+    created.push(JSON.parse(body));
+    carried = !body.includes('"grants":[]');
     return new Response(JSON.stringify({ ...entry, setup: createdSetup }), { status: 202 });
   }, originalFetch);
-  return Object.assign(grants, { created });
+  return { created };
 };
 
 const start = (access: readonly SpaceModelAccess[] = [], setup = { commands: [] as string[], waitBeforeSending: false }) => startSpaceCreation({
   projectId: 'project-1',
-  request: { projectDirectory: PROJECT, name: 'Fix login', start: 'clean', network: { mode: 'allowlist', domains: [] } },
+  request: { projectDirectory: PROJECT, placeId: 'docker', name: 'Fix login', start: 'clean', network: { mode: 'allowlist', domains: [] } },
   setup,
   access,
   refusalMessage: 'refused',
@@ -87,13 +87,14 @@ describe('startSpaceCreation', () => {
   });
 
   test('the waiting message goes to the space once it is ready and its access given', async () => {
-    const grants = host({ status: 200, body: { grant: { kind: 'model', id: 'openai', provider: 'openai', upstream: openai.upstream, source: { kind: 'env', name: 'OPENAI_API_KEY' }, url: 'http://gatekeeper:8080/model/openai' } } });
+    const { created } = host({ status: 200, body: { grant: { kind: 'model', id: 'openai', provider: 'openai', upstream: openai.upstream, source: { kind: 'env', name: 'OPENAI_API_KEY' }, url: 'http://gatekeeper:8080/model/openai' } } });
     await start([openai]);
     const { outcome } = waitingMessage();
     useSpacesStore.getState().noteProgress({ spaceId: ID, step: 'ready', failure: null });
     expect(await outcome).toEqual({ directory: DIRECTORY });
-    expect(grants).toEqual([openai]);
-    expect(useSpacesStore.getState().creationAccess.get(ID)).toBeUndefined();
+    // The access went with the creation; the host gave it, and nothing is listed as missing.
+    expect(created).toMatchObject([{ grants: [openai] }]);
+    expect(useSpacesStore.getState().journey?.get(ID)?.accessFailures).toEqual([]);
   });
 
   test('a draft that had not sent yet stays where the user types, and finds the space when it sends', async () => {
@@ -106,6 +107,31 @@ describe('startSpaceCreation', () => {
     expect(useSessionUIStore.getState().newSessionDraft.directoryOverride).toBe(PROJECT);
     expect(useSessionUIStore.getState().newSessionDraft.pendingWorktreeRequestId).toBe(requestId);
     expect(await waitForPendingDraftWorktreeRequest(requestId)).toBe(DIRECTORY);
+  });
+
+  test('the draft\'s terminal opens nowhere while the space is made, and in the space once it runs', async () => {
+    host({ status: 200, body: {} });
+    await start();
+    const { requestId, outcome } = waitingMessage();
+    const terminal = () => draftSpaceTarget(requestId, useSpacesStore.getState().journey);
+    expect(terminal()).toEqual({ kind: 'preparing' });
+    useSpacesStore.getState().noteProgress({ spaceId: ID, step: 'ready', failure: null });
+    await outcome;
+    // The draft still stands on the project's folder, and the terminal goes to the space anyway.
+    expect(useSessionUIStore.getState().newSessionDraft.directoryOverride).toBe(PROJECT);
+    expect(terminal()).toEqual({ kind: 'ready', directory: DIRECTORY });
+    // A draft waiting for a worktree, or for nothing, keeps its own terminal.
+    expect(draftSpaceTarget(null, useSpacesStore.getState().journey)).toBeNull();
+    expect(draftSpaceTarget('worktree_1_abc', useSpacesStore.getState().journey)).toBeNull();
+  });
+
+  test('a failed creation leaves the draft\'s terminal to the project', async () => {
+    host({ status: 200, body: {} });
+    await start();
+    const { requestId, outcome } = waitingMessage();
+    useSpacesStore.getState().noteProgress({ spaceId: ID, step: 'failed', failure: { code: 'docker_daemon_unreachable', message: 'down' } });
+    await outcome;
+    expect(draftSpaceTarget(requestId, useSpacesStore.getState().journey)).toBeNull();
   });
 
   test('a failed creation gives the message back, and the draft no longer points at the space', async () => {
@@ -165,13 +191,13 @@ describe('startSpaceCreation', () => {
     const { outcome } = waitingMessage();
     useSpacesStore.getState().noteProgress({ spaceId: ID, step: 'ready', failure: null });
     expect(await outcome).toEqual({ error: 'refused' });
-    expect(useSpacesStore.getState().creationAccess.get(ID)).toEqual({ kind: 'failed', failures: [{ provider: 'openai', code: 'secret_source_missing', message: 'OPENAI_API_KEY is not set' }] });
+    expect(useSpacesStore.getState().journey?.get(ID)?.accessFailures).toEqual([{ provider: 'openai', code: 'secret_source_missing', message: 'OPENAI_API_KEY is not set' }]);
   });
 
   test('the setup commands travel with the request, and the message does not wait for them by default', async () => {
     const { created } = host({ status: 200, body: {} }, { state: 'running', index: 0, total: 1, command: 'npm ci' });
     await start([], { commands: ['npm ci'], waitBeforeSending: false });
-    expect(created).toEqual([{ projectDirectory: PROJECT, name: 'Fix login', start: 'clean', network: { mode: 'allowlist', domains: [] }, setupCommands: ['npm ci'] }]);
+    expect(created).toEqual([{ projectDirectory: PROJECT, placeId: 'docker', name: 'Fix login', start: 'clean', network: { mode: 'allowlist', domains: [] }, setupCommands: ['npm ci'], grants: [] }]);
     const { outcome } = waitingMessage();
     useSpacesStore.getState().noteProgress({ spaceId: ID, step: 'ready', failure: null });
     expect(await outcome).toEqual({ directory: DIRECTORY });

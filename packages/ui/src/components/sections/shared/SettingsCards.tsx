@@ -22,7 +22,7 @@ import { cn } from '@/lib/utils';
 export const SETTINGS_CARD_GRID_CLASS = 'grid grid-cols-1 gap-3 @xl:grid-cols-2 @3xl:grid-cols-3';
 
 const CARD_CLASS = cn(
-  'group flex min-h-[132px] flex-col rounded-xl border p-4 text-left transition-colors duration-150',
+  'group flex min-h-[132px] flex-col rounded-xl p-4 text-start',
   'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--interactive-focus-ring)]',
 );
 
@@ -33,18 +33,18 @@ const TONE_CLASS = {
   warning: 'bg-[var(--status-warning)]/15 text-[var(--status-warning)]',
   error: 'bg-[var(--status-error)]/15 text-[var(--status-error)]',
   info: 'bg-[var(--status-info)]/15 text-[var(--status-info)]',
-  neutral: 'bg-[var(--surface-muted)] text-muted-foreground',
+  neutral: 'oc-tile-inset text-muted-foreground',
 } satisfies Record<SettingsCardTone, string>;
 
 export const SettingsCardPill: React.FC<{ tone: SettingsCardTone; children: React.ReactNode }> = ({ tone, children }) => (
-  <span className={cn('max-w-40 shrink-0 truncate rounded-full px-2 py-0.5 text-[10px] font-medium', TONE_CLASS[tone])}>
+  <span className={cn('max-w-40 shrink-0 truncate rounded-full px-2 py-0.5 text-[0.625rem] font-medium', TONE_CLASS[tone])}>
     {children}
   </span>
 );
 
 /** Small outlined chip for the card footer (scope, source). */
 export const SettingsCardChip: React.FC<{ children: React.ReactNode }> = ({ children }) => (
-  <span className="shrink-0 rounded-full border border-[var(--interactive-border)] px-2 py-px text-[10px] font-medium">
+  <span className="oc-tile-inset shrink-0 rounded-full px-2 py-px text-[0.625rem] font-medium">
     {children}
   </span>
 );
@@ -61,6 +61,8 @@ interface SettingsCardProps {
   title: string;
   /** Monospace second line: an id, command or URL. */
   subtitle?: string;
+  /** Plain text under the title saying what the item is; up to two lines. */
+  description?: string;
   /** Top-right pills (status, update available). */
   badges?: React.ReactNode;
   /** Bottom row content: counts and chips. */
@@ -82,12 +84,12 @@ const ActionLabel: React.FC<{ action: SettingsCardAction }> = ({ action }) => (
   </>
 );
 
-export const SettingsCard: React.FC<SettingsCardProps> = ({ icon, title, subtitle, badges, footer, muted, onOpen, actions, actionsLabel }) => {
+export const SettingsCard: React.FC<SettingsCardProps> = ({ icon, title, subtitle, description, badges, footer, muted, onOpen, actions, actionsLabel }) => {
   const hasActions = (actions?.length ?? 0) > 0;
   const body = (
     <>
       <div className="flex items-start justify-between gap-2">
-        <span className={cn('flex size-10 shrink-0 items-center justify-center rounded-[10px] bg-[var(--surface-muted)]', muted && 'opacity-60')}>
+        <span className={cn('oc-tile-inset flex size-10 shrink-0 items-center justify-center rounded-[10px]', muted && 'opacity-60')}>
           {icon}
         </span>
         {badges ? <span className="flex min-w-0 flex-wrap justify-end gap-1">{badges}</span> : null}
@@ -97,13 +99,16 @@ export const SettingsCard: React.FC<SettingsCardProps> = ({ icon, title, subtitl
         {subtitle ? (
           <div className="mt-0.5 truncate font-mono typography-micro text-muted-foreground" title={subtitle}>{subtitle}</div>
         ) : null}
+        {description ? (
+          <div className="mt-1 line-clamp-2 typography-micro text-muted-foreground">{description}</div>
+        ) : null}
       </div>
-      <div className={cn('mt-auto flex min-w-0 items-center gap-2 pt-3 typography-micro text-muted-foreground', hasActions && 'pr-8')}>
+      <div className={cn('mt-auto flex min-w-0 items-center gap-2 pt-3 typography-micro text-muted-foreground', hasActions && 'pe-8')}>
         {footer}
         {onOpen && !hasActions ? (
           <Icon
             name="arrow-right-s"
-            className="ml-auto size-4 shrink-0 opacity-0 transition-opacity duration-150 group-hover:opacity-70 group-focus-visible:opacity-70"
+            className="ms-auto size-4 shrink-0 opacity-0 transition-opacity duration-150 group-hover:opacity-70 group-focus-visible:opacity-70"
             aria-hidden
           />
         ) : null}
@@ -117,13 +122,13 @@ export const SettingsCard: React.FC<SettingsCardProps> = ({ icon, title, subtitl
       onClick={onOpen}
       className={cn(
         CARD_CLASS,
-        'h-full w-full border-[var(--interactive-border)] bg-[var(--surface-elevated)] hover:border-[var(--interactive-border-hover)] hover:bg-[var(--interactive-hover)]/50',
+        'oc-tile oc-tile-hover h-full w-full',
       )}
     >
       {body}
     </button>
   ) : (
-    <div className={cn(CARD_CLASS, 'h-full border-[var(--interactive-border)] bg-[var(--surface-elevated)]')}>{body}</div>
+    <div className={cn(CARD_CLASS, 'oc-tile h-full')}>{body}</div>
   );
 
   if (!hasActions || !actions) return card;
@@ -139,7 +144,7 @@ export const SettingsCard: React.FC<SettingsCardProps> = ({ icon, title, subtitl
             <Button
               variant="ghost"
               size="icon"
-              className="absolute bottom-3 right-3 h-7 w-7 text-muted-foreground opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 data-[state=open]:opacity-100"
+              className="absolute bottom-3 inset-e-3 h-7 w-7 text-muted-foreground opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 data-[state=open]:opacity-100"
               aria-label={actionsLabel}
               title={actionsLabel}
             >
@@ -183,10 +188,11 @@ export const SettingsAddCard: React.FC<{
     data-settings-item={settingsItem}
     className={cn(
       CARD_CLASS,
-      'items-center justify-center gap-2 border-dashed border-[var(--interactive-border)] text-muted-foreground hover:bg-[var(--interactive-hover)]/50 hover:text-foreground',
+      // The one card drawn with a line: an empty slot reads as a dashed outline.
+      'oc-tile-hover items-center justify-center gap-2 text-center border border-dashed border-[color-mix(in_srgb,var(--foreground)_14%,transparent)] text-muted-foreground hover:text-foreground',
     )}
   >
-    <span className="flex size-10 items-center justify-center rounded-[10px] bg-[var(--surface-muted)]">
+    <span className="oc-tile-inset flex size-10 items-center justify-center rounded-[10px]">
       <Icon name="add" className="size-5" />
     </span>
     <span className="typography-ui-label font-medium">{label}</span>
@@ -202,7 +208,7 @@ export const SettingsCardSearch: React.FC<{
   <div className="relative mb-4 max-w-[24rem]">
     <Icon
       name="search"
-      className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+      className="pointer-events-none absolute inset-s-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
       aria-hidden
     />
     <Input
@@ -210,7 +216,7 @@ export const SettingsCardSearch: React.FC<{
       onChange={(event) => onChange(event.target.value)}
       placeholder={placeholder}
       aria-label={placeholder}
-      className="h-9 pl-8"
+      className="ps-8"
     />
   </div>
 );
@@ -220,7 +226,7 @@ export const SettingsBackButton: React.FC<{ label: string; onClick: () => void }
   <Button
     variant="ghost"
     size="icon"
-    className="-ml-2 h-7 w-7 shrink-0"
+    className="-ms-2 h-7 w-7 shrink-0"
     onClick={onClick}
     aria-label={label}
     title={label}

@@ -11,6 +11,7 @@ import { z } from 'zod';
 
 import { sanitizeSessionListItem } from '../opencode/proxy.js';
 import { isDirectoryOfSpace } from './dispatcher.js';
+import { SPACE_HOME } from './layout.js';
 
 // How many host session ids are remembered for the collision rule. Older ones are forgotten
 // first; a session the host listed or created recently is always among them.
@@ -83,6 +84,24 @@ export function spaceEventDropCode({ spaceId, payload, isHostSessionId }) {
   if (data?.sessionID !== undefined && isHostSessionId(data.sessionID)) return SPACE_DROP_CODES.eventHostSession;
   return null;
 }
+
+const isUnderSpaceHome = (directory) => {
+  const parsed = directorySchema.safeParse(directory);
+  return parsed.success && (parsed.data === SPACE_HOME || parsed.data.startsWith(`${SPACE_HOME}/`));
+};
+
+/**
+ * Whether an event names only OpenCode's own locations inside the space, its home and its config
+ * folder: the catalog events it sends at boot and at the first prompt, a dozen per start. They are
+ * outside the root and dropped as any other, and not worth a log line each.
+ */
+const isSpaceHomeEvent = (payload) => {
+  const parsed = eventSchema.safeParse(payload);
+  if (!parsed.success) return false;
+  const { data, location } = parsed.data;
+  const directories = [location?.directory, data?.location?.directory].filter((directory) => directory !== undefined && directory !== null);
+  return directories.length > 0 && directories.every(isUnderSpaceHome);
+};
 
 /**
  * The host's list with every space's records after it. `spaces` marks each space's answer:
@@ -187,7 +206,9 @@ export function createSpaceSessionIndex({ logger = console } = {}) {
     acceptSpaceEvent(spaceId, payload) {
       const code = spaceEventDropCode({ spaceId, payload, isHostSessionId });
       if (code !== null) {
-        logger.warn?.(`[spaces] dropped an event of space ${spaceId}: ${code}`);
+        if (!(code === SPACE_DROP_CODES.eventOutsideRoot && isSpaceHomeEvent(payload))) {
+          logger.warn?.(`[spaces] dropped an event of space ${spaceId}: ${code}`);
+        }
         return false;
       }
       const sessionID = payload.data?.sessionID;
@@ -201,6 +222,18 @@ export function createSpaceSessionIndex({ logger = console } = {}) {
         if (payload.type === 'session.created') claims.set(sessionID, spaceId);
       }
       return true;
+    },
+    /**
+     * Why a space may not speak for one session in its own state, its queue or its permission
+     * mode: the session is the host's or one another space holds, or a directory given lies
+     * outside the space's root. Null when it may. Claims nothing.
+     */
+    spaceSessionDropCode(spaceId, sessionId, directory = null) {
+      if (directory !== null && (!directorySchema.safeParse(directory).success || !isDirectoryOfSpace(directory, spaceId))) return SPACE_DROP_CODES.eventOutsideRoot;
+      if (!idSchema.safeParse(sessionId).success) return SPACE_DROP_CODES.malformed;
+      if (isHostSessionId(sessionId)) return SPACE_DROP_CODES.eventHostSession;
+      if ((claimedBy(sessionId) ?? spaceId) !== spaceId) return SPACE_DROP_CODES.claimed;
+      return null;
     },
     /** Every space's last accepted list with its state, for the merge. */
     snapshot() {

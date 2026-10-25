@@ -6,11 +6,10 @@ import { streamPerfMeasure } from '@/stores/utils/streamDebug';
 
 interface UseTurnRecordsOptions {
     sessionKey?: string;
-    showTextJustificationActivity: boolean;
     showTurnChangedFiles: boolean;
 }
 
-export interface TurnRecordsResult {
+interface TurnRecordsResult {
     projection: TurnProjectionResult;
     staticTurns: TurnProjectionResult['turns'];
     streamingTurn: TurnProjectionResult['turns'][number] | undefined;
@@ -24,16 +23,13 @@ export const useTurnRecords = (
     const staticTurnsRef = React.useRef<TurnRecord[]>([]);
     const streamingTurnRef = React.useRef<TurnRecord | undefined>(undefined);
     const previousSessionKeyRef = React.useRef<string | undefined>(options.sessionKey);
-    const previousShowTextJustificationActivityRef = React.useRef(options.showTextJustificationActivity);
     const previousShowTurnChangedFilesRef = React.useRef(options.showTurnChangedFiles);
 
     if (
         previousSessionKeyRef.current !== options.sessionKey
-        || previousShowTextJustificationActivityRef.current !== options.showTextJustificationActivity
         || previousShowTurnChangedFilesRef.current !== options.showTurnChangedFiles
     ) {
         previousSessionKeyRef.current = options.sessionKey;
-        previousShowTextJustificationActivityRef.current = options.showTextJustificationActivity;
         previousShowTurnChangedFilesRef.current = options.showTurnChangedFiles;
         previousProjectionRef.current = null;
         staticTurnsRef.current = [];
@@ -44,14 +40,13 @@ export const useTurnRecords = (
         previousProjectionRef.current = null;
         staticTurnsRef.current = [];
         streamingTurnRef.current = undefined;
-    }, [options.sessionKey, options.showTextJustificationActivity, options.showTurnChangedFiles]);
+    }, [options.sessionKey, options.showTurnChangedFiles]);
 
     const projection = React.useMemo(() => {
         const sessionKey = options.sessionKey ?? '';
         const cacheKey = buildProjectionCacheKey(
             sessionKey,
             messages,
-            options.showTextJustificationActivity,
             options.showTurnChangedFiles,
             'merge',
         );
@@ -64,7 +59,6 @@ export const useTurnRecords = (
         return streamPerfMeasure('ui.turns.projection_ms', () => {
             const nextProjection = projectTurnRecords(messages, {
                 previousProjection: previousProjectionRef.current,
-                showTextJustificationActivity: options.showTextJustificationActivity,
                 showTurnChangedFiles: options.showTurnChangedFiles,
                 mergeHiddenUserTurns: true,
             });
@@ -74,10 +68,10 @@ export const useTurnRecords = (
 
             return nextProjection;
         });
-    }, [messages, options.showTextJustificationActivity, options.showTurnChangedFiles, options.sessionKey]);
+    }, [messages, options.showTurnChangedFiles, options.sessionKey]);
 
     // The last turn is the live tail only while nothing follows it. A notice
-    // that lands after it (a compaction, a shell run) ends the turn, so the
+    // that lands after it (a shell run) ends the turn, so the
     // turn joins the history and keeps its place above that notice.
     const lastMessageId = messages[messages.length - 1]?.info.id;
     const tailIsTurn = !lastMessageId || !projection.ungroupedMessageIds.has(lastMessageId);

@@ -1,55 +1,58 @@
 import * as React from 'react';
 import { OpenChamberLogo } from '@/components/ui/OpenChamberLogo';
-import { AppStartupOverlay } from '@/components/ui/AppStartupOverlay';
 import { Icon } from '@/components/icon/Icon';
+import { Spinner } from '@/components/ui/spinner';
 import { Button } from '@/components/ui/button';
 import { DesktopHostSwitcherInline } from '@/components/desktop/DesktopHostSwitcher';
 import { useI18n } from '@/lib/i18n';
-import { hasCompatibleManagedDesktopOpenCode } from '@/lib/desktop';
 import { subscribeRuntimeEndpointChanged } from '@/lib/runtime-switch';
-import { fetchOpenCodeCompatibility, recoverOpenCode, type OpenCodeCompatibility } from '@/lib/opencode/compatibility';
+import { recoverOpenCode, type OpenCodeCompatibility } from '@/lib/opencode/compatibility';
+import { runCompatibilityCheck, takeCompatibilityCheck, type CompatibilityCheck } from './openCodeCompatibilityCheck';
 
-export const OpenCodeCompatibilityGate: React.FC<React.PropsWithChildren> = ({ children }) => {
+/**
+ * The app mounts at once and keeps starting while the check runs; only a
+ * confirmed incompatible OpenCode replaces it with the recovery screen. A
+ * failed check leaves the app's own connection recovery in charge.
+ *
+ * `enabled={false}` skips the check while keeping the children mounted, so a
+ * host without a server yet can turn the gate on without remounting the app.
+ */
+export const OpenCodeCompatibilityGate: React.FC<React.PropsWithChildren<{ enabled?: boolean }>> = ({ children, enabled = true }) => {
   const { t } = useI18n();
   const [compatibility, setCompatibility] = React.useState<OpenCodeCompatibility | null>(null);
-  const [checked, setChecked] = React.useState(false);
   const titleId = React.useId();
   const [operation, setOperation] = React.useState<'install-v2' | 'reconnect' | null>(null);
   const [failed, setFailed] = React.useState(false);
   const generation = React.useRef(0);
 
   React.useEffect(() => {
+    if (!enabled) return;
     let mounted = true;
-    const check = async () => {
+    const check = async (request: CompatibilityCheck) => {
       const revision = ++generation.current;
       try {
-        if (await hasCompatibleManagedDesktopOpenCode()) return;
-        if (!mounted || revision !== generation.current) return;
-        const result = await fetchOpenCodeCompatibility();
-        if (mounted && revision === generation.current) setCompatibility(result);
+        const result = await request;
+        if (result && mounted && revision === generation.current) setCompatibility(result);
       } catch {
         // An unavailable host or an older OpenChamber host keeps its existing
         // connection UI. Failed reads never dismiss a known incompatible CLI.
-      } finally {
-        if (mounted && revision === generation.current) setChecked(true);
       }
     };
-    void check();
+    void check(takeCompatibilityCheck());
     const unsubscribe = subscribeRuntimeEndpointChanged(() => {
       generation.current += 1;
       setCompatibility(null);
-      setChecked(false);
       setOperation(null);
       setFailed(false);
-      void check();
+      void check(runCompatibilityCheck());
     });
     return () => { mounted = false; generation.current += 1; unsubscribe(); };
-  }, []);
+  }, [enabled]);
 
   React.useEffect(() => {
     if (compatibility?.state === 'incompatible') {
-      // The application cannot initialize against v1. Recovery owns the screen
-      // before App mounts, including dismissal of the HTML loading overlay.
+      // The application cannot initialize against v1. Recovery replaces it,
+      // including dismissal of the HTML loading overlay.
       document.getElementById('initial-loading')?.remove();
     }
   }, [compatibility]);
@@ -71,10 +74,7 @@ export const OpenCodeCompatibilityGate: React.FC<React.PropsWithChildren> = ({ c
     }
   };
 
-  if (!checked) {
-    return <AppStartupOverlay ready={false} />;
-  }
-  if (compatibility?.state !== 'incompatible') return <>{children}</>;
+  if (!enabled || compatibility?.state !== 'incompatible') return <>{children}</>;
   const external = compatibility.installation === 'external';
   const bundled = compatibility.installation === 'bundled';
   // A 2.x below the minimum needs an update, not the v1 → v2 move.
@@ -109,12 +109,12 @@ export const OpenCodeCompatibilityGate: React.FC<React.PropsWithChildren> = ({ c
         <div className="app-region-no-drag mt-7 flex flex-wrap items-center justify-center gap-2">
           {compatibility.canInstall && (
             <Button disabled={operation !== null} onClick={() => void recover('install-v2')}>
-              <Icon name={operation === 'install-v2' ? 'refresh' : 'download'} className={operation === 'install-v2' ? 'size-4 animate-spin' : 'size-4'} />
+              {operation === 'install-v2' ? <Spinner className="size-4" /> : <Icon name="download" className="size-4" />}
               <span role={operation === 'install-v2' ? 'status' : undefined}>{t(operation === 'install-v2' ? 'opencodeCompatibility.installing' : outdated ? 'opencodeCompatibility.update' : 'opencodeCompatibility.install')}</span>
             </Button>
           )}
           <Button variant={compatibility.canInstall ? 'ghost' : 'default'} disabled={operation !== null} onClick={() => void recover('reconnect')}>
-            <Icon name="refresh" className={operation === 'reconnect' ? 'size-4 animate-spin' : 'size-4'} />
+            {operation === 'reconnect' ? <Spinner className="size-4" /> : <Icon name="refresh" className="size-4" />}
             <span role={operation === 'reconnect' ? 'status' : undefined}>{t(operation === 'reconnect' ? 'opencodeCompatibility.reconnecting' : 'opencodeCompatibility.reconnect')}</span>
           </Button>
         </div>

@@ -8,6 +8,7 @@ import { loadDesktopSettings, updateDesktopSettings } from '@/lib/persistence';
 import { copyTextToClipboard } from '@/lib/clipboard';
 import { restartDesktopApp } from '@/lib/desktop';
 import { cn } from '@/lib/utils';
+import { useWaitingBlink } from '@/hooks/useDurationTicker';
 import { RemoteConnectionForm } from './RemoteConnectionForm';
 import { desktopHostsGet, desktopHostsSet } from '@/lib/desktopHosts';
 import { useI18n } from '@/lib/i18n';
@@ -30,7 +31,7 @@ type ChooserScreenProps = {
 function InstallCommand({ windows, onCopy, copyTitle }: { windows: boolean; onCopy: () => void; copyTitle: string }) {
   return (
     <div className="flex items-center justify-between gap-3 w-full">
-      <code className="flex-1 min-w-0 text-left overflow-x-auto whitespace-nowrap">
+      <code className="flex-1 min-w-0 text-start overflow-x-auto whitespace-nowrap">
         {windows ? (
           <span style={{ color: 'var(--syntax-keyword)' }}>{WINDOWS_INSTALL_COMMAND}</span>
         ) : (
@@ -53,6 +54,12 @@ function InstallCommand({ windows, onCopy, copyTitle }: { windows: boolean; onCo
       </button>
     </div>
   );
+}
+
+// Its own component: the blink re-renders this dot once a second, not the whole screen.
+function WatchingDot() {
+  const blink = useWaitingBlink(true);
+  return <span className={cn('absolute inset-0 rounded-full', blink)} style={{ backgroundColor: 'var(--primary-base)' }} />;
 }
 
 export function ChooserScreen({ onCliAvailable, localAvailable = true }: ChooserScreenProps) {
@@ -300,7 +307,7 @@ export function ChooserScreen({ onCliAvailable, localAvailable = true }: Chooser
             {platform === 'windows' && (
               <div className="mb-4 rounded-lg border border-border p-4">
                 <div className="text-sm text-foreground">{t('onboarding.localSetup.windows.title')}</div>
-                <ol className="mt-2 list-decimal space-y-1 pl-5 text-sm text-muted-foreground">
+                <ol className="mt-2 list-decimal space-y-1 ps-5 text-sm text-muted-foreground">
                   <li>{t('onboarding.localSetup.windows.stepRunInstallInWsl')}</li>
                   <li>{t('onboarding.localSetup.windows.stepSetBinaryPath')}</li>
                 </ol>
@@ -324,10 +331,7 @@ export function ChooserScreen({ onCliAvailable, localAvailable = true }: Chooser
 
             <div className="app-region-no-drag mt-3 flex items-center gap-2.5 px-1" role="status" aria-live="polite">
               <span className="relative inline-flex h-2 w-2 shrink-0" aria-hidden>
-                <span
-                  className="absolute inset-0 rounded-full"
-                  style={{ backgroundColor: 'var(--primary-base)', animation: 'pulse-opacity 1.6s ease-in-out infinite' }}
-                />
+                <WatchingDot />
               </span>
               <span className="min-w-0 flex-1 text-xs text-muted-foreground">
                 <span className="text-foreground">{t('onboarding.localSetup.status.watching')}</span>
@@ -388,7 +392,7 @@ export function ChooserScreen({ onCliAvailable, localAvailable = true }: Chooser
                   <span>{t('onboarding.localSetup.troubleshoot.title')}</span>
                   <Icon name="arrow-down-s" className="h-4 w-4 transition-transform group-open:rotate-180" />
                 </summary>
-                <ul className="list-disc space-y-1.5 pb-4 pl-4 text-xs text-muted-foreground">
+                <ul className="list-disc space-y-1.5 pb-4 ps-4 text-xs text-muted-foreground">
                   {platform === 'windows' ? (
                     <li>{t('onboarding.localSetup.windows.hintDetectionFailed')}</li>
                   ) : (

@@ -1,10 +1,12 @@
 import React from 'react';
+import { AnimatePresence } from 'motion/react';
 import { ComposerFloatingPanel } from './composer/ui/ComposerFloatingPanel';
 import { Icon } from '@/components/icon/Icon';
 import { cn } from '@/lib/utils';
 import { useI18n } from '@/lib/i18n';
 import type { PermissionRequest } from '@/types/permission';
 import { useScopedBlockingPermissions } from '@/sync/sync-context';
+import { useRequestReveal } from '@/sync/request-reveal';
 import { useMobileAutocompleteMaxHeight } from './useMobileAutocompleteMaxHeight';
 import {
     PermissionActions,
@@ -30,10 +32,13 @@ interface PermissionDockProps {
     hidden: boolean;
 }
 
-export const PermissionDock: React.FC<PermissionDockProps> = ({ sessionId, directory, hidden }) => {
+const PermissionDockView: React.FC<PermissionDockProps> = ({ sessionId, directory, hidden }) => {
     const permissions = useScopedBlockingPermissions(sessionId, directory);
-    if (hidden || permissions.length === 0) return null;
-    return <PermissionDockPanel permissions={permissions} />;
+    return (
+        <AnimatePresence>
+            {hidden || permissions.length === 0 ? null : <PermissionDockPanel key="permissions" permissions={permissions} />}
+        </AnimatePresence>
+    );
 };
 
 const PermissionDockPanel: React.FC<{ permissions: PermissionRequest[] }> = ({ permissions }) => {
@@ -41,6 +46,13 @@ const PermissionDockPanel: React.FC<{ permissions: PermissionRequest[] }> = ({ p
     const [selectedId, setSelectedId] = React.useState<string | null>(null);
     const [collapsed, setCollapsed] = React.useState(false);
     const bodyRef = React.useRef<HTMLDivElement | null>(null);
+
+    // "Open session" on a request's toast expands the dock on that request.
+    const permissionIds = React.useMemo(() => permissions.map((permission) => permission.id), [permissions]);
+    useRequestReveal(permissionIds, React.useCallback((id: string) => {
+        setSelectedId(id);
+        setCollapsed(false);
+    }, []));
 
     // The chosen request stays current while it is pending; a request that
     // was answered elsewhere (another client, auto-accept) falls back to the
@@ -92,7 +104,7 @@ const PermissionDockRequest: React.FC<{
                     onClick={onToggleCollapsed}
                     aria-expanded={!collapsed}
                     aria-label={collapsed ? t('chat.permissionDock.expandAria') : t('chat.permissionDock.collapseAria')}
-                    className="flex min-w-0 flex-1 items-center gap-2 text-left text-muted-foreground transition-colors hover:text-foreground"
+                    className="flex min-w-0 flex-1 items-center gap-2 text-start text-muted-foreground transition-colors hover:text-foreground"
                 >
                     <Icon name="question" className="size-3.5 shrink-0 text-[var(--status-warning)]" />
                     <Icon name={collapsed ? 'arrow-up-s' : 'arrow-down-s'} className="size-4 shrink-0" />
@@ -156,3 +168,6 @@ const PermissionDockRequest: React.FC<{
         </ComposerFloatingPanel>
     );
 };
+
+/** Memoized: the composer re-renders on every keystroke, and nothing here depends on the draft text. */
+export const PermissionDock = React.memo(PermissionDockView);

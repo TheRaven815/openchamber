@@ -1,14 +1,9 @@
 import React from 'react';
-import type { FormField, FormValue, IntegrationOAuthMethod } from '@opencode/client';
+import type { FormField, FormValue } from '@opencode/client';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { toast } from '@/components/ui';
-import { Icon } from '@/components/icon/Icon';
-import {
-  SETTINGS_SELECT_ROW_TRIGGER_CLASS,
-  SETTINGS_SELECT_SIZE,
-} from '@/components/sections/shared/SettingsSection';
+import { Spinner } from '@/components/ui/spinner';
 import { useI18n, type I18nKey } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
 import { copyTextToClipboard } from '@/lib/clipboard';
@@ -23,14 +18,15 @@ import {
   firstUnansweredField,
   isAnswerableField,
   shouldOpenAuthorizationUrl,
-  visibleFields,
   type OAuthAttempt,
 } from './provider-oauth';
+import { ProviderFormFields } from './ProviderFormFields';
+import type { SignInMethod } from './providerAuth';
 
 interface ProviderOAuthMethodsProps {
   /** The integration that owns these methods; it shares the provider's id. */
   integrationId: string;
-  methods: IntegrationOAuthMethod[];
+  methods: SignInMethod[];
   /** Called once a credential has been stored, so the caller can reload providers. */
   onConnected: () => void | Promise<void>;
   /**
@@ -41,6 +37,10 @@ interface ProviderOAuthMethodsProps {
   directory?: string | null;
   /** Layout only — the caller owns separation from whatever sits above. */
   className?: string;
+  /** Start the only sign-in method on mount, for a sign-in the user just asked for elsewhere. */
+  autoStart?: boolean;
+  /** Off when a surrounding card already names the method. */
+  showMethodLabels?: boolean;
 }
 
 type Flow =
@@ -59,11 +59,15 @@ const IDLE: Flow = { phase: 'idle' };
 const STATUS_POLL_INTERVAL_MS = 1500;
 
 /**
- * OAuth sign-in for a provider's integration methods.
+ * Sign-in for a provider's OAuth and external-credential methods.
  *
- * The mode reported by `integration.oauth.connect` drives everything: `auto`
- * polls `integration.oauth.status` until the attempt completes, `code` collects
- * a pasted code and calls `integration.oauth.complete`. See `provider-oauth.ts`.
+ * For OAuth, the mode reported by `integration.oauth.connect` drives
+ * everything: `auto` polls `integration.oauth.status` until the attempt
+ * completes, `code` collects a pasted code and calls
+ * `integration.oauth.complete`. See `provider-oauth.ts`. An external method
+ * (an Azure CLI login, an AWS profile) only needs its form answered:
+ * `integration.connect.external` stores a reference to credentials managed
+ * outside OpenCode, so there is no attempt to follow.
  *
  * Only one method can run at a time, and an abandoned attempt is cancelled
  * upstream on unmount so it cannot linger until it expires. Mount this with
@@ -75,6 +79,8 @@ export const ProviderOAuthMethods: React.FC<ProviderOAuthMethodsProps> = ({
   onConnected,
   directory,
   className,
+  autoStart = false,
+  showMethodLabels = true,
 }) => {
   const { t } = useI18n();
   const sdk = React.useCallback(
@@ -114,10 +120,10 @@ export const ProviderOAuthMethods: React.FC<ProviderOAuthMethodsProps> = ({
     toast.error(t(failureKey));
   };
 
-  const succeed = async () => {
+  const succeed = async (successKey: I18nKey = 'settings.providers.page.toast.oauthCompleted') => {
     activeAttemptRef.current = null;
     setFlow(IDLE);
-    toast.success(t('settings.providers.page.toast.oauthCompleted'));
+    toast.success(t(successKey));
     await onConnected();
   };
 
@@ -158,7 +164,27 @@ export const ProviderOAuthMethods: React.FC<ProviderOAuthMethodsProps> = ({
     }
   };
 
-  const runConnect = async (method: IntegrationOAuthMethod, answer: Record<string, FormValue>) => {
+  const runExternalConnect = async (methodID: string, answer: Record<string, FormValue>) => {
+    setFlow({ phase: 'connecting', methodID });
+    try {
+      // OpenCode refuses an answer for a method without a form, even an empty one.
+      await sdk().integration.connect.external({
+        integrationID: integrationId,
+        methodID,
+        answer: Object.keys(answer).length > 0 ? answer : undefined,
+      });
+    } catch (error) {
+      fail(methodID, error, 'settings.providers.page.toast.externalConnectFailed');
+      return;
+    }
+    await succeed('settings.providers.page.toast.externalConnected');
+  };
+
+  const runConnect = async (method: SignInMethod, answer: Record<string, FormValue>) => {
+    if (method.type === 'external') {
+      await runExternalConnect(method.id, answer);
+      return;
+    }
     setFlow({ phase: 'connecting', methodID: method.id });
 
     let attempt: OAuthAttempt;
@@ -193,7 +219,7 @@ export const ProviderOAuthMethods: React.FC<ProviderOAuthMethodsProps> = ({
     await pollAttempt(method.id, attempt.attemptID);
   };
 
-  const beginConnect = (method: IntegrationOAuthMethod) => {
+  const beginConnect = (method: SignInMethod) => {
     const fields = (method.form ?? []).filter(isAnswerableField);
     if (fields.length === 0) {
       void runConnect(method, {});
@@ -203,7 +229,16 @@ export const ProviderOAuthMethods: React.FC<ProviderOAuthMethodsProps> = ({
     setFlow({ phase: 'prompting', methodID: method.id, fields, error: null });
   };
 
-  const submitFields = (method: IntegrationOAuthMethod) => {
+  const autoStartedRef = React.useRef(false);
+  React.useEffect(() => {
+    if (!autoStart || autoStartedRef.current || methods.length !== 1) return;
+    autoStartedRef.current = true;
+    beginConnect(methods[0]);
+    // Once per mount: a later render must not restart a sign-in the user cancelled.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoStart, methods]);
+
+  const submitFields = (method: SignInMethod) => {
     if (flow.phase !== 'prompting') {
       return;
     }
@@ -246,70 +281,6 @@ export const ProviderOAuthMethods: React.FC<ProviderOAuthMethodsProps> = ({
       cancelAttempt(flow.attempt.attemptID);
     }
     setFlow(IDLE);
-  };
-
-  const renderField = (field: FormField) => {
-    if (field.type === 'external') {
-      return (
-        <div key={field.key} className="space-y-1.5">
-          <label className="typography-ui-label text-foreground">{fieldLabel(field)}</label>
-          <Button
-            variant="outline"
-            size="xs"
-            className="!font-normal"
-            onClick={() => void openExternalUrl(field.url)}
-          >
-            {t('settings.providers.page.actions.open')}
-          </Button>
-        </div>
-      );
-    }
-
-    const raw = fieldValues[field.key];
-    const value = typeof raw === 'string' ? raw : '';
-    const setValue = (next: FormValue) =>
-      setFieldValues((prev) => ({ ...prev, [field.key]: next }));
-
-    const options = field.type === 'string' || field.type === 'multiselect' ? field.options ?? [] : [];
-
-    return (
-      <div key={field.key} className="space-y-1.5">
-        <label className="typography-ui-label text-foreground">{fieldLabel(field)}</label>
-        {field.description && (
-          <p className="typography-meta text-muted-foreground">{field.description}</p>
-        )}
-        {options.length > 0 ? (
-          <Select value={value} onValueChange={setValue}>
-            <SelectTrigger size={SETTINGS_SELECT_SIZE} className={SETTINGS_SELECT_ROW_TRIGGER_CLASS}>
-              <SelectValue>
-                {(current) => options.find((option) => option.value === current)?.label ?? null}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              {options.map((option) => (
-                <SelectItem key={option.value} value={option.value}>
-                  {option.description ? `${option.label} · ${option.description}` : option.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        ) : field.type === 'boolean' ? (
-          <input
-            type="checkbox"
-            checked={raw === true}
-            onChange={(event) => setValue(event.target.checked)}
-            aria-label={fieldLabel(field)}
-          />
-        ) : (
-          <Input
-            value={value}
-            onChange={(event) => setValue(event.target.value)}
-            placeholder={field.type === 'string' ? field.placeholder : undefined}
-            className="max-w-[24rem] text-xs"
-          />
-        )}
-      </div>
-    );
   };
 
   const renderAttemptDetails = (attempt: OAuthAttempt) => {
@@ -389,7 +360,7 @@ export const ProviderOAuthMethods: React.FC<ProviderOAuthMethodsProps> = ({
         return (
           <div key={method.id} className="space-y-3">
             <div className="flex items-center justify-between gap-2">
-              <div className="typography-ui-label text-foreground">{method.label}</div>
+              {showMethodLabels ? <div className="typography-ui-label text-foreground">{method.label}</div> : null}
               <Button
                 variant="outline"
                 size="xs"
@@ -403,7 +374,11 @@ export const ProviderOAuthMethods: React.FC<ProviderOAuthMethodsProps> = ({
 
             {isActive && flow.phase === 'prompting' && (
               <div className="space-y-3">
-                {visibleFields(flow.fields, fieldValues).map(renderField)}
+                <ProviderFormFields
+                  fields={flow.fields}
+                  values={fieldValues}
+                  onChange={(key, value) => setFieldValues((prev) => ({ ...prev, [key]: value }))}
+                />
                 {flow.error && (
                   <p className="typography-meta text-[var(--status-error)]">{flow.error}</p>
                 )}
@@ -420,8 +395,10 @@ export const ProviderOAuthMethods: React.FC<ProviderOAuthMethodsProps> = ({
 
             {isActive && flow.phase === 'connecting' && (
               <p className="typography-meta text-muted-foreground flex items-center gap-2">
-                <Icon name="loader" className="h-3.5 w-3.5 animate-spin" />
-                {t('settings.providers.page.auth.oauth.starting')}
+                <Spinner className="h-3.5 w-3.5" />
+                {method.type === 'external'
+                  ? t('settings.providers.page.auth.external.connecting')
+                  : t('settings.providers.page.auth.oauth.starting')}
               </p>
             )}
 
@@ -430,7 +407,7 @@ export const ProviderOAuthMethods: React.FC<ProviderOAuthMethodsProps> = ({
                 {renderAttemptDetails(flow.attempt)}
                 <div className="flex items-center justify-between gap-2">
                   <p className="typography-meta text-muted-foreground flex items-center gap-2">
-                    <Icon name="loader" className="h-3.5 w-3.5 animate-spin" />
+                    <Spinner className="h-3.5 w-3.5" />
                     {t('settings.providers.page.auth.oauth.waiting')}
                   </p>
                   <Button variant="ghost" size="xs" className="!font-normal shrink-0" onClick={cancel}>

@@ -78,7 +78,7 @@ export const createPushRuntime = (deps) => {
   };
 
   const persistPushSubscriptionUpdate = async (mutate) => {
-    persistPushSubscriptionsLock = persistPushSubscriptionsLock.then(async () => {
+    const result = persistPushSubscriptionsLock.then(async () => {
       await fsPromises.mkdir(path.dirname(PUSH_SUBSCRIPTIONS_FILE_PATH), { recursive: true });
       const current = await readPushSubscriptionsFromDisk();
       const next = mutate({
@@ -88,8 +88,10 @@ export const createPushRuntime = (deps) => {
       await writePushSubscriptionsToDisk(next);
       return next;
     });
-
-    return persistPushSubscriptionsLock;
+    // A failed write (a full disk) rejects only its own caller; the next
+    // subscription still writes instead of replaying that error until a restart.
+    persistPushSubscriptionsLock = result.catch(() => {});
+    return result;
   };
 
   const getOrCreateVapidKeys = async () => {

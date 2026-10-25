@@ -1,7 +1,7 @@
 // Tunnel mux frame codec (Layer 3 of the protocol spec). Pure functions, no I/O.
 // Frame layout: [1 byte frameType (high bit = fragment-continues)][4 byte BE streamId][payload].
 // Client-initiated streams use odd streamIds starting at 1; even ids are reserved.
-// Spec: .opencode/plans/private-relay/01-protocol-spec.md (Layer 3).
+// Spec: packages/web/server/lib/relay/DOCUMENTATION.md (Layer 3).
 
 import {
   BATCH_CONTAINER_TAG_BATCH,
@@ -266,10 +266,10 @@ const BUFFERED_FRAME_TYPES = new Set<number>([
 // 150ms batch window is invisible to users while cutting DO messages ~33% more than 100ms.
 // Leading-edge flush keeps time-to-first-token and terminal echo instant regardless of this value.
 export const DEFAULT_BATCH_WINDOW_MS = 150;
-export const DEFAULT_BATCH_MAX_BYTES = 24 * 1024;
-export const DEFAULT_BATCH_MAX_FRAMES = 32;
+const DEFAULT_BATCH_MAX_BYTES = 24 * 1024;
+const DEFAULT_BATCH_MAX_FRAMES = 32;
 
-export interface OutboundFrameBatcherOptions {
+interface OutboundFrameBatcherOptions {
   /** Trailing flush window in ms. Buffered frames flush no later than this. */
   windowMs?: number;
   maxBatchBytes?: number;

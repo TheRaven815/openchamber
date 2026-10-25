@@ -75,6 +75,7 @@ describe('openchamber events', () => {
       openWebSocket() { throw new Error('SSE must not open a socket'); },
       getStatus: () => ({ state: 'connected' }),
       subscribeStatus: () => () => undefined,
+      retry: () => undefined,
       close: () => undefined,
     };
     adoptRelayTunnel({ relayUrl: 'wss://relay.test', serverId: 'fixture', hostEncPubJwk: {} }, tunnel);
@@ -205,6 +206,82 @@ describe('openchamber events', () => {
     }
   });
 
+  test('the control SSE stream carries permission modes and requests left for the user, and rereads the modes on connect and when a space reconnects', async () => {
+    // The permission store's imports read localStorage once a window exists.
+    const storage = new Map<string, string>();
+    Object.defineProperty(globalThis, 'localStorage', {
+      value: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) },
+      configurable: true,
+    });
+    const { subscribePermissionPolicySync } = await import('@/sync/permission-mode-sync');
+    const { getRuntimeKey } = await import('./runtime-switch');
+    const { usePermissionStore } = await import('@/stores/permissionStore');
+    const waitFor = async (done: () => boolean) => {
+      for (let i = 0; i < 50 && !done(); i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(done()).toBe(true);
+    };
+    usePermissionStore.getState().reset();
+    const originalFetch = globalThis.fetch;
+    let reads = 0;
+    const spaceReads: string[] = [];
+    globalThis.fetch = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), 'http://runtime.test');
+      if (url.pathname !== '/api/permission-auto-accept') return new Response(null, { status: 404 });
+      const directory = new Headers(input instanceof Request ? input.headers : init?.headers).get('x-opencode-directory');
+      if (directory) {
+        spaceReads.push(decodeURIComponent(directory));
+        return Response.json({ sessions: {}, modes: {}, revision: 1 });
+      }
+      reads += 1;
+      return Response.json({ sessions: { ses_1: true }, modes: { ses_1: 'auto' }, revision: 1 });
+    }, originalFetch);
+    const applied: Array<{ type: string; permissionId?: string }> = [];
+    const unsubscribe = subscribePermissionPolicySync(getRuntimeKey(), (event) => {
+      applied.push(event.type === 'openchamber.permission-left-for-user'
+        ? { type: event.type, permissionId: event.properties.permissionId }
+        : { type: event.type });
+      if (event.type === 'openchamber.permission-auto-accept') {
+        usePermissionStore.getState().applySnapshot({ modes: event.properties.modes ?? {}, revision: event.properties.revision });
+      }
+    });
+    const source = MockEventSource.instances[0];
+    const send = (data: string) => source.onmessage?.({ data });
+    try {
+      send(JSON.stringify({ type: 'openchamber:event-stream-ready', properties: {} }));
+      await waitFor(() => usePermissionStore.getState().getSessionMode('ses_1') === 'auto');
+      expect(reads).toBe(1);
+
+      // Another window switched the session to Ask.
+      send(JSON.stringify({ type: 'openchamber:permission-auto-accept.updated', properties: { sessions: { ses_1: false }, modes: { ses_1: 'ask' }, revision: 2 } }));
+      expect(usePermissionStore.getState().getSessionMode('ses_1')).toBe('ask');
+
+      send(JSON.stringify({ type: 'openchamber:permission-auto-accept.left-for-user', properties: { permissionId: 'per_1', sessionId: 'ses_1', directory: '/repo' } }));
+      send(JSON.stringify({ type: 'openchamber:permission-auto-accept.left-for-user', properties: { sessionId: 'ses_1', directory: '/repo' } }));
+      expect(applied).toEqual([
+        { type: 'openchamber.permission-auto-accept' },
+        { type: 'openchamber.permission-left-for-user', permissionId: 'per_1' },
+      ]);
+
+      // A reconnect reads the modes again: a change made during the gap was never announced here.
+      send(JSON.stringify({ type: 'openchamber:event-stream-ready', properties: {} }));
+      await waitFor(() => reads === 2);
+
+      // The host follows a space's modes again: that space's modes are read from it.
+      send(JSON.stringify({ type: 'openchamber:space-permission-stream', properties: { spaceId: '0123456789ab', status: 'connected' } }));
+      await waitFor(() => spaceReads.length === 1);
+      expect(spaceReads).toEqual(['/spaces/0123456789ab']);
+
+      unsubscribe();
+      send(JSON.stringify({ type: 'openchamber:permission-auto-accept.left-for-user', properties: { permissionId: 'per_2', sessionId: 'ses_1', directory: '/repo' } }));
+      expect(applied).toHaveLength(2);
+    } finally {
+      unsubscribe();
+      globalThis.fetch = originalFetch;
+      usePermissionStore.getState().reset();
+      Reflect.deleteProperty(globalThis, 'localStorage');
+    }
+  });
+
   test('an expired session stops the stream from reconnecting until the user logs in', async () => {
     const { useAuthSessionStore } = await import('./runtime-auth-expiry');
     const { subscribeOpenchamberEvents } = await import('./openchamberEvents');
@@ -268,6 +345,42 @@ describe('openchamber events', () => {
     unsubscribe();
   });
 
+  test('dispatches a project-context invalidation only with a valid owner id', async () => {
+    const { subscribeOpenchamberEvents } = await import('./openchamberEvents');
+    const owners: string[] = [];
+    const unsubscribe = subscribeOpenchamberEvents((event) => {
+      if (event.type === 'project-context-changed') owners.push(event.projectId);
+    });
+    try {
+      for (const properties of [{ projectId: 'path_chats' }, {}, { projectId: '' }, { projectId: 42 }]) {
+        MockEventSource.instances[0].onmessage?.({
+          data: JSON.stringify({ type: 'openchamber:project-context-changed', properties }),
+        });
+      }
+      expect(owners).toEqual(['path_chats']);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  test('dispatches a chat-folder change only with its stored revision', async () => {
+    const { subscribeOpenchamberEvents } = await import('./openchamberEvents');
+    const revisions: number[] = [];
+    const unsubscribe = subscribeOpenchamberEvents((event) => {
+      if (event.type === 'session-folders-changed') revisions.push(event.updatedAt);
+    });
+    try {
+      for (const properties of [{ updatedAt: 42 }, {}, { updatedAt: 'later' }]) {
+        MockEventSource.instances[0].onmessage?.({
+          data: JSON.stringify({ type: 'openchamber:session-folders-changed', properties }),
+        });
+      }
+      expect(revisions).toEqual([42]);
+    } finally {
+      unsubscribe();
+    }
+  });
+
   test('dispatches an agent file-open request and drops one without a path', async () => {
     const { subscribeOpenchamberEvents } = await import('./openchamberEvents');
     const events: unknown[] = [];
@@ -289,6 +402,31 @@ describe('openchamber events', () => {
 
     expect(events).toEqual([
       { type: 'file-open-request', path: '/repo/out/report.csv', directory: '/repo', sessionId: null },
+    ]);
+    unsubscribe();
+  });
+
+  test('dispatches an agent plan-open request and drops one without a plan id', async () => {
+    const { subscribeOpenchamberEvents } = await import('./openchamberEvents');
+    const events: unknown[] = [];
+    const unsubscribe = subscribeOpenchamberEvents((event) => events.push(event));
+    const source = MockEventSource.instances[0];
+
+    source.onmessage?.({
+      data: JSON.stringify({
+        type: 'openchamber:plan-open-request',
+        properties: { projectId: 'path_repo', planId: 'p1', title: 'Plan', directory: '/repo', sessionId: 'ses_1' },
+      }),
+    });
+    source.onmessage?.({
+      data: JSON.stringify({
+        type: 'openchamber:plan-open-request',
+        properties: { projectId: 'path_repo', title: 'Plan', directory: '/repo', sessionId: null },
+      }),
+    });
+
+    expect(events).toEqual([
+      { type: 'plan-open-request', projectId: 'path_repo', planId: 'p1', title: 'Plan', directory: '/repo', sessionId: 'ses_1' },
     ]);
     unsubscribe();
   });

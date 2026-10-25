@@ -1,9 +1,11 @@
+import { isPlainObject, isString } from '../shared/guards.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import { constants as fsConstants } from 'node:fs';
 import { withSourceControlFileLock } from '../source-control/file-lock.js';
+import { isLoopbackHost } from './loopback-http.js';
 
 const VERSION = 1;
 const DEFAULT_MAX_RECORDS = 256;
@@ -20,11 +22,11 @@ const ERROR_CODES = new Set([
   'INVALID_REQUEST', 'NOT_FOUND', 'STALE_REPOSITORY', 'STALE_BINDING', 'STALE_CONFIG',
   'REMOTE_CHANGED', 'AUTHENTICATION_REQUIRED', 'AUTHENTICATION_FAILED', 'TRANSPORT_FAILED',
   'CONFLICT', 'CANCELLED', 'TIMEOUT', 'OUTCOME_UNKNOWN', 'RUNTIME_UNSUPPORTED', 'UNKNOWN',
-  'GIT_LFS_CLIENT_MISSING',
+  'GIT_LFS_CLIENT_MISSING', 'CHECKOUT_TOO_LARGE',
 ]);
 const FAILURE_ERROR_CODES = new Set([
   'INVALID_REQUEST', 'AUTHENTICATION_REQUIRED', 'AUTHENTICATION_FAILED', 'TRANSPORT_FAILED',
-  'RUNTIME_UNSUPPORTED', 'GIT_LFS_CLIENT_MISSING', 'UNKNOWN',
+  'RUNTIME_UNSUPPORTED', 'GIT_LFS_CLIENT_MISSING', 'CHECKOUT_TOO_LARGE', 'UNKNOWN',
 ]);
 const STATE_ERROR_CODES = Object.freeze({
   partial: FAILURE_ERROR_CODES,
@@ -54,12 +56,9 @@ const SAFE_ERROR_MESSAGES = Object.freeze({
   RUNTIME_UNSUPPORTED: 'Git operation is unsupported by this runtime',
   UNKNOWN: 'Git operation failed; inspect repository state before retrying',
   GIT_LFS_CLIENT_MISSING: 'Git LFS is required but unavailable',
+  CHECKOUT_TOO_LARGE: 'Checkout has too many files to inspect',
 });
 
-const isPlainObject = (value) => value === Object(value)
-  && !Array.isArray(value)
-  && Object.getPrototypeOf(value) === Object.prototype;
-const isString = (value) => Object.prototype.toString.call(value) === '[object String]';
 const exactKeys = (value, required, optional = []) => {
   const keys = Object.keys(value);
   return required.every((key) => keys.includes(key))
@@ -94,7 +93,9 @@ const isSafeDisplayEndpoint = (value) => {
   try {
     const endpoint = new URL(value);
     const pathname = decodeURIComponent(endpoint.pathname);
-    return ['https:', 'ssh:'].includes(endpoint.protocol)
+    // Plain HTTP only to this machine (a provider's loopback development
+    // instance); the planner decided it may be reached.
+    return (['https:', 'ssh:'].includes(endpoint.protocol) || (endpoint.protocol === 'http:' && isLoopbackHost(endpoint.hostname)))
       && !endpoint.username && !endpoint.password && !endpoint.search && !endpoint.hash
       && Boolean(endpoint.hostname && endpoint.pathname && endpoint.pathname !== '/')
       && !/[\0-\x20\x7f\\]/.test(pathname)

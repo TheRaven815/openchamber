@@ -48,6 +48,12 @@ describe('settings registry', () => {
       useUIStore.setState(original, true);
     }
   });
+  test('round-trips the small model thinking variant', () => {
+    expect(parseSettingsDocument({ smallModelVariant: 'high' })).toEqual({ smallModelVariant: 'high' });
+    expect(parseSettingsDocument({ smallModelVariant: '' })).toEqual({});
+    expect(parseSettingsDocument({ smallModelVariant: 3 })).toEqual({});
+  });
+
   test('accepts only interface languages the UI ships', () => {
     expect(parseSettingsDocument({ locale: 'zh-CN' })).toEqual({ locale: 'zh-CN' });
     expect(parseSettingsDocument({ locale: 'xx' })).toEqual({});
@@ -166,6 +172,17 @@ describe('settings registry', () => {
     });
     expect(parseSettingsDocument(null)).toBeNull();
     expect(parseSettingsDocument([])).toBeNull();
+  });
+
+  test('reads the removed Sorted chat mode as collapsed activity until the user picks a mode', () => {
+    expect(parseSettingsDocument({ chatRenderMode: 'sorted', activityRenderMode: 'summary' }))
+      .toEqual({ chatRenderMode: 'sorted', activityRenderMode: 'collapsed' });
+    expect(parseSettingsDocument({ chatRenderMode: 'sorted' }))
+      .toEqual({ chatRenderMode: 'sorted', activityRenderMode: 'collapsed' });
+    // Picking a mode in Settings writes chatRenderMode 'live' along with it.
+    expect(parseSettingsDocument({ chatRenderMode: 'live', activityRenderMode: 'summary' }))
+      .toEqual({ chatRenderMode: 'live', activityRenderMode: 'summary' });
+    expect(parseSettingsDocument({ activityRenderMode: 'summary' })).toEqual({ activityRenderMode: 'summary' });
   });
 
   test('applies only the fields a snapshot carries and leaves the rest alone', () => {

@@ -28,7 +28,7 @@ jobs:
       targets: ${{ steps.collect.outputs.targets }}
     steps:
       - id: collect
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             if (context.eventName === "pull_request_target") {
@@ -79,7 +79,7 @@ jobs:
     steps:
       - name: Generate bot app token
         id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ secrets.OC_REVIEW_APP_ID }}
           private-key: ${{ secrets.OC_REVIEW_APP_PRIVATE_KEY }}
@@ -92,7 +92,7 @@ jobs:
           fetch-depth: 0
 
       - name: Sync labels and parking comment
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PR_NUMBER: ${{ matrix.target.number }}
           # A push to main touching this workflow relabels every open PR.
@@ -111,12 +111,12 @@ jobs:
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
 
             const sizeLabels = [
-              { name: "size:XS", color: "0e8a16", description: "Under 10 changed lines (tests, lockfiles, translations and evidence images excluded)." },
-              { name: "size:S", color: "5ebd3e", description: "10-29 changed lines (tests, lockfiles, translations and evidence images excluded)." },
-              { name: "size:M", color: "fbca04", description: "30-99 changed lines (tests, lockfiles, translations and evidence images excluded)." },
-              { name: "size:L", color: "fe7d37", description: "100-499 changed lines (tests, lockfiles, translations and evidence images excluded)." },
-              { name: "size:XL", color: "d93f0b", description: "500-999 changed lines (tests, lockfiles, translations and evidence images excluded)." },
-              { name: "size:XXL", color: "b60205", description: "1,000+ changed lines (tests, lockfiles, translations and evidence images excluded)." },
+              { name: "size:XS", color: "0e8a16", description: "Under 10 changed lines (tests, lockfiles and translations excluded)." },
+              { name: "size:S", color: "5ebd3e", description: "10-29 changed lines (tests, lockfiles and translations excluded)." },
+              { name: "size:M", color: "fbca04", description: "30-99 changed lines (tests, lockfiles and translations excluded)." },
+              { name: "size:L", color: "fe7d37", description: "100-499 changed lines (tests, lockfiles and translations excluded)." },
+              { name: "size:XL", color: "d93f0b", description: "500-999 changed lines (tests, lockfiles and translations excluded)." },
+              { name: "size:XXL", color: "b60205", description: "1,000+ changed lines (tests, lockfiles and translations excluded)." },
             ];
             const discussionLabel = {
               name: "needs-discussion",
@@ -155,7 +155,6 @@ jobs:
               ":(glob,exclude)**/package-lock.json",
               ":(glob,exclude)**/pnpm-lock.yaml",
               ":(glob,exclude)packages/ui/src/lib/i18n/messages/**",
-              ":(glob,exclude).github/pr-evidence/**",
             ];
             const sumNumstat = (text) =>
               text
@@ -250,7 +249,7 @@ jobs:
                 issue_number: number,
                 body: [
                   marker,
-                  `Thanks for the PR. This one is large (${sizeLabel.replace("size:", "")}, about ${effectiveLines} changed lines after excluding tests, lockfiles, translation catalogs and evidence images), so I'm parking it with \`needs-discussion\` rather than reviewing it as-is.`,
+                  `Thanks for the PR. This one is large (${sizeLabel.replace("size:", "")}, about ${effectiveLines} changed lines after excluding tests, lockfiles and translation catalogs), so I'm parking it with \`needs-discussion\` rather than reviewing it as-is.`,
                   "",
                   "A change this size almost always carries a product decision, and that's easier to settle in words than inside a diff. Even when it doesn't change where the product is going, this many touched files changes how it behaves in places nobody asked about, so the question is still whether we want this change at all, and in this shape. Please open an [Ideas discussion](https://github.com/openchamber/openchamber/discussions/categories/ideas) describing what changes for the user and why, then add the link to this PR's description. The label comes off on the next push or edit.",
                   "",
@@ -259,6 +258,37 @@ jobs:
                   "Nothing closes automatically because of this label. The usual stale rule still applies: 28 days without activity marks the PR stale, 7 more days closes it.",
                 ].join("\n"),
               });
+            }
+
+            // Evidence (screenshots, recordings, request logs) belongs in the PR
+            // description, where GitHub hosts it. Committed, it would ship in every
+            // clone forever. Said once per PR.
+            const evidenceMarker = "<!-- pr-intake:evidence-files -->";
+            const addedFiles = execFileSync("git", ["diff", "--name-only", "--diff-filter=A", `${pr.base.sha}...${headSha}`], { encoding: "utf8" })
+              .split("\n")
+              .filter(Boolean);
+            const evidenceFiles = addedFiles.filter((file) => file.split("/").some((segment) => segment === "evidence" || segment === "pr-evidence"));
+            if (evidenceFiles.length > 0 && process.env.POST_COMMENTS === "true") {
+              const existing = comments.length > 0
+                ? comments
+                : await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: number, per_page: 100 });
+              if (!existing.some((comment) => (comment.body ?? "").includes(evidenceMarker))) {
+                const listed = evidenceFiles.slice(0, 10).map((file) => `- \`${file}\``);
+                if (evidenceFiles.length > 10) listed.push(`- and ${evidenceFiles.length - 10} more`);
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: number,
+                  body: [
+                    evidenceMarker,
+                    "This PR adds evidence files to the repository:",
+                    "",
+                    ...listed,
+                    "",
+                    "Screenshots, recordings and logs go in the PR description instead (drag them into the editor and GitHub hosts them). Please drop these files from the branch; committed, they ship in every clone of the repo.",
+                  ].join("\n"),
+                });
+              }
             }
 
             core.info(`PR #${number}: team=${isTeam}; ${effectiveLines} counted lines (${totalLines} total) -> ${sizeLabel}; needs-discussion=${needsDiscussion}`);

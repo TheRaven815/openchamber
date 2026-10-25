@@ -1,6 +1,6 @@
 ---
 name: performance-engineering
-description: Use when implementing or reviewing code on interaction, render, event, polling, synchronization, list-processing, store-selector, cache, indexing, or high-volume data paths; when users report lag, freezes, jank, high CPU, memory growth, slow startup, or performance regressions; and before accepting memoization or caching as a fix for repeated work.
+description: Use when measuring, profiling, or comparing performance; when implementing or reviewing code on startup, interaction, render, scroll, event, polling, synchronization, list-processing, store-selector, cache, indexing, or high-volume data paths; when users report lag, freezes, jank, high CPU, memory growth, slow startup, or performance regressions; and before accepting memoization or caching as a fix for repeated work.
 ---
 
 # Performance Engineering
@@ -49,12 +49,27 @@ exactly the same thing. `RunTask` only appears under the disabled-by-default
 timeline category; a scenario opened for the wrong directory renders nothing at
 all. Before believing a quiet result, confirm the instrument fired and the
 workload actually ran: assert on an independent signal, such as DOM growth
-alongside the application's own render counters.
+alongside the application's own render counters. A positive control proves it
+outright: inject the effect the metric should catch (a 60 px shift through
+`profile:switch --inject-script`) and confirm the metric reads it.
+
+**Prove the probe ends where the user's wait ends.** A probe that fires on an
+earlier moment reports a wait nobody has: "mounted" that fires when the HTML
+splash parses, "content" that fires while the transcript is still invisible
+behind a reveal hold. Check each end condition once against a screenshot or a
+frame trace of the moment the user can act.
 
 **Prove the workload is comparable.** When the stimulus varies in size between
 runs, per-second and total figures are not comparable. Normalise by units of
 work delivered, and check run-to-run spread on an unchanged build before
-attributing any difference to a change.
+attributing any difference to a change. The same build drifts between
+sessions (one fixture read 13% and 9% main-thread busy hours apart), so run
+the before and after back to back, interleaved when the delta is small.
+
+**Prove the claim on the hardware it is about.** Headless Chrome composites on
+a software GPU: a mask swap cut GPU time 39% headless and nothing headed. Confirm
+GPU and compositor claims with headed, uninstrumented runs
+(`scripts/perf/DOCUMENTATION.md`, "Process CPU is the figure a user reports").
 
 Do not report a number whose validity you have not established. State which
 validity checks ran.
@@ -68,6 +83,20 @@ validity checks ran.
 - Capture a baseline before changing code.
 
 Do not infer a bottleneck from code appearance when a trace or counter can identify it.
+
+**Attribute before you fix.** Measure absolute numbers on the minified
+production build and attribute on a diagnostic build of the same tree with
+readable names and source maps. Count renders per component from a React
+commit hook injected before app code, and record whether each render changed
+the DOM: a component that re-renders with zero mutations is pure waste. Then
+ablate: switch one suspect off in the page and re-measure (the tooling for
+each step is under "Attribution" in `scripts/perf/DOCUMENTATION.md`). A suspect that does
+not move the number when disabled is not the cause, however busy it looks
+(promoting a spinner to its own layer with `will-change`, `translateZ` or
+`contain` changed no CPU figure). Rank the
+findings by measured share of the budget, and keep "clearly wasteful" apart
+from "intentional but expensive", which is the owner's call (Know When To
+Stop).
 
 Treat every proposed optimization as a hypothesis. Memoization, caches, indexes, workers, scheduling, retries, and lifecycle machinery must address an observed cost or failure in the measured path; “could be slow” or “might race” is not evidence. Keep only the smallest mechanism that meets the contract, except where an inherent security, data-loss, destructive-operation, or concurrency invariant requires proactive protection.
 
@@ -137,6 +166,18 @@ Track completeness at the smallest destructive scope. One failed project/entity 
 
 Do not jump to a worker to hide avoidable work. Do not add a global store when a local shared index has the correct lifetime.
 
+### 5. Retest What Depended On The Old Timing
+
+An optimization that changes when something happens (the UI shows earlier, a
+hold is removed, the first frame already has its final geometry) also removes
+the cover that hid latent races. Showing the shell before OpenCode answered
+surfaced a first-run dialog over the composer, a draft flashing before the
+restored session, and bootstraps that failed during startup and never re-ran;
+a first paint with stable geometry let LegendList run its DOM-order pass inside
+the reveal. After any timing change, walk the flows that relied on the old
+order: first visit with empty storage, cold start before the backend is ready,
+restore and revert, and session open, each with a frame trace or in the app.
+
 ## Structural Pattern
 
 Replace repeated questions with maintained answers:
@@ -186,6 +227,8 @@ Before virtualizing a collection, define:
 - initialization, remount, and activation-threshold behavior;
 - interactions that depend on mounted DOM, including incremental reveal, focus, selection, drag-and-drop, menus, and accessibility traversal.
 
+Lists here use `@tanstack/react-virtual`; the chat transcript uses LegendList (`components/chat/lib/scroll/DOCUMENTATION.md`). Known traps: a virtualizer enabled before its scroll element exists caches offset 0 and scrolls the scroller to the top on attach, so enable it only once the element is known; row margins collapse in plain flow but not across virtual wrappers, so spacing doubles when virtualization kicks in; `getVirtualItems()[0]` is the overscan boundary, not the first visible row; a scroller hosting a virtualizer sets `overflow-anchor: none`. `bun-patches/@tanstack+virtual-core+*.patch` clamps the render range to real scroll bounds inside a shared scroller: carry it over when bumping the dependency.
+
 When activation is threshold-based, test threshold minus one, threshold, and threshold plus one. Also test applicable collapsed/expanded, hidden/visible, filtered/unfiltered, and short/long transitions. If the current DOM or scroll topology cannot expose the virtual tail reliably, correct that topology or retain normal rendering rather than virtualizing solely by item count.
 
 ## Caching Rules
@@ -203,6 +246,64 @@ Do not introduce a cache merely to make an abstraction reusable or prepare for f
 
 A cache inside an `O(consumers × entities × candidates)` loop is a mitigation, not automatically a complete fix.
 
+## Known Costs In This Codebase
+
+- **On-demand surfaces load through `useOnDemandComponent`** (`hooks/useOnDemandComponent.ts`): import first, then render. A `React.lazy` component behind `Suspense` holds its real content at least 300 ms after the fallback shows (React's fallback throttle), whatever the CPU.
+- **A whole-UI freeze with a fast server and no event-loop lag is browser connection-pool starvation.** Server timing starts when Express receives a request; the browser's queue is invisible there. Background fan-out goes through the `lib/background-network.ts` gate (a cap, not `priority: 'low'`, which changes nothing), and slow third-party reads get a cap and a timeout.
+- **Freshness comes from signals, never idle traffic.** Relay bytes are paid, so nothing polls or streams while nothing happens: refresh from events the client already gets (agent tool calls, git status, own operations), only for what is visible, batched (the Files tree re-lists at most once per 2 s per surface and never auto-re-lists a folder whose last listing had over 1000 entries).
+- **An inherited custom property on a transcript ancestor restyles the whole transcript.** Writing `--scroll-shadow-*` or `--chat-composer-*` on the chat column or scroller restyled ~47k elements (45 to 90 ms) at every reply start/end and composer line, and `--oc-titlebar-controls-width` on `<html>` restyled the whole document (~65k elements, ~100 ms) on every sidebar toggle. Write the value on the elements that read it (`composer/state/composerInsetReaders.ts`) or register it with `@property … { inherits: false }`.
+- **Hidden-state flips beside the transcript cost a frame when an accessibility client is on.** `aria-hidden` or `inert` changing on the sidebar's column re-serialized the whole transcript (40 to 55 ms, two dropped frames, every toggle); flip them on a small subtree inside it (`Sidebar.tsx` hides only its content, with `inert`). Headless runs never show it: measure with `--force-accessibility` (`scripts/perf/DOCUMENTATION.md`, "When An Accessibility Client Is On").
+- **Focus and inherited flips on a large subtree restyle all of it.** Tailwind's group variants compile to `:is(:where(.group):focus-visible *)`, so a focus change on an element restyles its whole subtree: focusing the context zone's aside cost 40 ms with a 300-row file tree open, focusing an empty element inside it cost nothing. `inert`, `pointer-events` and `user-select` flips cost the same. Measure such surfaces on a real repository: the perf fixture project has a few files, and a three-file tree hides costs that scale with rows.
+- **A closed surface still pays for its subscriptions.** An always-mounted dialog that reads session messages rebuilt itself on every streamed flush. Put the reading body inside `DialogContent` so it mounts only while open or closing (`TimelineDialog`, `SessionGoalDialog`).
+- **Whole-record session hooks re-render on every streamed step.** `useSession` and `useSessionMessages` change identity on each `session.updated` and flush; components that show one field read it through the leaf selectors in `sync/sync-context.tsx` (rule in `sync/DOCUMENTATION.md`).
+- **LegendList state lags the DOM by a frame.** `getState()` sizes come from estimates until rows are measured and from the footer a beat later; read `scrollHeight` when choosing a scroll target, and list state only to skip work mid-glide. Our bun patch hands out a fresh list's containers in item order, so its DOM-order pass has nothing to move after a session opens (`message/parts/DOCUMENTATION.md`).
+- **Count processes on server Git paths.** Look for a git spawn per item, the same read repeated within one operation, and network calls (`ls-remote`, `fetch`) where local refs answer. Batch into one read (`git remote -v`, not `get-url` per remote), keep a fallback when the batched read fails, prove the output matches the old method, and parse with `/\r?\n/`: Git for Windows may print CRLF, and spawns cost more there.
+
+## Motion That Stays On Screen
+
+An infinite CSS animation is paid for as long as it is on screen, and the bill
+lands outside the page: the GPU process and the OS compositor draw every frame.
+Main-thread busy time, style recalcs and `profile:idle`'s CPU budget all read
+it as free. Measured with process CPU on four machines, one spinner or smooth
+pulse took a still app from 2 to 9% of a core to 14 to 66%; in this
+repository's fixture, headless or under Xvfb, it draws 60 frames a second and
+costs 7 to 8% against 1% for a still page.
+
+- **`steps()` still pays.** A stepped animation keeps the compositor ticking
+  every frame, whatever it draws: CodeMirror's `steps(1)` caret draws 1.7
+  frames a second and costs 4.1%, the same blink from a 600 ms timer 1.3%
+  (`lib/codemirror/caretBlink.ts`).
+- **Layer promotion changes nothing.** `will-change`, `translateZ(0)` and
+  `contain` measured no different.
+- **Cost follows changes per second.** Driven from a JS timer, each change
+  is one drawn frame: measured headed on an M-series Mac, Chrome renderer plus
+  GPU, one indicator: still page 0.3%, 1 change a second 1.0%, 2 1.7%, 4
+  2.7%, 8 4.2%, a smooth spinner 8.6 to 9%, a smooth pulse 6.5%.
+- **One clock for every indicator** (`hooks/useDurationTicker.ts`): spinners
+  step four times a second, blinks, dots and counters once, on the same
+  beats, so the page pays for the fastest indicator on screen, not the sum.
+  The styling rules live in `theme-system`, "Animation Contract".
+- **A tick re-renders its subscriber and everything under it.** Call the
+  clock hook in the leaf that shows the change (the dot, the counter), make
+  `active` true only while the readout moves, and keep it out of a page or a
+  preview: a status age on Remote instances re-rendered that whole page every
+  second while any instance was connected. Labels that change by the minute
+  ("5m ago") use `useMinuteTickerNow`, which re-renders only when the minute
+  turns.
+- **Native images count too.** The macOS menu bar icon's breath called
+  `setImage` 13 times a second: 6.9 to 7.3% of the Electron main process,
+  against 2.6 to 3.1% at five a second (`tray.mjs`).
+- **Hidden surfaces stop.** A closed panel, a background tab or an element
+  under `opacity: 0` or `inert` neither animates nor polls. Gate on the
+  surface's own visibility prop (`PauseClock` for clock-driven indicators):
+  desktop windows run with `backgroundThrottling: false`, so
+  `document.visibilityState` stays `visible` there, and macOS keeps drawing a
+  minimized window at full cost.
+- **Measure motion with frames and process CPU, headed, with an ablation.**
+  `profile:animation` isolates one technique; `profile:idle` reports frames
+  drawn per second and fails `--budget-frames` (its positive control is
+  `scripts/perf/controls/pulse-dot.js`). Quote CPU only from headed runs.
+
 ## Repository Tooling
 
 `scripts/perf/DOCUMENTATION.md` is the entry point: it covers every capture
@@ -210,21 +311,36 @@ command, how to stand up a production build to measure against, how to read the
 artifacts, and the validity guarantees these scripts enforce. Read it before
 measuring.
 
-Five unattended capture commands exist; prefer them over ad-hoc timing code,
-and extend them when a scenario is missing rather than measuring by hand.
+Prefer the unattended capture commands over ad-hoc timing code, and extend
+them when a scenario is missing rather than measuring by hand. Their options
+live in the documentation and `--help`.
 
 | Command | Answers |
 |---|---|
-| `bun run profile:idle` | What the app does while nobody interacts with it. Supports `--session`, `--tab`, `--then-tab`, `--panel`, `--expand-projects` to reach a specific mounted state, plus `--baseline` and `--budget-*` for regression gating. |
-| `bun run profile:session` | What a streaming assistant response costs. Creates a session, dispatches a prompt through the `openchamber session` CLI, and records until the session reports idle. Reports the long-task distribution, a timeline-trace breakdown, running animations, and output-normalised metrics. |
-| `bun run profile:animation` | What a CSS animation costs, isolated from the app. Animate only `transform` and `opacity`; everything else recalculates style every frame. |
-| `bun run profile:switch` | How long switching sessions from the sidebar takes: `ack` (the clicked row highlights) and `content` (the target session's messages are on screen), cold and warm, plus the requests each switch fires. Use it as the regression gate for any change in the sidebar, header, chat container, or markdown first paint. |
-| `bun run profile:switch` | How long switching sessions from the sidebar takes: `ack` (the clicked row highlights) and `content` (the target session's messages are on screen), cold and warm, plus the requests each switch fires. Use it as the regression gate for any change in the sidebar, header, chat container, or markdown first paint. |
+| `bun run profile:idle` | What the app does while nobody interacts with it, in a chosen mounted state: frames drawn and main-thread work, with baseline and budget gating (`--budget-frames`). |
+| `bun run profile:session` | What a streaming reply costs on deterministic fixtures (prose, code, unicode, tool-heavy): long tasks against the frame budget, the finalize spike, a trace breakdown. |
+| `bun run profile:switch` | How long a session switch takes until it is `visible`, cold and warm, the shift after reveal, and the bytes each switch fetches. The gate for sidebar, header, chat container and markdown first-paint changes. |
+| `bun run profile:startup` | Time from launch to a usable composer, web or packaged desktop, with the requests and bytes until then. |
+| `bun run profile:animation` | What a CSS animation or a timer costs in isolation: frames drawn, style and layout, process CPU. |
 | `bun run profile:browser` | A manually driven capture when the interaction cannot be scripted. |
+| `bun run profile:heap` | JS heap and DOM kept after hovering and opening N sessions. |
+| `bun run profile:composer` | Elements restyled per new composer line. |
+| `bun run profile:toggle` | What opening and closing the session sidebar and the context panel costs, per toggle: input to next frame, dropped and worst frames, style/layout, forced layouts with their JS stacks. |
+| `bun run profile:compare` | The before/after verdict: builds both sides, runs the scenarios serially, prints median, p95, change and validity flags. |
+| `bun run profile:serve` | An isolated server with the fixture provider for manual runs and ablations. |
+| `bun run profile:analyze` | Attribution for one run: functions, source files, components, long tasks, large restyles, renders. |
+| `bun run build:web:diag` | The unminified, source-mapped build with store notifications, for attribution only. |
 
-Both automated commands fail loudly rather than reporting a clean result when
+The automated commands fail loudly rather than reporting a clean result when
 the renderer was throttled, the trace collected no tasks, or the scenario never
 rendered. Keep that property when extending them.
+
+A before/after comparison runs the unchanged commit and the change from two
+worktrees against the same seeded server state: the after worktree is HEAD
+plus `git diff HEAD --binary` and the untracked files, verified identical to
+the working tree, and each build's served chunk is checked against its own
+`index.html`. Run one build, one server and one Chrome at a time.
+`bun run profile:compare` does all of this; `--dry-run` shows the plan.
 
 Measure a production build. A development build's render and bundle behaviour
 does not represent what users run.
@@ -301,5 +417,6 @@ If the interaction remains above budget, do not call the mitigation the complete
 - [ ] Structural optimizations have transition-focused correctness coverage independent of performance measurements.
 - [ ] When mount topology or activation boundaries change, instrumentation distinguishes those transitions from steady state.
 - [ ] Every change retained is justified by a measured difference; unvalidated ones reverted and recorded as rejected.
+- [ ] Flows that relied on the old timing retested after any change to when something happens.
 - [ ] Remaining cost compared against the budget, and stopping justified when inside it.
 - [ ] Correctness, type, lint, and relevant runtime validations pass.

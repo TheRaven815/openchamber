@@ -193,6 +193,33 @@ describe("input-store attachments", () => {
     expect(useInputStore.getState().attachedFiles).toEqual([])
   })
 
+  test("moves the selected draft's files onto another draft, merged with its own", () => {
+    const parent = { runtimeKey: "runtime", directory: "/repo", sessionId: "parent" }
+    const btw = { ...parent, sessionId: "btw-pending:parent" }
+    const input = useInputStore.getState()
+    input.selectAttachmentDraft(btw)
+    input.addRestoredAttachment({ url: "data:text/plain;base64,aGVsbG8=", mimeType: "text/plain", filename: "earlier.txt" })
+    input.selectAttachmentDraft(parent)
+    input.addRestoredAttachment({ url: "data:image/png;base64,AQID", mimeType: "image/png", filename: "image-1.png" })
+
+    input.moveAttachedFiles(parent, btw)
+
+    expect(useInputStore.getState().attachedFiles).toEqual([])
+    input.selectAttachmentDraft(btw)
+    expect(useInputStore.getState().attachedFiles.map((file) => file.filename)).toEqual(["earlier.txt", "image-1.png"])
+    input.selectAttachmentDraft(parent)
+    expect(useInputStore.getState().attachedFiles).toEqual([])
+  })
+
+  test("leaves files in place when the drafts are the same", () => {
+    const parent = { runtimeKey: "runtime", directory: "/repo", sessionId: "parent" }
+    const input = useInputStore.getState()
+    input.selectAttachmentDraft(parent)
+    input.addRestoredAttachment({ url: "data:image/png;base64,AQID", mimeType: "image/png", filename: "image-1.png" })
+    input.moveAttachedFiles(parent, { ...parent })
+    expect(useInputStore.getState().attachedFiles.map((file) => file.filename)).toEqual(["image-1.png"])
+  })
+
   test("does not leave local file reads pending after a reader error", async () => {
     const addPromise = useInputStore.getState().addAttachedFile(new File(["hello"], "hello.txt", { type: "text/plain" }))
     expect(pendingReaders).toHaveLength(1)
@@ -567,5 +594,28 @@ describe("input-store pinned composer addressing", () => {
     useInputStore.getState().selectAttachmentDraft(main)
     expect(useInputStore.getState().attachedFiles.map((entry) => entry.id)).toEqual(["a"])
     expect(useInputStore.getState().attachmentDrafts.get(getChatDraftIdentityKey(pinned))?.map((entry) => entry.id)).toEqual(["b"])
+  })
+})
+
+describe("input-store draft submit", () => {
+  beforeEach(() => {
+    useInputStore.setState({ pendingDraftSubmit: null })
+  })
+
+  test("the requested draft takes its first message once", () => {
+    useInputStore.getState().requestDraftSubmit(7, "Fix the build")
+
+    expect(useInputStore.getState().consumePendingDraftSubmit(7)).toBe("Fix the build")
+    expect(useInputStore.getState().consumePendingDraftSubmit(7)).toBeNull()
+  })
+
+  test("another draft or a session drops the message instead of sending it", () => {
+    useInputStore.getState().requestDraftSubmit(7, "Fix the build")
+    expect(useInputStore.getState().consumePendingDraftSubmit(8)).toBeNull()
+    expect(useInputStore.getState().pendingDraftSubmit).toBeNull()
+
+    useInputStore.getState().requestDraftSubmit(7, "Fix the build")
+    expect(useInputStore.getState().consumePendingDraftSubmit(null)).toBeNull()
+    expect(useInputStore.getState().pendingDraftSubmit).toBeNull()
   })
 })

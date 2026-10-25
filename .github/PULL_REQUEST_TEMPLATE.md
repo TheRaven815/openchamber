@@ -16,8 +16,8 @@ from a maintainer in the discussion is what makes the PR worth writing.
 See CONTRIBUTING.md.
 
 Keep one change per PR. Unrelated fixes in the same diff wait for the biggest one.
-Size labels count changed lines without tests, lockfiles, translation catalogs
-and evidence images, so a small change with many locale files stays small.
+Size labels count changed lines without tests, lockfiles and translation
+catalogs, so a small change with many locale files stays small.
 -->
 
 ## What and why
@@ -64,6 +64,7 @@ and evidence images, so a small change with many locale files stays small.
 
 <!-- User-visible change: current before/after screenshots or recordings for the
      affected desktop/mobile, narrow/wide, theme, and interaction states.
+     Attach them here in the description; never commit them to the branch.
      No visible change: one concrete sentence on why the diff cannot affect
      rendered behavior. -->
 

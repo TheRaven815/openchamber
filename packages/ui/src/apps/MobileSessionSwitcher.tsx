@@ -1,5 +1,6 @@
 import React from 'react';
 import { useSessionTurnActivity } from '@/sync/global-session-status';
+import { getSessionActivityTime } from '@/sync/session-ordering';
 import { SessionActivityIndicator } from '@/components/session/SessionActivityIndicator';
 import type { Session } from '@/lib/opencode/model';
 
@@ -11,8 +12,8 @@ import { useI18n } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
 import { refreshGlobalSessions, resolveGlobalSessionDirectory } from '@/stores/useGlobalSessionsStore';
 import { useProjectsStore } from '@/stores/useProjectsStore';
-import { useSessionUnseenCount } from '@/sync/notification-store';
-import { useHasSessionActivityDuration } from '@/sync/session-activity-timing';
+import { useSessionUnread } from '@/sync/session-unread';
+import { useHasSessionTurnDuration } from '@/sync/session-turn-duration';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 
 const RECENT_SESSIONS_LIMIT = 10;
@@ -32,26 +33,26 @@ const SwitcherRow: React.FC<{
   onSelect: () => void;
 }> = ({ session, meta, active, onSelect }) => {
   const { t } = useI18n();
-  const unseenCount = useSessionUnseenCount(session.id);
+  const isUnread = useSessionUnread(session.id);
   const turnActivity = useSessionTurnActivity(session.id);
   const isStreaming = turnActivity !== null;
-  const showUnreadDot = !isStreaming && unseenCount > 0 && !active;
-  const hasActivityDuration = useHasSessionActivityDuration(session.id, isStreaming);
+  const showUnreadDot = !isStreaming && isUnread && !active;
+  const hasActivityDuration = useHasSessionTurnDuration(session.id, isStreaming);
   const showActivityDuration = (isStreaming || showUnreadDot) && hasActivityDuration;
-  const timeLabel = formatSessionCompactDateLabel(session.time?.updated ?? session.time?.created ?? 0);
+  const timeLabel = formatSessionCompactDateLabel(getSessionActivityTime(session));
 
   return (
     <button
       type="button"
       className={cn(
-        'flex w-full items-center gap-3 rounded-xl px-2.5 py-2 text-left transition-colors active:bg-interactive-active focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
+        'flex w-full items-center gap-3 rounded-xl px-2.5 py-2 text-start transition-colors active:bg-interactive-active focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
         active && 'bg-[color-mix(in_srgb,var(--primary)_10%,transparent)]',
       )}
       onClick={onSelect}
       style={{ touchAction: 'manipulation' }}
     >
       <span className="flex min-w-0 flex-1 flex-col">
-        <span dir="auto" className={cn('block truncate text-left typography-ui-label', active ? 'text-primary' : 'text-foreground')}>
+        <span dir="auto" className={cn('block truncate oc-ui-start-align typography-ui-label', active ? 'text-primary' : 'text-foreground')}>
           {getSessionTitle(session, t('sessions.sidebar.session.untitled'))}
         </span>
         {meta ? (

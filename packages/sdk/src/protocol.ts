@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { guestSessionWorktreeSchema, guestStorageRequestSchema, guestStorageResultSchema, guestWorkspaceQuerySchema, guestWorkspaceSnapshotSchema } from './workspace-schemas.ts';
 import { guestStatusControlEventSchema, guestStatusControlsSchema } from './status-control-schemas.ts';
 import { guestPopoverClosedEventSchema, guestPopoverDataSchema, guestPopoverRequestSchema } from './popover-schemas.ts';
+import { GUEST_SHELL_END_STATUSES, GUEST_SHELL_ID_MAX, GUEST_SHELLS_MAX, GUEST_SHELL_OUTPUT_TAIL_MAX } from './shells.ts';
 
 import { OPENCHAMBER_SDK_API_VERSION, OPENCHAMBER_SDK_CHANNEL } from './api-version.ts';
 import {
@@ -45,6 +46,7 @@ import {
   isGuestFilePath,
   isGuestRequestPath,
   resolveHostRequestErrorCode,
+  HOST_REQUEST_ERROR_CODES,
   type GuestMessage,
   type HostMessage,
 } from './contract.ts';
@@ -161,9 +163,32 @@ const generateResultPayloadSchema = z.object({
   text: z.string().max(GUEST_GENERATE_TEXT_MAX),
 });
 
+const generateRequestSchema = z.object({
+  prompt: z.string().trim().min(1).max(GUEST_GENERATE_PROMPT_MAX),
+  system: z.string().trim().min(1).max(GUEST_GENERATE_SYSTEM_MAX).optional(),
+  maxOutputTokens: z.number().int().min(1).max(GUEST_GENERATE_OUTPUT_TOKENS_MAX).optional(),
+});
+
+const lateGenerateResultSchema = z.discriminatedUnion('ok', [
+  z.object({ request: generateRequestSchema, ok: z.literal(true), result: generateResultPayloadSchema }),
+  z.object({ request: generateRequestSchema, ok: z.literal(false), code: z.enum(HOST_REQUEST_ERROR_CODES), error: z.string().min(1) }),
+]);
+
+const shellOutputResultPayloadSchema = z.object({
+  output: z.string(),
+  cursor: z.number(),
+  skipped: z.boolean(),
+});
+
+const shellStopResultPayloadSchema = z.object({
+  stopped: z.literal(true),
+});
+
 const hostResultPayloadSchema = z.union([
   guestStorageResultSchema,
   guestWorkspaceSnapshotSchema,
+  shellOutputResultPayloadSchema,
+  shellStopResultPayloadSchema,
   startSessionResultPayloadSchema,
   requestResultPayloadSchema,
   promptResultPayloadSchema,
@@ -239,6 +264,7 @@ const readyPayloadSchema = z.object({
     deviceStorage: z.literal(true).optional(),
     statusControls: z.literal(true).optional(),
     popovers: z.literal(true).optional(),
+    lateGenerateResults: z.literal(true).optional(),
   }).optional(),
 });
 
@@ -285,8 +311,37 @@ const hostResultSchema = z.object({
   };
 });
 
+const guestRunningShellSchema = z.object({
+  id: z.string().min(1).max(GUEST_SHELL_ID_MAX),
+  sessionID: z.string().min(1).max(1024),
+  command: z.string(),
+  startedAt: z.number().nonnegative(),
+  background: z.boolean(),
+}).strict();
+const guestEndedShellSchema = guestRunningShellSchema.extend({
+  status: z.enum(GUEST_SHELL_END_STATUSES),
+  exit: z.number().int().optional(),
+  endedAt: z.number().nonnegative(),
+}).strict();
+const guestShellsScopeSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('session'), sessionId: z.string().min(1).max(1024) }).strict(),
+  z.object({ kind: z.literal('project'), projectId: z.string().min(1).max(1024) }).strict(),
+  z.object({ kind: z.literal('global') }).strict(),
+]);
+const guestRunningShellsSnapshotSchema = z.object({
+  kind: z.literal('shells'),
+  scope: guestShellsScopeSchema,
+  shells: z.array(guestRunningShellSchema).max(GUEST_SHELLS_MAX),
+  ended: z.array(guestEndedShellSchema).max(GUEST_SHELLS_MAX),
+}).strict();
+
 export const hostMessageSchema = z.union([
   z.object({ ...envelope, type: z.literal('workspace'), payload: z.object({ subscriptionId: z.string().min(1).max(128), snapshot: guestWorkspaceSnapshotSchema }) }),
+  z.object({
+    ...envelope,
+    type: z.literal('shells'),
+    payload: z.object({ subscriptionId: z.string().min(1).max(128), snapshot: guestRunningShellsSnapshotSchema }),
+  }),
   z.object({
     ...envelope,
     type: z.literal('ready'),
@@ -388,6 +443,7 @@ export const hostMessageSchema = z.union([
     type: z.literal('file-saved'),
     payload: z.object({ version: z.string().max(GUEST_FILE_EDITOR_VERSION_MAX) }),
   }),
+  z.object({ ...envelope, type: z.literal('generate-late'), payload: lateGenerateResultSchema }),
 ]);
 
 const filePathSchema = z.string().min(1).max(GUEST_FILE_PATH_MAX).refine(isGuestFilePath);
@@ -405,6 +461,10 @@ export const guestMessageSchema = z.discriminatedUnion('type', [
   z.object({ ...envelope, type: z.literal('workspace-read'), id: z.string().min(1), payload: guestWorkspaceQuerySchema }),
   z.object({ ...envelope, type: z.literal('workspace-subscribe'), id: z.string().min(1), payload: z.object({ subscriptionId: z.string().min(1).max(128), query: guestWorkspaceQuerySchema }) }),
   z.object({ ...envelope, type: z.literal('workspace-unsubscribe'), id: z.string().min(1), payload: z.object({ subscriptionId: z.string().min(1).max(128) }) }),
+  z.object({ ...envelope, type: z.literal('shells-subscribe'), id: z.string().min(1), payload: z.object({ subscriptionId: z.string().min(1).max(128), scope: guestShellsScopeSchema }).strict() }),
+  z.object({ ...envelope, type: z.literal('shells-unsubscribe'), id: z.string().min(1), payload: z.object({ subscriptionId: z.string().min(1).max(128) }).strict() }),
+  z.object({ ...envelope, type: z.literal('shell-output'), id: z.string().min(1), payload: z.object({ shellId: z.string().min(1).max(GUEST_SHELL_ID_MAX), cursor: z.number().int().nonnegative().optional(), tailBytes: z.number().int().positive().max(GUEST_SHELL_OUTPUT_TAIL_MAX).optional() }).strict() }),
+  z.object({ ...envelope, type: z.literal('shell-stop'), id: z.string().min(1), payload: z.object({ shellId: z.string().min(1).max(GUEST_SHELL_ID_MAX) }).strict() }),
   z.object({ ...envelope, type: z.literal('storage'), id: z.string().min(1), payload: guestStorageRequestSchema }),
   z.object({
     ...envelope,
@@ -569,11 +629,7 @@ export const guestMessageSchema = z.discriminatedUnion('type', [
     ...envelope,
     type: z.literal('generate'),
     id: z.string().min(1),
-    payload: z.object({
-      prompt: z.string().trim().min(1).max(GUEST_GENERATE_PROMPT_MAX),
-      system: z.string().trim().min(1).max(GUEST_GENERATE_SYSTEM_MAX).optional(),
-      maxOutputTokens: z.number().int().min(1).max(GUEST_GENERATE_OUTPUT_TOKENS_MAX).optional(),
-    }),
+    payload: generateRequestSchema,
   }),
   z.object({
     ...envelope,
@@ -629,6 +685,7 @@ export const guestMessageSchema = z.discriminatedUnion('type', [
   }),
   z.object({ ...envelope, type: z.literal('file-save') }),
   z.object({ ...envelope, type: z.literal('file-unsupported') }),
+  z.object({ ...envelope, type: z.literal('generate-late-listen') }),
 ]);
 
 type ParsedHostMessage = z.infer<typeof hostMessageSchema>;

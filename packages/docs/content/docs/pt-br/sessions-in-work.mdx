@@ -1,49 +1,62 @@
 ---
 title: Sessões em andamento
-description: Mantenha à vista na barra lateral as sessões com trabalho real em andamento, até você marcá-las como concluídas.
+description: Mantenha no topo da barra lateral o trabalho que você está fazendo, até marcá-lo como concluído.
 ---
 
 # Sessões em andamento
 
-Perguntas, pesquisas e experimentos rápidos se acumulam depressa, e a sessão em que você está de fato consertando algo fica enterrada no meio deles. O bloco **Em andamento** reúne essas sessões em um só lugar da barra lateral. Uma sessão fica lá até você dizer que ela está concluída.
+Toda sessão em que você envia uma mensagem leva o seu trabalho para o bloco **Em andamento**, no topo da barra lateral, e ele fica lá até você marcá-lo como concluído, não importa há quanto tempo você o abriu. Seus projetos guardam tudo o que você já fez; Em andamento reúne só o que você ainda não terminou.
 
-Essa é a diferença para "Recente". "Recente" mostra tudo o que mudou nos últimos dois dias e se renova sozinho: uma sessão que você abriu hoje de manhã por curiosidade está lá, e uma correção que você pausou na segunda-feira já sumiu. "Em andamento" é a lista do que você ainda não terminou, não importa há quanto tempo abriu.
+## O que é um trabalho
+
+A barra lateral lista trabalhos, não sessões soltas. Um trabalho é:
+
+- **um worktree** com todas as sessões dele, numa só linha com o nome da tarefa (veja [Sessões de Worktree](/pt-br/worktrees/)), ou
+- **uma sessão na pasta do próprio projeto**, com o que nasceu dela aninhado embaixo: os subagentes, a revisão, os forks e perguntas paralelas que você manteve, e as sessões que o agente dela abriu para você.
+
+Clique na linha para abri-la; a seta à esquerda abre as sessões que estão embaixo.
 
 ## Onde encontrar
 
-O bloco **Em andamento** fica na barra lateral, abaixo das conversas e acima de "Recente" (ou da linha do tempo, no modo Timeline). No celular, ele fica no mesmo lugar da lista de sessões.
+O bloco **Em andamento** fica na barra lateral, abaixo das conversas e acima dos seus projetos ou da linha do tempo. Um trabalho que está nele sai do projeto, então cada trabalho aparece uma vez só. Para mantê-lo também no projeto, ative **Mostrar também o que está em andamento nos projetos** no menu de exibição da barra lateral. A busca mostra o trabalho uma só vez, no bloco Em andamento.
 
-Uma sessão em andamento vai para lá junto com as suas subsessões. Ela não aparece uma segunda vez em "Recente", na linha do tempo, no seu projeto ou na sua pasta. Marque-a como concluída e ela volta para onde estava.
+Cada trabalho ocupa uma linha: o título e o estado dele, com uma marca colorida quando tem um pull request ou uma issue. As linhas seguem a ordem da atividade mais recente, por isso não mostram data. Passe o mouse sobre uma linha para ver o projeto, a branch, a hora e os links, ou ative **Linhas detalhadas** no menu de exibição para mostrá-los abaixo do título. As linhas detalhadas valem também nos seus projetos; as sessões dentro de um trabalho continuam ocupando uma linha.
+
+As sessões fixadas têm um bloco **Fixadas** próprio, acima de Em andamento; para deixá-las só nos seus projetos, desative **Mostrar fixadas** no mesmo menu. Uma sessão fixada em andamento aparece só em Fixadas.
+
+No celular, a lista de sessões é a mesma, com o mesmo menu de exibição. As linhas ocupam duas linhas de texto, a menos que você desative **Linhas detalhadas**, e a seta que abre um trabalho fica sempre visível, já que não há onde passar o mouse.
+
+## Como as sessões entram
+
+Envie uma mensagem numa sessão e ela vai para em andamento. Vale para qualquer sessão de projeto, inclusive sessões em worktrees. Um worktree novo vai para em andamento assim que você o cria, enquanto o rascunho que abre nele ainda não foi enviado.
+
+Uma sessão que você marcou como concluída volta quando você envia uma nova mensagem nela.
+
+Conversas, sessões arquivadas, sessões de revisão e execuções de [tarefas agendadas](/pt-br/scheduled-tasks/) nunca entram; se você fizer um fork de uma execução para continuar trabalhando nela, o fork entra. Um subagente nunca coloca a sessão principal em andamento.
+
+## Nomes das tarefas
+
+O agente dá a cada trabalho o nome da sua tarefa assim que a tarefa fica clara, em poucas palavras, como "Correção do timeout de login". Um worktree guarda o nome na descrição da branch, então você o vê em qualquer lugar onde abrir o repositório; uma sessão na pasta do projeto usa o nome como título. Se você renomear, o seu nome fica: o agente nunca renomeia uma tarefa que você nomeou.
 
 ## Acompanhar e concluir uma sessão manualmente
 
-- **Acompanhar:** passe o mouse sobre uma sessão e clique no olho, ou escolha **Acompanhar como em andamento** no menu da sessão.
-- **Concluir:** passe o mouse sobre uma sessão do bloco e clique no visto, ou escolha **Marcar como concluído** no menu.
+- **Acompanhar:** passe o mouse sobre uma linha e clique no olho, ou escolha **Acompanhar como em andamento** no menu da sessão.
+- **Concluir:** passe o mouse sobre uma linha do bloco e clique no visto, ou escolha **Marcar como concluído** no menu. Isso encerra o trabalho inteiro: todas as sessões dele que ainda estavam em andamento.
 
-No celular, deslize a linha de uma sessão para chegar à mesma ação, ou use o menu da sessão.
+Concluir um worktree o tira de Em andamento e o deixa onde está. Para também arquivá-lo ao concluí-lo, ative **Arquivar o worktree ao marcá-lo como concluído** em **Configurações → Sessões**: a pasta some, e as sessões, as mudanças e a branch dele ficam esperando na página Arquivo, prontas para restaurar. Se uma sessão ainda estiver rodando ali, o worktree fica.
 
-Qualquer sessão de projeto pode ficar em andamento, inclusive sessões em worktrees. As subsessões vão junto com a sessão principal. As conversas nunca: são só conversas, então não ganham o olho.
+No celular, deslize uma linha para o lado para chegar à mesma ação.
 
-## Deixe o Jev mover as sessões por você
-
-Com um [provedor de classificação](/pt-br/classification-providers/) configurado, você não precisa acompanhar as sessões sozinho. O Jev lê cada mensagem que você envia e coloca a sessão em andamento quando você:
-
-- pede uma mudança
-- relata um bug
-- discute uma mudança concreta que está prestes a fazer
-
-Perguntas, explicações e pesquisas não contam. O Jev olha de novo quando o agente termina um turno, o que pega o trabalho que só fica claro com a resposta.
-
-O Jev só move sessões **para** em andamento. Depois que você marca uma sessão como concluída, só um novo pedido enviado depois disso a traz de volta.
+As conversas não ganham o olho: são só conversas.
 
 ### "Este trabalho parece concluído."
 
-Quando um turno parece o fim do trabalho (você agradeceu, pediu um commit, confirmou que funciona), o Jev não fecha nada e deixa uma dica:
+Com um [provedor de classificação](/pt-br/classification-providers/) configurado, o Jev confere cada turno de uma sessão em andamento. Quando um turno parece o fim do trabalho (você agradeceu, pediu um commit, confirmou que funciona), o Jev não fecha nada e deixa uma dica:
 
 - um visto cinza na linha da sessão na barra lateral
 - uma faixa acima do campo de mensagem: **Este trabalho parece concluído.** com um botão **Marcar como concluído**
 
-Clique em **Marcar como concluído** se o Jev estiver certo. Se não, é só continuar: a dica some com a sua próxima mensagem.
+Clique em **Marcar como concluído** se o Jev estiver certo. Se não, é só continuar: a dica some com a sua próxima mensagem. Sem provedor de classificação não há dica, e você mesmo marca as sessões como concluídas.
 
 ## Resumo e sugestão da próxima mensagem
 
@@ -58,19 +71,16 @@ Ative ou desative em **Configurações → Chat → Assistência da sessão**.
 
 ## Configurações
 
-Abra **Configurações → Sessões → Sessões em andamento**:
+Abra **Configurações → Sessões → Sessões em andamento**. Há uma só opção, **Mostrar sessões em andamento**, ativada por padrão. Desativada, a função inteira desliga: não há bloco, e enviar uma mensagem não coloca mais a sessão em andamento.
 
-- **Mostrar sessões em andamento:** o próprio bloco; desativado, as sessões ficam onde sempre estiveram
-- **Mover sessões para em andamento automaticamente:** a parte do Jev; desative para acompanhar só manualmente
-
-As duas vêm ativadas por padrão.
+Para esconder só o bloco, use **Mostrar em andamento** no menu de exibição da barra lateral.
 
 ## Onde funciona
 
-O bloco e o acompanhamento manual funcionam em todo lugar, inclusive no VS Code. O movimento automático, a dica "parece concluído" e o filtro do Jev para os resumos precisam do servidor do OpenChamber, então funcionam no app desktop, no app web e no celular, mas não no VS Code.
+O bloco e o acompanhamento manual funcionam em todo lugar, inclusive no VS Code. Colocar a sessão em andamento quando você envia uma mensagem, a dica "parece concluído" e o filtro do Jev para os resumos precisam do servidor do OpenChamber, então funcionam no app desktop, no app web e no celular, mas não no VS Code. No VS Code você acompanha as sessões manualmente.
 
 ## Relacionado
 
-- [Provedores de classificação (Jev)](/pt-br/classification-providers/): configure o acompanhamento automático
+- [Provedores de classificação (Jev)](/pt-br/classification-providers/): configure a dica "parece concluído"
 - [Conversas](/pt-br/chats/): conversas que ficam fora do trabalho em andamento
 - [Objetivos de sessão](/pt-br/session-goals/): faça o agente trabalhar até a linha de chegada

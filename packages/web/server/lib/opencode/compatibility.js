@@ -8,11 +8,12 @@ const infoSchema = z.object({ version: versionSchema });
 const legacyHealthSchema = z.object({ version: versionSchema, healthy: z.boolean() });
 
 /**
- * Oldest OpenCode OpenChamber runs against. 2.0.20 added `GET /api/credential`,
- * the only way to read the provider keys quota lookups, voice and routing use
- * (2.0.15 before it added `PATCH /api/session` metadata).
+ * Oldest OpenCode OpenChamber runs against. 2.1.0 added `archived` to
+ * `PATCH /api/session/{id}`; an older OpenCode ignores the field and answers
+ * 204, so an archive would look done and change nothing. (2.0.20 before it
+ * added `GET /api/credential`, 2.0.15 `PATCH /api/session` metadata.)
  */
-const MINIMUM_OPENCODE_VERSION = '2.0.20';
+const MINIMUM_OPENCODE_VERSION = '2.1.0';
 
 const releaseParts = (version) => version.split(/[-+]/, 1)[0].split('.').map(Number);
 

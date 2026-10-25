@@ -6,6 +6,8 @@ import type { GitStatus } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
 import { useI18n } from '@/lib/i18n';
 import { describeChange } from './changeStatus';
+import { changedPathName } from './changesTree';
+import { ChangedPathLabel } from './ChangedPathLabel';
 
 interface ChangeRowProps {
   file: GitStatus['files'][number];
@@ -125,7 +127,7 @@ export const ChangeRow = React.memo<ChangeRowProps>(function ChangeRow({
       tabIndex={0}
       onClick={onViewDiff}
       onKeyDown={handleKeyDown}
-      style={indentPx > 0 ? { paddingLeft: `${indentPx}px` } : undefined}
+      style={indentPx > 0 ? { paddingInlineStart: `${indentPx}px` } : undefined}
     >
         {actionAtStart ? actionButton : null}
         <span
@@ -142,27 +144,15 @@ export const ChangeRow = React.memo<ChangeRowProps>(function ChangeRow({
           if (lastSlash === -1 || nameOnly) {
             return (
               <span
-                className="flex-1 min-w-0 truncate typography-ui-label text-foreground"
-                style={{ direction: 'rtl', textAlign: 'left', unicodeBidi: 'plaintext' }}
+                className="oc-ui-start-align flex-1 min-w-0 truncate typography-ui-label text-foreground"
+                style={{ direction: 'rtl', unicodeBidi: 'plaintext' }}
                 title={file.path}
               >
-                {file.path.slice(lastSlash + 1)}
+                {changedPathName(file.path)}
               </span>
             );
           }
-          const dir = file.path.slice(0, lastSlash);
-          const name = file.path.slice(lastSlash);
-          return (
-            <span className="flex-1 min-w-0 flex items-baseline overflow-hidden" title={file.path}>
-              <span
-                className="min-w-0 truncate typography-ui-label text-muted-foreground"
-                  style={{ direction: 'rtl', textAlign: 'left', unicodeBidi: 'plaintext' }}
-              >
-                {dir}
-              </span>
-              <span className="flex-shrink-0 typography-ui-label"><span className="text-muted-foreground">/</span><span className="text-foreground">{name.slice(1)}</span></span>
-            </span>
-          );
+          return <ChangedPathLabel path={file.path} className="flex-1 typography-ui-label" />;
         })()}
         {actionAtStart ? (
           <>

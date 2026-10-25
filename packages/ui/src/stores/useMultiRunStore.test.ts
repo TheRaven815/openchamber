@@ -95,8 +95,7 @@ mock.module('@/lib/opencode/client', () => ({
 }));
 
 mock.module('@/lib/sessionKnowledgeApi', () => ({
-  fetchSessionKnowledge: () => ({ text: '', signature: '' }),
-  reportSessionKnowledgeDelivered: async () => undefined,
+  syncSessionKnowledge: async () => undefined,
 }));
 
 mock.module('@/sync/session-archive-batch', () => ({
@@ -113,6 +112,8 @@ mock.module('@/sync/session-archive-batch', () => ({
 
 mock.module('@/lib/gitApi', () => ({
   checkIsGitRepository: mock(() => Promise.resolve(isGitRepository)),
+  resolveGitRepositoryPrefix: mock(() => Promise.resolve('')),
+  validateWorktreeDirectory: mock(() => Promise.resolve({ valid: true, insideWorktreeRoot: true, resolvedWorktreeRoot: null, resolvedCwd: null })),
 }));
 
 mock.module('@/lib/worktrees/worktreeCreate', () => ({
@@ -126,6 +127,7 @@ mock.module('@/lib/worktrees/worktreeBootstrap', () => ({
     operationOrder.push(`wait:${directory}`);
     return Promise.resolve();
   },
+  waitForWorktreeGitReady: () => Promise.resolve(),
 }));
 
 mock.module('@/lib/worktrees/worktreeStatus', () => ({

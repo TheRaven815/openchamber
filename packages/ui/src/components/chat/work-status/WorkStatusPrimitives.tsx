@@ -10,7 +10,7 @@ import type { IconName } from '@/components/icon/icons';
  *
  * Every readout is a labelled row — icon, name, trailing value — so a glance
  * answers "what is this number" without hovering. Sections carry a heading and
- * are separated by a hairline; the panel itself stays chrome-less, since it is
+ * are separated by space alone; the panel itself stays chrome-less, since it is
  * an object inside the chat rather than a docked pane.
  */
 
@@ -22,23 +22,27 @@ import type { IconName } from '@/components/icon/icons';
  */
 const SECTION_CLASS = cn(
   'flex flex-col',
-  '[&:not(:first-child)]:mt-3 [&:not(:first-child)]:border-t',
-  '[&:not(:first-child)]:border-[var(--interactive-border)] [&:not(:first-child)]:pt-3',
+  '[&:not(:first-child)]:mt-5',
 );
 
 const HEADING_CLASS = 'text-xs font-semibold text-foreground';
 
 export const WorkStatusSection: React.FC<{
   title: string;
+  /** Names what the section is about, right after the title (the project). */
+  subject?: React.ReactNode;
   /** Aggregate for the whole section; belongs on the heading, not on a row. */
   summary?: React.ReactNode;
   children: React.ReactNode;
-}> = ({ title, summary, children }) => (
+}> = ({ title, subject, summary, children }) => (
   <section className={SECTION_CLASS}>
     <div data-work-status-heading className="mb-0.5 flex items-center gap-2 px-1">
-      <h3 className={cn(HEADING_CLASS, 'min-w-0 flex-1 truncate')}>{title}</h3>
+      <h3 className={cn(HEADING_CLASS, 'min-w-0 flex-1 truncate')}>
+        {title}
+        {subject ? <span className="ms-1.5 font-normal text-muted-foreground">{subject}</span> : null}
+      </h3>
       {summary !== undefined && summary !== null ? (
-        <span className="min-w-0 max-w-[60%] truncate text-right text-xs text-muted-foreground tabular-nums">{summary}</span>
+        <span dir="auto" className="min-w-0 max-w-[60%] truncate text-end text-xs text-muted-foreground tabular-nums">{summary}</span>
       ) : null}
     </div>
     {children}
@@ -86,7 +90,7 @@ export const WorkStatusCollapsibleSection: React.FC<{
           aria-expanded={expanded}
           onClick={() => setExpandedInStore(id, !expanded)}
           className={cn(
-            'group/section flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 text-left',
+            'group/section flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 text-start',
             // No hover fill anywhere in the panel: at this row density the blocks
             // of colour read as selection, not as affordance. Interactivity shows
             // through the text instead.
@@ -96,7 +100,7 @@ export const WorkStatusCollapsibleSection: React.FC<{
           {iconNode ?? (icon ? (
             <Icon
               name={icon}
-              className={cn('size-4 shrink-0', !iconColor && 'text-muted-foreground')}
+              className={cn('size-3.5 shrink-0', !iconColor && 'text-muted-foreground')}
               style={iconColor ? { color: iconColor } : undefined}
             />
           ) : null)}
@@ -107,7 +111,7 @@ export const WorkStatusCollapsibleSection: React.FC<{
           />
           <span className="flex-1" />
           {summary !== undefined && summary !== null ? (
-            <span className="min-w-0 max-w-[60%] truncate text-right text-xs text-muted-foreground tabular-nums">{summary}</span>
+            <span dir="auto" className="min-w-0 max-w-[60%] truncate text-end text-xs text-muted-foreground tabular-nums">{summary}</span>
           ) : null}
         </button>
         {actionLayout === 'inline' ? action : null}
@@ -126,7 +130,7 @@ type RowProps = {
   value?: React.ReactNode;
   muted?: boolean;
   /** Turns the row into a button; the caller decides what it opens. */
-  onClick?: () => void;
+  onClick?: (event: React.MouseEvent<HTMLButtonElement>) => void;
   ariaLabel?: string;
   tooltip?: React.ReactNode;
   className?: string;
@@ -154,21 +158,21 @@ export const WorkStatusRow: React.FC<RowProps> = ({
       {leading ?? (icon ? (
         <Icon
           name={icon}
-          className={cn('size-4 shrink-0', !iconColor && 'text-muted-foreground')}
+          className={cn('size-3.5 shrink-0', !iconColor && 'text-muted-foreground')}
           style={iconColor ? { color: iconColor } : undefined}
         />
       ) : null)}
-      <span id={labelId} className={cn('min-w-0 flex-1 truncate text-[13px]', muted && 'text-muted-foreground')}>
+      <span id={labelId} className={cn('min-w-0 flex-1 truncate text-[0.8125rem]', muted && 'text-muted-foreground')}>
         {label}
       </span>
       {value !== undefined && value !== null ? (
-        <span className="flex shrink-0 items-center gap-1.5 text-[13px] tabular-nums">{value}</span>
+        <span className="flex shrink-0 items-center gap-1.5 text-[0.8125rem] tabular-nums">{value}</span>
       ) : null}
     </>
   );
 
   const shared = cn(
-    'flex h-7 w-full items-center gap-2 rounded-md px-1 text-left text-muted-foreground',
+    'flex h-7 w-full items-center gap-2 rounded-md px-1 text-start text-muted-foreground',
     className,
   );
 
@@ -176,7 +180,7 @@ export const WorkStatusRow: React.FC<RowProps> = ({
   // a row action). The row's button is stretched under the content instead:
   // the whole row still answers a press, and controls inside it sit above.
   const row = onClick ? (
-    <div className={cn(shared, 'relative transition-colors hover:text-foreground')}>
+    <div className={cn(shared, 'oc-ref-tint-scope relative transition-colors hover:text-foreground')}>
       <button
         type="button"
         onClick={onClick}
@@ -194,9 +198,11 @@ export const WorkStatusRow: React.FC<RowProps> = ({
   if (!tooltip) return row;
 
   return (
-    <Tooltip delayDuration={750}>
+    // Above the row, as on every dense row, so it never covers the rows
+    // under it or the actions beside it.
+    <Tooltip delayDuration={300}>
       <TooltipTrigger asChild>{row}</TooltipTrigger>
-      <TooltipContent side="left" sideOffset={8} className="max-w-[min(320px,calc(100vw-24px))] whitespace-normal break-words text-left">
+      <TooltipContent side="top" sideOffset={4} className="max-w-[min(320px,calc(100vw-24px))] whitespace-normal break-words text-start">
         {tooltip}
       </TooltipContent>
     </Tooltip>
@@ -216,7 +222,10 @@ export const WorkStatusValue: React.FC<{
   children: React.ReactNode;
   tone?: WorkStatusTone;
 }> = ({ children, tone = 'default' }) => (
+  // Values are mostly numbers with units ("~41 tok/s", "6.6K ↑ · 242 ↓"); dir=auto
+  // keeps those in their own order inside a right-to-left panel.
   <span
+    dir="auto"
     className={tone === 'muted' ? 'text-muted-foreground' : undefined}
     style={tone === 'default' || tone === 'muted' ? undefined : { color: TONE_COLOR[tone] }}
   >
@@ -249,7 +258,7 @@ export const WorkStatusRowAction: React.FC<{
         onClick();
       }}
       className={cn(
-        'shrink-0 rounded-full px-1.5 py-px text-[11px] font-medium leading-4 transition-opacity',
+        'shrink-0 rounded-full px-1.5 py-px text-[0.6875rem] font-medium leading-4 transition-opacity',
         'hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-50',
         !color && 'bg-[var(--interactive-hover)] text-muted-foreground',
       )}
@@ -269,7 +278,7 @@ export const WorkStatusPill: React.FC<{
 }> = ({ children, color, background }) => (
   <span
     className={cn(
-      'rounded-full px-1.5 py-px text-[11px] font-medium leading-4',
+      'rounded-full px-1.5 py-px text-[0.6875rem] font-medium leading-4',
       !color && 'bg-[var(--interactive-hover)] text-muted-foreground',
     )}
     style={color ? { color, backgroundColor: background } : undefined}
@@ -281,10 +290,10 @@ export const WorkStatusPill: React.FC<{
 /** Full-width callout for states that block the branch (merge, rebase, …). */
 export const WorkStatusCallout: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <div
-    className="mx-1 mb-1 flex items-center gap-2 rounded-md px-2 py-1.5 text-[13px] font-medium"
+    className="mx-1 mb-1 flex items-center gap-2 rounded-md px-2 py-1.5 text-[0.8125rem] font-medium"
     style={{ backgroundColor: 'var(--status-warning-background)', color: 'var(--status-warning)' }}
   >
-    <Icon name="alert" className="size-4 shrink-0" />
+    <Icon name="alert" className="size-3.5 shrink-0" />
     <span className="min-w-0 truncate">{children}</span>
   </div>
 );

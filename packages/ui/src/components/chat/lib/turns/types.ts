@@ -5,7 +5,7 @@ export interface ChatMessageEntry {
     parts: Part[];
 }
 
-type TurnActivityKind = 'tool' | 'reasoning' | 'justification';
+type TurnActivityKind = 'tool' | 'reasoning';
 
 export interface TurnMessageRecord {
     messageId: string;
@@ -27,12 +27,6 @@ export interface TurnActivityRecord extends TurnPartRecord {
     kind: TurnActivityKind;
 }
 
-export interface TurnDiffStats {
-    additions: number;
-    deletions: number;
-    files: number;
-}
-
 export interface TurnChangedFile {
     file: string;
     /** Absent when neither the turn diff nor the tool call reports line counts. */
@@ -40,13 +34,6 @@ export interface TurnChangedFile {
     deletions?: number;
     /** False when the turn diff view has no entry for this path, so a pill cannot open it. */
     inTurnDiff?: boolean;
-}
-
-export interface TurnActivityGroup {
-    id: string;
-    anchorMessageId: string;
-    afterToolPartId: string | null;
-    parts: TurnActivityRecord[];
 }
 
 export interface TurnSummaryRecord {
@@ -71,13 +58,17 @@ export interface TurnRecord {
     messages: TurnMessageRecord[];
     assistantMessageIds: string[];
     assistantMessages: ChatMessageEntry[];
+    /**
+     * Session notices that came after the prompt before the run's first step
+     * existed. They render in the turn until that step arrives and takes them
+     * as rows (`attachSyntheticContext`).
+     */
+    waitingNotices?: ChatMessageEntry[];
     activityParts: TurnActivityRecord[];
-    activitySegments: TurnActivityGroup[];
     summary: TurnSummaryRecord;
     summaryText?: string;
     hasTools: boolean;
     hasReasoning: boolean;
-    diffStats?: TurnDiffStats;
     changedFiles?: TurnChangedFile[];
     stream: TurnStreamState;
     startedAt?: number;
@@ -110,27 +101,27 @@ export interface TurnProjectionResult {
     ungroupedMessageIds: Set<string>;
 }
 
-export type Turn = Pick<TurnRecord, 'turnId' | 'userMessage' | 'assistantMessages'>;
+export type Turn = Pick<TurnRecord, 'turnId' | 'userMessage' | 'assistantMessages' | 'waitingNotices'>;
 
 export interface TurnGroupingContext {
     turnId: string;
-    activityOwnerMessageId?: string;
     isFirstAssistantInTurn: boolean;
     isLastAssistantInTurn: boolean;
-    hasEarlierAssistantText?: boolean;
+    /**
+     * Text the turn's earlier assistant messages wrote, one entry per text
+     * part, in order. Set on the last assistant message only, so the turn
+     * footer can copy and save the whole reply.
+     */
+    earlierAssistantText?: string[];
     isLatestTurn: boolean;
     summaryBody?: string;
     activityParts?: TurnActivityRecord[];
-    activityGroupSegments?: TurnActivityGroup[];
     headerMessageId?: string;
     hasTools: boolean;
     hasReasoning: boolean;
-    diffStats?: TurnDiffStats;
     changedFiles?: TurnChangedFile[];
     userMessageCreatedAt?: number;
     /** Model variant ("thinking" etc.) the turn ran with, read off its assistant messages. */
     assistantVariant?: string;
     isWorking: boolean;
-    isGroupExpanded?: boolean;
-    toggleGroup?: () => void;
 }

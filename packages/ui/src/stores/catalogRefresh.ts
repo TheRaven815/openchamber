@@ -12,22 +12,41 @@
  */
 
 import type { CatalogKind } from "@/lib/opencode/events";
-import { invalidateAgentsLoadCache, useAgentsStore } from "@/stores/useAgentsStore";
+import { notifyCredentialChanged } from "@/lib/opencode/integration-catalog";
+import { getConfigDirectory, invalidateAgentsLoadCache, useAgentsStore } from "@/stores/useAgentsStore";
 import { invalidateCommandsLoadCache, useCommandsStore } from "@/stores/useCommandsStore";
 import { invalidateSkillsLoadCache, useSkillsStore } from "@/stores/useSkillsStore";
 import { useSkillsCatalogStore } from "@/stores/useSkillsCatalogStore";
-import { useConfigStore } from "@/stores/useConfigStore";
+import { invalidateConfigAgentsLoad, useConfigStore } from "@/stores/useConfigStore";
 import { useMcpConfigStore } from "@/stores/useMcpConfigStore";
 import { usePluginsStore } from "@/stores/usePluginsStore";
+import { useQuotaStore } from "@/stores/useQuotaStore";
 import { refreshWebSearchIfLoaded } from "@/stores/useWebSearchStore";
 
 const SOURCE = "catalogRefresh";
 
-const refreshAgents = async (): Promise<void> => {
+const refreshAgents = async (eventDirectories: readonly string[] = []): Promise<void> => {
+  const ambientDirectory = getConfigDirectory();
+  const scopedDirectories = Array.from(new Set(
+    eventDirectories
+      .map((directory) => directory.trim())
+      .filter((directory) => directory.length > 0 && directory !== "global" && directory !== ambientDirectory),
+  ));
+
   invalidateAgentsLoadCache();
+  invalidateConfigAgentsLoad();
+  for (const directory of scopedDirectories) {
+    invalidateAgentsLoadCache(directory);
+    invalidateConfigAgentsLoad(directory);
+  }
+
   await Promise.allSettled([
     useAgentsStore.getState().loadAgents(),
     useConfigStore.getState().loadAgents({ source: SOURCE, fresh: true }),
+    ...scopedDirectories.flatMap((directory) => [
+      useAgentsStore.getState().loadAgents(directory),
+      useConfigStore.getState().loadAgents({ directory, source: SOURCE, fresh: true }),
+    ]),
   ]);
 };
 
@@ -81,11 +100,43 @@ const refreshProvidersAfterCredentialChange = async (): Promise<void> => {
   await refreshProviders();
 };
 
+/**
+ * A credential event is the live channel for "which account is active", so the
+ * usage trackers re-read from it rather than from whichever screen switched the
+ * account. That is also what covers a switch made in OpenCode's own TUI or by
+ * another client, which no OpenChamber screen can see.
+ *
+ * Every tracker the user selected is re-read, because the event does not name
+ * the provider and threading that through the event, the sync layer and this
+ * table costs more than the extra requests on an action a person performs a few
+ * times a day.
+ */
+const refreshUsageAfterCredentialChange = async (): Promise<void> => {
+  const { results, dropdownProviderIds, fetchQuotas } = useQuotaStore.getState();
+  // Only the trackers this store already shows. Gating on `results` rather than
+  // on the instance-level load flag is what makes this work in the VS Code
+  // extension: that layout fetches quotas on open and never calls
+  // `ensureLoadedForRuntime`, so `loadedRuntimeKey` stays null there and gating
+  // on it silently skipped every refresh. With nothing fetched there is nothing
+  // on screen to update, and `dropdownProviderIds` is still its default of every
+  // tracker rather than the user's selection.
+  const shown = new Set(results.map((result) => result.providerId));
+  const targets = dropdownProviderIds.filter((providerId) => shown.has(providerId));
+  if (targets.length === 0) return;
+  // `invalidate` because a credential event means the last sample can belong to
+  // the account just left; keeping it would show that account's numbers as the
+  // new one's.
+  await fetchQuotas(targets, { invalidate: true });
+};
+
 /** The lists a catalog kind invalidates, in the order they are re-read. */
-export function catalogRefreshTasks(kind: CatalogKind): Array<() => Promise<void>> {
+export function catalogRefreshTasks(
+  kind: CatalogKind,
+  eventDirectories: readonly string[] = [],
+): Array<() => Promise<void>> {
   switch (kind) {
     case "agent":
-      return [refreshAgents];
+      return [() => refreshAgents(eventDirectories)];
     case "command":
       return [refreshCommands];
     case "skill":
@@ -99,14 +150,21 @@ export function catalogRefreshTasks(kind: CatalogKind): Array<() => Promise<void
     case "provider":
     case "model":
       return [refreshProviders];
-    // A web search key is a credential too.
+    // A web search key is a credential too, and a switch of provider accounts
+    // changes which account the usage trackers report on and which one an open
+    // provider page marks active.
     case "credential":
-      return [refreshProvidersAfterCredentialChange, refreshWebSearchIfLoaded];
+      return [
+        refreshProvidersAfterCredentialChange,
+        refreshWebSearchIfLoaded,
+        refreshUsageAfterCredentialChange,
+        async () => notifyCredentialChanged(),
+      ];
     // A config file can carry any of them (a provider declared in
     // opencode.json included), and OpenChamber's own plugin injection lives
     // in one, so the whole set is re-read.
     case "config":
-      return [refreshAgents, refreshCommands, refreshSkills, refreshMcp, refreshPlugins, refreshProviders, refreshWebSearchIfLoaded];
+      return [() => refreshAgents(eventDirectories), refreshCommands, refreshSkills, refreshMcp, refreshPlugins, refreshProviders, refreshWebSearchIfLoaded];
     // Projects are the sync layer's own slice; nothing in Settings reads them
     // through these stores.
     case "project":
@@ -116,8 +174,11 @@ export function catalogRefreshTasks(kind: CatalogKind): Array<() => Promise<void
   }
 }
 
-export async function refreshStoresForCatalogKind(kind: CatalogKind): Promise<void> {
-  const tasks = catalogRefreshTasks(kind);
+export async function refreshStoresForCatalogKind(
+  kind: CatalogKind,
+  eventDirectories: readonly string[] = [],
+): Promise<void> {
+  const tasks = catalogRefreshTasks(kind, eventDirectories);
   if (tasks.length === 0) return;
   await Promise.allSettled(tasks.map((task) => task()));
 }

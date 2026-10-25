@@ -8,7 +8,7 @@ import { SessionAuthGate } from './components/auth/SessionAuthGate'
 import { ThemeSystemProvider } from './contexts/ThemeSystemContext'
 import { ThemeProvider } from './components/providers/ThemeProvider'
 import './lib/debug'
-import { syncDesktopSettings, initializeAppearancePreferences } from './lib/persistence'
+import { initializeAppearancePreferences } from './lib/persistence'
 import { startAppearanceAutoSave } from './lib/appearanceAutoSave'
 import { applyPersistedDirectoryPreferences } from './lib/directoryPersistence'
 import { preloadMarkdownRenderer } from './components/chat/markdownRendererLoader'
@@ -17,6 +17,8 @@ import { startModelPrefsAutoSave } from './lib/modelPrefsAutoSave'
 import { initializeLocale, I18nProvider } from './lib/i18n'
 import type { RuntimeAPIs } from './lib/api/types'
 import { installRuntimeEndpointReset } from './apps/runtimeEndpointReset'
+import { forgetLayoutForSafeStart, isDesktopSafeStart } from './lib/desktopSafeStart'
+import { prefetchOpenCodeCompatibility } from './components/update/openCodeCompatibilityCheck'
 
 declare global {
   interface Window {
@@ -29,17 +31,19 @@ const runtimeAPIs = (typeof window !== 'undefined' && window.__OPENCHAMBER_RUNTI
 })();
 
 initializeLocale();
+if (isDesktopSafeStart()) forgetLayoutForSafeStart();
 installRuntimeEndpointReset();
+prefetchOpenCodeCompatibility();
 
 // Initialize settings asynchronously — the app renders with defaults first
 // and hydrates once persisted preferences are applied. Users with non-default
 // themes may briefly see default appearance on cold start; accepted trade-off
 // for faster time-to-first-paint.
+// Only local preferences load here. Server settings are fetched once, by
+// SessionAuthGate after authentication: a fetch from here duplicated that read
+// on every start, and failed on a password-protected server.
 void initializeAppearancePreferences().then(() => {
-  void Promise.all([
-    syncDesktopSettings(),
-    applyPersistedDirectoryPreferences(),
-  ]).catch((err) => {
+  void applyPersistedDirectoryPreferences().catch((err) => {
     console.error('[main] settings init failed:', err);
   });
 

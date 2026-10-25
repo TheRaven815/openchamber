@@ -20,6 +20,11 @@ import {
 import type { TimeFormatPreference } from '@/stores/useUIStore';
 import { formatDateTimeForPreference } from '@/lib/timeFormat';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
+import { cn } from '@/lib/utils';
+import { ContextPanelHeaderToolbar } from './contextPanelHeaderSlot';
+import { useInContextPanelHeader } from './contextPanelHeaderSlotContext';
+import { toolContentShellChars } from '@/lib/opencode/toolContentShells';
+import { composeContextBreakdown, type ContextBuckets } from './contextBreakdown';
 
 type SessionMessage = { info: Message; parts: Part[] };
 
@@ -42,13 +47,6 @@ type TokenBreakdown = {
   cacheRead: number;
   cacheWrite: number;
   total: number;
-};
-
-type ContextBuckets = {
-  user: number;
-  assistant: number;
-  tool: number;
-  other: number;
 };
 
 const EMPTY_BREAKDOWN: TokenBreakdown = {
@@ -177,7 +175,9 @@ const estimatePartChars = (part: Part, role: 'user' | 'assistant' | 'tool' | 'ot
       toolInputOutputLength
       + estimateTextLength(partRecord.raw)
       + Math.round(estimateTextLength(partRecord.metadata) * 0.25)
-      + Math.round(estimateTextLength(partRecord.state) * 0.1);
+      + Math.round(estimateTextLength(partRecord.state) * 0.1)
+      // A result left out of the page still counts, by the length the server reported.
+      + Math.round((toolContentShellChars(part) ?? 0) * 0.1);
 
     return { user: 0, assistant: 0, tool: toolPayloadLength, other: 0 };
   }
@@ -263,6 +263,7 @@ const resolveProviderAndModel = (
 
 export const ContextPanelContent: React.FC = () => {
   const { t } = useI18n();
+  const inPanelHeader = useInContextPanelHeader();
   const timeFormatPreference = useUIStore((state) => state.timeFormatPreference);
   const [expandedRawMessages, setExpandedRawMessages] = React.useState<Record<string, boolean>>({});
   const [copiedRawMessageId, setCopiedRawMessageId] = React.useState<string | null>(null);
@@ -332,10 +333,16 @@ export const ContextPanelContent: React.FC = () => {
       cache: { read: tokenBreakdown.cacheRead, write: tokenBreakdown.cacheWrite },
     });
 
-    const totalAssistantCost = assistantMessages.reduce((sum, message) => {
-      const cost = toNonNegativeNumber((message.info as { cost?: unknown }).cost);
-      return sum + cost;
-    }, 0);
+    // The session record carries the whole session's cost; the loaded
+    // messages are only its tail once a long chat was opened cold or cut back
+    // (`SessionMessageLoader.trimHistory`). A persisted snapshot strips the
+    // field, so the sum stands in until the live record arrives.
+    const totalAssistantCost = Number.isFinite(currentSession?.cost)
+      ? toNonNegativeNumber(currentSession?.cost)
+      : assistantMessages.reduce((sum, message) => {
+        const cost = toNonNegativeNumber((message.info as { cost?: unknown }).cost);
+        return sum + cost;
+      }, 0);
 
     const latestAssistantInfo = (contextMessage?.info ?? null) as (Message & { providerID?: string; modelID?: string }) | null;
     const providerModel = resolveProviderAndModel(
@@ -358,11 +365,17 @@ export const ContextPanelContent: React.FC = () => {
 
     const computedBreakdown = computeContextBreakdown(sessionMessages, systemPrompt);
 
-    const userTokens = computedBreakdown.user;
-    const assistantTokens = computedBreakdown.assistant;
-    const toolTokens = computedBreakdown.tool;
-    const otherTokens = Math.max(0, tokenBreakdown.input - userTokens - assistantTokens - toolTokens);
-    const breakdownTotal = userTokens + assistantTokens + toolTokens + otherTokens;
+    // The bar sits under the readout, so it is measured against the same window
+    // the readout reports, not against its own estimate. `other` is then the
+    // real unattributed remainder — prompt, schemas, skills, estimation error —
+    // rather than a leftover clamped to zero.
+    //
+    // A completed compaction record can still carry the summarizing turn's
+    // tokens. The readout shows `—` for that state because the fill is unknown,
+    // so the bar must not denominate against the pre-compaction window either;
+    // zero sends it to the estimate, which is the same fallback the panel
+    // documents for an unknown window.
+    const breakdown = composeContextBreakdown(computedBreakdown, { windowTokens: tokenBreakdown.total, compacted: isCompacted });
 
     const firstMessageTs = sessionMessages[0]?.info?.time?.created;
     const lastMessageTs = sessionMessages.length > 0
@@ -382,13 +395,8 @@ export const ContextPanelContent: React.FC = () => {
       cacheHitRate,
       totalAssistantCost,
       contextLimit,
-      breakdown: {
-        user: userTokens,
-        assistant: assistantTokens,
-        tool: toolTokens,
-        other: otherTokens,
-      },
-      breakdownTotal,
+      breakdown,
+      breakdownTotal: breakdown.total,
     };
   }, [currentSessionId, providers, sessionMessages, sessions, t]);
 
@@ -409,12 +417,23 @@ export const ContextPanelContent: React.FC = () => {
 
   return (
     <ScrollableOverlay outerClassName="h-full" className="bg-background">
+      {/* In the context panel the session title names the panel itself, in
+          place of the generic "Context" label. */}
+      {inPanelHeader ? (
+        <ContextPanelHeaderToolbar>
+          <div className="flex min-w-0 flex-1 items-center ps-1.5 pe-1">
+            <span dir="auto" className="truncate typography-ui-label text-foreground" title={viewModel.sessionTitle}>{viewModel.sessionTitle}</span>
+          </div>
+        </ContextPanelHeaderToolbar>
+      ) : null}
       <div className="mx-auto w-full max-w-[52rem] px-5 py-6">
 
         {/* ── Session header ── */}
         <div className="mb-6">
-          <h2 dir="auto" className="typography-ui-header font-semibold text-foreground truncate text-left">{viewModel.sessionTitle}</h2>
-          <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 typography-micro text-muted-foreground/70">
+          {inPanelHeader ? null : (
+            <h2 dir="auto" className="typography-ui-header font-semibold text-foreground truncate oc-ui-start-align">{viewModel.sessionTitle}</h2>
+          )}
+          <div className={cn(!inPanelHeader && 'mt-1', 'flex flex-wrap items-center gap-x-2 gap-y-0.5 typography-micro text-muted-foreground/70')}>
             <span>{viewModel.providerModel.providerName} / {viewModel.providerModel.modelName}</span>
             {viewModel.createdAt && (
               <>
@@ -563,7 +582,7 @@ export const ContextPanelContent: React.FC = () => {
                 >
                   <button
                     type="button"
-                    className="w-full cursor-pointer px-3 py-1.5 text-left hover:bg-[var(--interactive-hover)]"
+                    className="w-full cursor-pointer px-3 py-1.5 text-start hover:bg-[var(--interactive-hover)]"
                     aria-expanded={isExpanded}
                     onClick={() => {
                       setExpandedRawMessages((prev) => ({
@@ -595,20 +614,20 @@ export const ContextPanelContent: React.FC = () => {
                             {isAssistant ? assistantLeft : otherLabel}
                           </span>
                           {isAssistant && (
-                            <span className="text-right text-muted-foreground tabular-nums">
+                            <span className="text-end text-muted-foreground tabular-nums">
                               {assistantMiddle}
                             </span>
                           )}
                         </>
                       )}
-                      <span className="text-right text-muted-foreground">{previewTime}</span>
+                      <span className="text-end text-muted-foreground">{previewTime}</span>
                     </div>
                   </button>
 
                   {isExpanded && (
                     <div className="border-t border-[var(--surface-subtle)] p-0">
                       <div className="group relative max-h-[26rem] w-full overflow-auto bg-[var(--surface-background)]">
-                        <div className="absolute top-1 right-2 z-10 opacity-0 transition-opacity group-hover:opacity-100">
+                        <div className="absolute top-1 inset-e-2 z-10 opacity-0 transition-opacity group-hover:opacity-100">
                           <button
                             type="button"
                             className="rounded p-1 text-muted-foreground transition-colors hover:bg-interactive-hover/60 hover:text-foreground"

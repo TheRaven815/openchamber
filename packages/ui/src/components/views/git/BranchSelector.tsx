@@ -22,6 +22,7 @@ import { useI18n } from '@/lib/i18n';
 import { useDeviceInfo } from '@/lib/device';
 import { getGitUnpushedBranchCounts } from '@/lib/gitApi';
 import { getRecentBranches, rememberRecentBranch } from './recentBranches';
+import { sanitizeBranchNameInput } from './branchName';
 
 interface BranchInfo {
   ahead?: number;
@@ -45,19 +46,6 @@ interface BranchSelectorProps {
    */
   switchBlockedNotice?: string | null;
 }
-
-const sanitizeBranchNameInput = (value: string): string => {
-  return value
-    .trim()
-    .replace(/\s+/g, '-')
-    .replace(/[^A-Za-z0-9._/-]/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/\/{2,}/g, '/')
-    .replace(/\/-+/g, '/')
-    .replace(/-+\//g, '/')
-    .replace(/^[-/]+/, '')
-    .replace(/[-/]+$/, '');
-};
 
 export const BranchSelector: React.FC<BranchSelectorProps> = ({
   currentBranch,
@@ -174,7 +162,7 @@ export const BranchSelector: React.FC<BranchSelectorProps> = ({
           key={`${remote ? 'remote' : 'local'}-${branch}`}
           type="button"
           onClick={() => handleCheckout(branch)}
-          className="flex w-full items-center gap-2 rounded-lg px-2 py-2.5 text-left typography-ui-label hover:bg-interactive-hover"
+          className="flex w-full items-center gap-2 rounded-lg px-2 py-2.5 text-start typography-ui-label hover:bg-interactive-hover"
         >
           <span className="min-w-0 flex-1 truncate">{branch}</span>
           {ahead > 0 ? (
@@ -197,12 +185,12 @@ export const BranchSelector: React.FC<BranchSelectorProps> = ({
         <Button
           variant="ghost"
           size="sm"
-          className="h-8 min-w-0 max-w-full justify-start gap-1.5 px-2 py-1"
+          className="min-w-0 max-w-full justify-start gap-1.5 px-2 py-1"
           disabled={disabled}
           onClick={() => setIsOpen(true)}
         >
           <Icon name="git-branch" className="size-4 text-primary" />
-          <span className="min-w-0 truncate font-medium text-left">
+          <span className="min-w-0 truncate font-medium text-start">
             {currentBranch || t('gitView.branch.detachedHead')}
           </span>
           <Icon name="arrow-down-s" className="size-4 opacity-60" />
@@ -220,7 +208,7 @@ export const BranchSelector: React.FC<BranchSelectorProps> = ({
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               placeholder={t('gitView.branch.searchPlaceholder')}
-              className="oc-surface-elevated h-9 w-full rounded-lg border border-border bg-surface-elevated px-3 typography-meta outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+              className="oc-surface-elevated oc-raised oc-field h-9 w-full rounded-lg bg-surface-elevated px-3 typography-meta outline-none placeholder:text-muted-foreground"
             />
             {switchBlockedNotice ? (
               <div className="flex items-start gap-2 px-2 py-1">
@@ -256,12 +244,19 @@ export const BranchSelector: React.FC<BranchSelectorProps> = ({
             <Button
               variant="ghost"
               size="sm"
-              className="h-8 min-w-0 max-w-full justify-start gap-1.5 px-2 py-1"
+              /* Keeps its width in a row; the Git panel header lets it
+                 shrink only once the repository picker is down to its icon
+                 (`branch-selector__trigger`, index.css). */
+              className="branch-selector__trigger max-w-full justify-start gap-1.5 px-2 py-1"
               disabled={disabled}
             >
               <Icon name="git-branch" className="size-4 text-primary" />
-              <span className="min-w-0 truncate font-medium text-left">
-                {currentBranch || t('gitView.branch.detachedHead')}
+              {/* Like the repository picker: the name truncates down to the
+                  icon and chevron, which stay. */}
+              <span className="grid min-w-0 grid-cols-[minmax(0,max-content)]">
+                <span className="truncate font-medium text-start">
+                  {currentBranch || t('gitView.branch.detachedHead')}
+                </span>
               </span>
               <Icon name="arrow-down-s" className="size-4 opacity-60" />
             </Button>

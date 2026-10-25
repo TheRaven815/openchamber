@@ -27,8 +27,15 @@ import {
   WorkStatusValue,
 } from './WorkStatusPrimitives';
 import { useReportWorkStatusPresence } from './presenceContext';
+import { WorkStatusWarmingToggle } from './WorkStatusWarmingToggle';
 import { changeRequestCopy } from '@/lib/source-control/changeRequestCopy';
-import { formatChangeRequestReference } from '@/lib/source-control/identity';
+import { formatChangeRequestReference } from '@/lib/source-control/providers/terminology';
+import { useSourceControlProvider } from '@/lib/source-control/providers/registry';
+import { ProjectActionsButton } from '@/components/layout/ProjectActionsButton';
+import { OpenInAppButton } from '@/components/desktop/OpenInAppButton';
+import { useProjectActionsContext } from '@/hooks/useProjectActionsContext';
+import { PrChecksValue } from './PrChecksValue';
+import { prChecksTooltip } from './prChecks';
 
 type Props = {
   sessionId: string | null;
@@ -54,6 +61,7 @@ const UNKNOWN_PERCENT = '\u2014';
  */
 export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, goalRow, showSession, showRepository, children }) => {
   const { t } = useI18n();
+  const projectActionsContext = useProjectActionsContext();
   const { git } = useRuntimeAPIs();
   const ensureStatus = useGitStore((state) => state.ensureStatus);
   const fetchStatus = useGitStore((state) => state.fetchStatus);
@@ -162,14 +170,15 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
   // here would multiply GitHub requests per open session, which is exactly the
   // fan-out the PR-status concurrency gate exists to prevent.
   const prSummary = useFreshestSourceControlVisualSummaryForBranch(gitDirectory, branch);
+  const prDescriptor = useSourceControlProvider(prSummary?.provider);
+  const prTerm = prDescriptor.terminology.changeRequest;
 
   const sessionMessages = useSessionMessages(sessionId ?? '', directory ?? undefined);
   const { context: contextLimit } = useContextWindowLimits(sessionId, directory ?? undefined);
 
-  // Computed from this session's own messages rather than through
-  // `useSessionUIStore.getContextUsage`, which reads the *current* directory's
-  // store and so loses the readout for any session held elsewhere. See
-  // `contextUsage.ts`.
+  // Computed from this session's own messages rather than the header's
+  // reading, which reads the *current* directory's store and so loses the
+  // readout for any session held elsewhere. See `contextUsage.ts`.
   const contextUsage = React.useMemo(
     () => computeContextUsage(sessionMessages, contextLimit),
     [sessionMessages, contextLimit],
@@ -179,8 +188,13 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
   const openContextOverview = useUIStore((state) => state.openContextOverview);
   const openContextPanelTab = useUIStore((state) => state.openContextPanelTab);
   const openSurface = React.useCallback(
-    (mode: 'git' | 'pr') => { if (directory) openContextSurface(directory, mode); },
-    [directory, openContextSurface],
+    (mode: 'git' | 'pr') => {
+      if (!directory) return;
+      // The branch's pull request is the Tracker's branch tab, whichever item tab was last in front.
+      if (mode === 'pr') openContextPanelTab(directory, { mode: 'pr' });
+      else openContextSurface(directory, mode);
+    },
+    [directory, openContextPanelTab, openContextSurface],
   );
   // Working-tree diff without a target path: the panel opens on the whole
   // change set rather than picking a file on the user's behalf.
@@ -247,7 +261,7 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
   // restate the number directly above it.
   const showCostBreakdown = cost !== null && subagentCount > 0 && subagentCost > 0;
   const hasSession = showSession && (contextUsage !== null || cost !== null || Boolean(goalRow));
-  const hasRepository = showRepository && Boolean(branch || changed || prSummary || attentionLabel);
+  const hasRepository = showRepository && Boolean(branch || changed || prSummary || attentionLabel || projectActionsContext);
 
   useReportWorkStatusPresence('session-repository', hasSession || hasRepository);
 
@@ -263,6 +277,8 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
                 label={t('chat.workStatus.context.label')}
                 value={(
                   <>
+                    {/* Keeping the cache warm is about this context, so its switch sits on the row. */}
+                    <WorkStatusWarmingToggle sessionId={sessionId} directory={directory} />
                     <WorkStatusValue>{usagePercent !== null ? formatPercent(usagePercent) : UNKNOWN_PERCENT}</WorkStatusValue>
                     {/* No icon of its own: the sprite has no currency glyph, and
                         spend belongs with consumption anyway. The `$` labels it. */}
@@ -272,7 +288,7 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
               />
               <WorkStatusMeter percent={usagePercent ?? 0} color={meterColor} />
               {contextUsage.state === 'compacted' ? (
-                <p className="mx-1 mb-1 text-[11px] leading-4 text-muted-foreground">
+                <p className="mx-1 mb-1 text-[0.6875rem] leading-4 text-muted-foreground">
                   {t('contextUsage.compacted.description')}
                 </p>
               ) : null}
@@ -280,7 +296,7 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
                   than reporting a reading of its own, so it carries no icon
                   and no label column. */}
               {showCostBreakdown ? (
-                <p className="mx-1 mb-1 truncate text-[11px] leading-4 text-muted-foreground tabular-nums">
+                <p className="mx-1 mb-1 truncate text-[0.6875rem] leading-4 text-muted-foreground tabular-nums">
                   {t('chat.workStatus.cost.breakdown', {
                     session: formatCost(ownCost),
                     subagents: formatCost(subagentCost),
@@ -298,7 +314,10 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
       repository: hasRepository ? (
         <WorkStatusSection
           title={t('chat.workStatus.section.project')}
-          summary={projectLabel}
+          subject={projectLabel}
+          summary={projectActionsContext?.directory
+            ? <OpenInAppButton directory={projectActionsContext.directory} />
+            : null}
         >
           {attentionLabel ? <WorkStatusCallout>{attentionLabel}</WorkStatusCallout> : null}
 
@@ -358,15 +377,15 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
               <WorkStatusRow
                 icon="git-pull-request"
                 onClick={directory ? () => openSurface('pr') : undefined}
-                ariaLabel={t(changeRequestCopy('chat.workStatus.action.openPr', prSummary.provider))}
+                ariaLabel={t(changeRequestCopy('chat.workStatus.action.openPr', prTerm))}
                 iconColor={`var(--pr-${prSummary.visualState})`}
-                label={prSummary.title ?? t(changeRequestCopy('chat.workStatus.pr.untitled', prSummary.provider))}
+                label={prSummary.title ?? t(changeRequestCopy('chat.workStatus.pr.untitled', prTerm))}
                 value={(
                   <WorkStatusPill
                     color={`var(--pr-${prSummary.visualState})`}
                     background={`color-mix(in srgb, var(--pr-${prSummary.visualState}) 18%, transparent)`}
                   >
-                    {prSummary.draft ? t('chat.workStatus.pr.draft') : formatChangeRequestReference(prSummary.provider, prSummary.number)}
+                    {prSummary.draft ? t('chat.workStatus.pr.draft') : formatChangeRequestReference(prDescriptor, prSummary.number)}
                   </WorkStatusPill>
                 )}
               />
@@ -374,32 +393,18 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
                 <WorkStatusRow
                   icon="checkbox-circle"
                   onClick={directory ? () => openSurface('pr') : undefined}
-                  ariaLabel={t(changeRequestCopy('chat.workStatus.action.openPr', prSummary.provider))}
+                  ariaLabel={t(changeRequestCopy('chat.workStatus.action.openPr', prTerm))}
                   label={t('chat.workStatus.pr.checks')}
                   muted
-                  value={(
-                    <>
-                      {prSummary.checks.failure > 0 ? (
-                        <WorkStatusValue tone="error">
-                          {t('chat.workStatus.pr.checksFailed', { count: prSummary.checks.failure })}
-                        </WorkStatusValue>
-                      ) : null}
-                      {prSummary.checks.pending > 0 ? (
-                        <WorkStatusValue tone="warning">
-                          {t('chat.workStatus.pr.checksPending', { count: prSummary.checks.pending })}
-                        </WorkStatusValue>
-                      ) : null}
-                      {prSummary.checks.failure === 0 && prSummary.checks.pending === 0 ? (
-                        <WorkStatusValue tone="success">
-                          {t('chat.workStatus.pr.checksPassed', { count: prSummary.checks.success })}
-                        </WorkStatusValue>
-                      ) : null}
-                    </>
-                  )}
+                  tooltip={prChecksTooltip(prSummary.checks, t)}
+                  value={<PrChecksValue checks={prSummary.checks} />}
                 />
               ) : null}
             </>
           ) : null}
+
+          {/* Last: the readouts above describe the project, this runs something in it. */}
+          {projectActionsContext ? <ProjectActionsButton /> : null}
         </WorkStatusSection>
       ) : null,
   });

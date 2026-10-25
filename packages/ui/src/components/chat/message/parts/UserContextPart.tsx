@@ -3,10 +3,15 @@ import React from 'react';
 import { Icon } from '@/components/icon/Icon';
 import type { IconName } from '@/components/icon/icons';
 import { useI18n } from '@/lib/i18n';
+import { changeRequestCopy } from '@/lib/source-control/changeRequestCopy';
+import { useChangeRequestTerm } from '@/lib/source-control/providers/registry';
 import type { ContextPartPayload } from '@/lib/messages/contextParts';
 import { cn } from '@/lib/utils';
+import { withAttachmentChips } from './attachmentCitationChips';
 import { legacyChatQuoteAnchor } from '@/lib/chatQuoteAnchor';
 import { useChatQuoteHighlightApi } from '../../hooks/chatQuoteHighlightStore';
+import { fileWithDiffCommentOrigin } from '@/lib/diffCommentOrigin';
+import { isWholeFileComment } from '@/components/comments/wholeFileComment';
 
 /**
  * A context item attached to a user message: an inline code comment, a
@@ -38,7 +43,9 @@ const ContextCard: React.FC<{
     onExpand?: () => void;
     /** Scroll to where the quote came from, with the button's label. */
     reveal?: { label: string; onReveal: () => void };
-}> = ({ icon, summary, title, body, text, mono, collapsed, onExpand, reveal }) => {
+    /** The message's file names: `[name]` in the user's comment renders as a file chip. */
+    attachmentFilenames: readonly string[];
+}> = ({ icon, summary, title, body, text, mono, collapsed, onExpand, reveal, attachmentFilenames }) => {
     const [expanded, setExpanded] = React.useState(false);
     const hasBody = body.trim().length > 0;
     const hasText = text.trim().length > 0;
@@ -56,7 +63,7 @@ const ContextCard: React.FC<{
         };
         return (
             <div
-                className="my-1 flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-l-2 border-[var(--interactive-border)] pl-3 text-xs text-muted-foreground"
+                className="my-1 flex min-w-0 max-w-full cursor-pointer items-center gap-1.5 border-s-2 border-[var(--interactive-border)] ps-3 text-xs text-muted-foreground"
                 role="button"
                 tabIndex={0}
                 onClick={onExpand}
@@ -67,10 +74,10 @@ const ContextCard: React.FC<{
                 <span className="truncate">
                     {comment.length > 0 ? `${summary}: ` : summary}
                     {comment.length > 0 ? (
-                        <span className="text-sm text-[var(--surface-foreground)]">{comment}</span>
+                        <span className="text-sm text-[var(--surface-foreground)]">{withAttachmentChips(comment, attachmentFilenames, 'comment')}</span>
                     ) : null}
                 </span>
-                <Icon name="arrow-down-s" className="ml-auto h-3.5 w-3.5 shrink-0 text-muted-foreground/70" />
+                <Icon name="arrow-down-s" className="ms-auto h-3.5 w-3.5 shrink-0 text-muted-foreground/70" />
             </div>
         );
     }
@@ -78,7 +85,7 @@ const ContextCard: React.FC<{
     return (
         <div className="my-1.5 min-w-0 max-w-full">
             <div
-                className={cn('min-w-0 border-l-2 border-[var(--interactive-border)] pl-3', hasBody && 'cursor-pointer')}
+                className={cn('min-w-0 border-s-2 border-[var(--interactive-border)] ps-3', hasBody && 'cursor-pointer')}
                 onClick={hasBody ? () => setExpanded((value) => !value) : undefined}
                 title={title}
             >
@@ -114,7 +121,9 @@ const ContextCard: React.FC<{
                 ) : null}
             </div>
             {hasText ? (
-                <div className="mt-1.5 whitespace-pre-wrap break-words font-sans text-sm text-[var(--surface-foreground)]">{text}</div>
+                <div className="mt-1.5 whitespace-pre-wrap break-words font-sans text-sm text-[var(--surface-foreground)]">
+                    {withAttachmentChips(text, attachmentFilenames, 'comment')}
+                </div>
             ) : null}
         </div>
     );
@@ -130,20 +139,29 @@ const UserContextPart: React.FC<{
     /** Message-level collapse state, shared with the text parts. */
     collapsed?: boolean;
     onExpand?: () => void;
-}> = ({ payload, collapsed, onExpand }) => {
+    attachmentFilenames: readonly string[];
+}> = ({ payload, collapsed, onExpand, attachmentFilenames }) => {
     const { t } = useI18n();
     const quoteHighlights = useChatQuoteHighlightApi();
-    const shared = { collapsed, onExpand };
+    // A part without a provider was written before providers other than GitHub existed: a pull request.
+    const changeRequestTerm = useChangeRequestTerm(payload.kind === 'pr-comment' || payload.kind === 'pr-check' ? payload.provider : null);
+    const shared = { collapsed, onExpand, attachmentFilenames };
 
     switch (payload.kind) {
         case 'code-comment': {
-            const file = basename(payload.fileLabel);
-            const summary = payload.startLine === payload.endLine
+            const file = fileWithDiffCommentOrigin(basename(payload.fileLabel), payload.origin);
+            const fullFile = fileWithDiffCommentOrigin(payload.fileLabel, payload.origin);
+            const wholeFile = isWholeFileComment(payload);
+            const summary = wholeFile
+                ? t('chat.message.context.codeCommentFile', { file })
+                : payload.startLine === payload.endLine
                 ? t('chat.message.context.codeCommentLine', { file, line: payload.startLine })
                 : t('chat.message.context.codeComment', { file, start: payload.startLine, end: payload.endLine });
-            const fullTitle = payload.startLine === payload.endLine
-                ? t('chat.message.context.codeCommentLine', { file: payload.fileLabel, line: payload.startLine })
-                : t('chat.message.context.codeComment', { file: payload.fileLabel, start: payload.startLine, end: payload.endLine });
+            const fullTitle = wholeFile
+                ? t('chat.message.context.codeCommentFile', { file: fullFile })
+                : payload.startLine === payload.endLine
+                ? t('chat.message.context.codeCommentLine', { file: fullFile, line: payload.startLine })
+                : t('chat.message.context.codeComment', { file: fullFile, start: payload.startLine, end: payload.endLine });
             return <ContextCard icon="chat-1" summary={summary} title={fullTitle} body={payload.code} text={payload.text} mono {...shared} />;
         }
         case 'terminal':
@@ -176,7 +194,7 @@ const UserContextPart: React.FC<{
             return (
                 <ContextCard
                     icon="git-pull-request"
-                    summary={t(payload.provider === 'gitlab' ? 'chat.message.context.mrComment' : 'chat.message.context.prComment', { label: payload.label })}
+                    summary={t(changeRequestCopy('chat.message.context.prComment', changeRequestTerm), { label: payload.label })}
                     body={payload.body}
                     text={payload.text}
                     {...shared}
@@ -186,7 +204,7 @@ const UserContextPart: React.FC<{
             return (
                 <ContextCard
                     icon="close-circle"
-                    summary={t(payload.provider === 'gitlab' ? 'chat.message.context.mrCheck' : 'chat.message.context.prCheck', { label: payload.label })}
+                    summary={t(changeRequestCopy('chat.message.context.prCheck', changeRequestTerm), { label: payload.label })}
                     body={payload.output}
                     text={payload.text}
                     mono
@@ -221,8 +239,9 @@ const UserContextPart: React.FC<{
             );
         }
         case 'repository-issue':
+        case 'repository-discussion':
         case 'change-request':
-        case 'linear-issue':
+        case 'tracker-item':
         case 'guest-issue':
         case 'guest-pr':
             // Rendered as link attachments by normalizeUserDisplayParts.

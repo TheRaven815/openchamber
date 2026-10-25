@@ -49,7 +49,7 @@ export const useGuestSurfaces = (): ContextSurfaceDescriptor[] => {
   return React.useMemo(() => {
     return enabledGuestSurfaces(guests, getRuntimeUrlResolver().authenticatedAsset);
     // runtimeKey: the asset resolver answers for the active runtime, so a switch recomputes the list.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [guests, runtimeKey]);
 };
 
@@ -72,7 +72,7 @@ export const useGuestStatusSections = (): InstalledGuest[] => {
   const guests = useGuestsStore((state) => state.guests);
   return React.useMemo(() => {
     if (isVSCodeRuntime() || isMobileSurfaceRuntime()) return EMPTY_STATUS_SECTIONS;
-    const sections = guests.filter((guest) => guest.statusEntry && isGuestActive(guest));
+    const sections = guests.filter((guest) => (guest.statusEntry || guest.statusSource) && isGuestActive(guest));
     return sections.length > 0 ? sections : EMPTY_STATUS_SECTIONS;
   }, [guests]);
 };
@@ -130,6 +130,6 @@ export const useGuestAttachItems = (): GuestAttachItem[] => {
     }
     return items;
     // runtimeKey: the asset resolver answers for the active runtime, so a switch recomputes the list.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [guests, runtimeKey]);
 };

@@ -8,6 +8,7 @@ import {
 import { dropGuestTokens } from './auth-store.js';
 import { resolveHostAccessToken } from './host-session.js';
 import { GuestOAuthError, guestAuthorizationHeader, refreshGuestAccessToken, takeUsableGuestAuth } from './oauth.js';
+import { readBoundedResponseText } from './response-body.js';
 
 const METHODS = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -36,11 +37,14 @@ export const joinGuestRequestUrl = (apiOrigin, path, query) => {
 };
 
 const readCappedBody = async (response) => {
-  const text = await response.text();
-  if (text.length <= GUEST_REQUEST_RESPONSE_MAX) {
-    return text;
+  const body = await readBoundedResponseText(response, GUEST_REQUEST_RESPONSE_MAX);
+  if (body.tooLarge) {
+    throw new GuestOAuthError(
+      `The API answered with more than ${GUEST_REQUEST_RESPONSE_MAX} bytes. Ask for a smaller page.`,
+      'RESPONSE_TOO_LARGE',
+    );
   }
-  return text.slice(0, GUEST_REQUEST_RESPONSE_MAX);
+  return body.text;
 };
 
 const sendAuthorized = async (url, method, body, accessToken, authorization) => {
@@ -60,7 +64,7 @@ const sendAuthorized = async (url, method, body, accessToken, authorization) => 
   });
 };
 
-export const proxyGuestRequest = async ({ guest, persistPath, method, path, query, body }) => {
+export const proxyGuestRequest = async ({ guest, trackers = null, persistPath, method, path, query, body }) => {
   const api = resolveIntegrationApi(guest.integration ?? {});
   if (!api) {
     throw new GuestOAuthError('This guest does not declare an API origin.', 'NO_INTEGRATION');
@@ -72,7 +76,7 @@ export const proxyGuestRequest = async ({ guest, persistPath, method, path, quer
   if (!url) {
     throw new GuestOAuthError('Request path must stay on the declared apiOrigin.', 'BAD_PATH');
   }
-  const hostToken = await resolveHostAccessToken(guest.integration);
+  const hostToken = await resolveHostAccessToken(guest.integration, trackers);
   const stored = hostToken ? null : await takeUsableGuestAuth(guest, persistPath);
   let accessToken = hostToken ?? stored?.accessToken;
   if (!accessToken) {
@@ -82,7 +86,7 @@ export const proxyGuestRequest = async ({ guest, persistPath, method, path, quer
   let response = await sendAuthorized(url, method, body, accessToken, api.authorization);
   if (response.status === 401) {
     const refreshed = hostToken
-      ? await resolveHostAccessToken(guest.integration)
+      ? await resolveHostAccessToken(guest.integration, trackers)
       : await refreshGuestAccessToken({ guest, persistPath }).catch(() => null);
     // Only the tokens this request was refused with are dropped. A refresh
     // that came back null because the user connected again meanwhile (new

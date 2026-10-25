@@ -1,14 +1,8 @@
 import { useSessionTabsStore } from '@/stores/useSessionTabsStore';
 import { useGlobalSessionsStore, resolveGlobalSessionDirectory } from '@/stores/useGlobalSessionsStore';
 import { useSessionUIStore } from '@/sync/session-ui-store';
+import { useProjectsStore } from '@/stores/useProjectsStore';
 
-/**
- * Close one header session tab. Closing the active tab activates its right
- * neighbour (falling back left), or opens a new-session draft when it was the
- * last tab. Only tabs whose session is present in the loaded session list
- * count as neighbours — the same rule the strip uses for rendering. The
- * session itself is never touched.
- */
 /**
  * Activate the nth (0-based) header session tab, counting only tabs whose
  * session is present in the loaded session list — the same rule the strip
@@ -48,6 +42,13 @@ export const activateAdjacentSessionTab = (delta: -1 | 1): boolean => {
   return true;
 };
 
+/**
+ * Close one header session tab. Closing the active tab activates its right
+ * neighbour (falling back left), or opens a new-session draft when it was the
+ * last tab. Only tabs whose session is present in the loaded session list
+ * count as neighbours — the same rule the strip uses for rendering. The
+ * session itself is never touched.
+ */
 export const closeSessionTabAndActivateNeighbour = (sessionId: string): void => {
   const { tabIds, closeTab } = useSessionTabsStore.getState();
   if (!tabIds.includes(sessionId)) return;
@@ -69,4 +70,37 @@ export const closeSessionTabAndActivateNeighbour = (sessionId: string): void => 
   }
 
   closeTab(sessionId);
+};
+
+/**
+ * Work that is done or removed leaves the working set, as Mark done in the
+ * composer does: the header tabs of `sessionIds` close, and when the open
+ * session is one of them the app moves to the neighbouring tab still at work,
+ * or with none to a new draft in `projectId` or the active project (never in the folder of
+ * the work just closed, which may be gone). Without header tabs (mobile,
+ * VS Code, tabs off) only the move away from the open session applies.
+ */
+export const leaveFinishedSessions = (sessionIds: readonly string[], options?: { projectId?: string | null }): void => {
+  if (sessionIds.length === 0) return;
+  const finished = new Set(sessionIds);
+  const { tabIds, removeTabs } = useSessionTabsStore.getState();
+  const { currentSessionId, setCurrentSession, openNewSessionDraft } = useSessionUIStore.getState();
+  if (currentSessionId && finished.has(currentSessionId)) {
+    const sessionsById = new Map(
+      useGlobalSessionsStore.getState().activeSessions.map((session) => [session.id, session] as const),
+    );
+    const index = tabIds.indexOf(currentSessionId);
+    const atWork = (id: string): boolean => !finished.has(id) && sessionsById.has(id);
+    const neighbourId = index === -1
+      ? null
+      : tabIds.slice(index + 1).find(atWork) ?? [...tabIds.slice(0, index)].reverse().find(atWork) ?? null;
+    const neighbour = neighbourId ? sessionsById.get(neighbourId) : null;
+    if (neighbour) {
+      setCurrentSession(neighbour.id, resolveGlobalSessionDirectory(neighbour));
+    } else {
+      const projectId = options?.projectId ?? useProjectsStore.getState().activeProjectId;
+      openNewSessionDraft(projectId ? { selectedProjectId: projectId } : undefined);
+    }
+  }
+  removeTabs(sessionIds);
 };

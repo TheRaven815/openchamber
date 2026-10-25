@@ -1,26 +1,26 @@
 /**
- * OpenChamber-owned session archive state.
+ * Session archive state that OpenCode does not hold.
  *
- * OpenCode 2.x still carries `SessionInfo.time.archived` on the wire (sessions
- * migrated from v1 keep the flag) but has no route that sets or clears it, so
- * archiving is an OpenChamber capability now. The state lives beside the
- * OpenCode instance it describes — one JSON file per data dir,
- * `{ [sessionID]: archivedAt | null }` — and the proxy folds it back onto the
- * session records it serves: a number archives, `null` is an explicit
- * unarchive that overrides what OpenCode still carries, and a session the file
- * does not mention keeps whatever OpenCode says.
+ * OpenCode 2.1 archives sessions itself (`PATCH /api/session/{id}` with
+ * `archived`), and `session-archive.js` sends every archive there. This file
+ * keeps what OpenCode cannot take yet or at all:
+ *
+ * - a session of a removed worktree while it moves to its project's main
+ *   folder, and for good when it cannot (the whole project is gone);
+ * - entries written before 2.1 that the migration has not pushed yet.
+ *
+ * One JSON file per data dir, `{ [sessionID]: archivedAt | null }`, folded onto
+ * the session records the proxy serves: a number archives, `null` is an
+ * explicit unarchive that overrides what OpenCode carries, and a session the
+ * file does not mention keeps whatever OpenCode says. An entry leaves the file
+ * once OpenCode holds the session's state.
  */
 
+import { asNonEmptyString } from '../shared/guards.js';
 import fsDefault from 'node:fs';
 import pathDefault from 'node:path';
 
 const ARCHIVE_FILE_NAME = 'sessions-archive.json';
-
-const asNonEmptyString = (value) => {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
-};
 
 const asTimestamp = (value) => (Number.isSafeInteger(value) && value > 0 ? value : null);
 
@@ -52,9 +52,8 @@ export const createArchiveStore = ({
 }) => {
   const filePath = path.join(dataDir, ARCHIVE_FILE_NAME);
 
-  /** sessionID → archivedAt (ms). Authoritative once `loaded` is true. */
+  /** sessionID → archivedAt (ms), or null for an explicit unarchive. */
   const entries = new Map();
-  let loaded = false;
   let loadPromise = null;
   /**
    * Writes stay disabled until one load has told us what is already on disk.
@@ -132,7 +131,6 @@ export const createArchiveStore = ({
           for (const [id, archivedAt] of result.stored) {
             if (!entries.has(id)) entries.set(id, archivedAt);
           }
-          loaded = true;
           writable = true;
         } else {
           // Let a later call retry; until one succeeds the store answers reads
@@ -154,6 +152,26 @@ export const createArchiveStore = ({
     const tmpPath = `${filePath}.${process.pid}.tmp`;
     await fsPromises.writeFile(tmpPath, payload, 'utf8');
     await fsPromises.rename(tmpPath, filePath);
+  };
+
+  /**
+   * Drops entries OpenCode now holds the state for. Writes only when one of
+   * the ids had an entry; a failed write restores them and reports them.
+   */
+  const forgetExclusive = async (targets) => {
+    const loadResult = await load();
+    if (!loadResult.ok || !writable) return { failedIds: targets.filter((id) => entries.has(id)) };
+    const removed = targets.filter((id) => entries.has(id)).map((id) => [id, entries.get(id)]);
+    if (removed.length === 0) return { failedIds: [] };
+    for (const [id] of removed) entries.delete(id);
+    try {
+      await persist();
+    } catch (error) {
+      for (const [id, value] of removed) entries.set(id, value);
+      console.warn('[openchamber-sessions] failed to persist archive state:', error?.message ?? error);
+      return { failedIds: removed.map(([id]) => id) };
+    }
+    return { failedIds: [] };
   };
 
   /** Applies a batch and rolls the memory back when the file write fails. */
@@ -196,19 +214,21 @@ export const createArchiveStore = ({
   return {
     load,
     getAll,
-    list: getAll,
-    isLoaded: () => loaded,
-    isArchived: async (id) => {
+    /**
+     * The file's entry for a session: a timestamp, `null` for an explicit
+     * unarchive, `undefined` when the file does not mention it and OpenCode's
+     * record decides.
+     */
+    entry: async (id) => {
       const sessionID = asNonEmptyString(id);
-      if (!sessionID) return false;
+      if (!sessionID) return undefined;
       await load();
-      return typeof entries.get(sessionID) === 'number';
+      return entries.get(sessionID);
     },
-    archivedAt: async (id) => {
-      const sessionID = asNonEmptyString(id);
-      if (!sessionID) return null;
-      await load();
-      return entries.get(sessionID) ?? null;
+    forget: async (ids) => {
+      const targets = asIdList(ids);
+      if (targets.length === 0) return { failedIds: [] };
+      return runExclusive(() => forgetExclusive(targets));
     },
     archive: async (ids, archivedAt) => {
       const stamp = asTimestamp(archivedAt) ?? now();

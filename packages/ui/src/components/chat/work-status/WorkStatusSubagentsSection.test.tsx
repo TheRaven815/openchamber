@@ -67,6 +67,7 @@ describe('subagent status rows', () => {
     ({ WorkStatusSubagentsSection } = await import('./WorkStatusSubagentsSection'));
     useUIStore.setState({ workStatusExpandedSections: {} });
     useSessionActivityTimingStore.setState({ startedAt: new Map(), settledMs: new Map() });
+    useGlobalSessionStatusStore.setState({ observedById: new Map(), statusById: new Map() });
     container = document.createElement('div');
     document.body.appendChild(container);
     root = createRoot(container);
@@ -143,6 +144,45 @@ describe('subagent status rows', () => {
     expect(titles()).toEqual(['Older', 'Newer']);
     await publish({ session_status: { older: { type: 'idle' }, newer: { type: 'idle' } } });
     expect(titles()).toEqual(['Newer', 'Older']);
+  });
+
+  test('keeps a running row above rows whose status is still unknown', async () => {
+    const older: Session = { ...child, id: 'older', title: 'Older', time: { created: 2, updated: 2 } };
+    const newer: Session = { ...child, id: 'newer', title: 'Newer', time: { created: 3, updated: 3 } };
+    const titles = () => Array.from(container.querySelectorAll<HTMLButtonElement>('button[aria-label]'))
+      .map((button) => button.parentElement?.textContent?.replace(/\$.*$/, ''));
+    await publish({ session: [parent, older, newer], session_status: { older: { type: 'busy' } } });
+    expect(titles()).toEqual(['Older', 'Newer']);
+  });
+
+  test('settles a child whose directory differs only in formatting from the panel', async () => {
+    await publish({ session: [parent, { ...child, directory: `${directory}/` }], sessionStatusReady: true });
+    expect(icon()).toBe('#oc-checkbox-circle');
+    await publish({ sessionStatusInvalidated: { child: true } });
+    expect(icon()).toBe('#oc-time');
+  });
+
+  test('settles a child that moved to another worktree from the panel snapshot', async () => {
+    // The host's list of running sessions covers every host directory, so a
+    // reload after the child finished there still shows it done.
+    await publish({ session: [parent, { ...child, directory: '/subagent-test-worktree' }] });
+    expect(icon()).toBe('#oc-time');
+    await publish({ sessionStatusReady: true });
+    expect(icon()).toBe('#oc-checkbox-circle');
+    await publish({ session_status: { child: { type: 'busy' } } });
+    expect(icon()).toBe('#oc-record-circle');
+  });
+
+  test('settles a child the global status store saw finish', async () => {
+    // A space answers for its own sessions, so the host panel's snapshot
+    // does not cover a child inside one.
+    const spaceDirectory = '/spaces/0123456789ab/app';
+    await publish({ session: [parent, { ...child, directory: spaceDirectory }], sessionStatusReady: true });
+    expect(icon()).toBe('#oc-time');
+    await act(async () => useGlobalSessionStatusStore.setState({
+      observedById: new Map([['child', { directory: spaceDirectory, outcome: 'completed' }]]),
+    }));
+    expect(icon()).toBe('#oc-checkbox-circle');
   });
 
   test('shows an observed current-turn duration only while running and expanded', async () => {

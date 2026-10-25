@@ -8,6 +8,9 @@ import request from 'supertest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createAgentToolRuntime } from './runtime.js';
+import { createOpenChamberControlService } from '../openchamber-control/service.js';
+import { createProjectContextRuntime } from '../project-context/runtime.js';
+import { createProjectIdFromPath } from '../projects/project-id.js';
 import { OPENCHAMBER_AGENT_TOOL_ACTION_DEFINITIONS, OPENCHAMBER_CONTROL_ACTION_DEFINITIONS } from '../openchamber-control/actions.js';
 
 const temporaryDirectories = [];
@@ -24,7 +27,7 @@ const createRuntime = async (overrides = {}) => {
     crypto,
     fsPromises: fs,
     path,
-    dataDir,
+    instanceDir: dataDir,
     getActivePort: () => 3901,
     executeAction,
     ...overrides,
@@ -41,15 +44,20 @@ const prepareManagedEnv = async (runtime, options) => {
 };
 
 /** Loads the generated plugin and returns the tools it registers, by name. */
-const loadTools = async (dataDir, tag) => {
+// `hooks` collects the session hooks the plugin registers, by name, and
+// `removed` the ids of OpenCode's own tools it takes away.
+const loadTools = async (dataDir, tag, hooks = {}, removed = []) => {
   const entrypoint = path.join(pluginDirectoryFor(dataDir), 'index.js');
   const pluginModule = await import(`${pathToFileURL(entrypoint).href}?${tag}=${Date.now()}`);
   const registered = {};
   await pluginModule.default.setup({
     tool: {
       transform: (edit) => {
-        edit({ add: (tool) => { registered[tool.name] = tool; } });
+        edit({ add: (tool) => { registered[tool.name] = tool; }, remove: (id) => { removed.push(id); } });
       },
+    },
+    session: {
+      hook: async (name, callback) => { hooks[name] = callback; },
     },
   });
   return registered;
@@ -97,6 +105,250 @@ describe('agent tool action allowlist', () => {
 });
 
 describe('managed agent tool runtime', () => {
+  it('rejects a stale note replacement from a second session without a write or event', async () => {
+    const owner = createProjectIdFromPath('/repo');
+    const onChanged = vi.fn();
+    const { runtime, dataDir } = await createRuntime({
+      resolveSessionDirectory: async (id) => ['ses_A', 'ses_B'].includes(id) ? '/repo' : null,
+      executeAction: (...args) => service.execute(...args),
+    });
+    const projectContextRuntime = createProjectContextRuntime({
+      fsPromises: fs, path, projectsDirPath: path.join(dataDir, 'projects'),
+      createId: () => 'note-1', onChanged,
+    });
+    const service = createOpenChamberControlService({
+      projectContextRuntime,
+      resolveProjectContextId: async (directory) => directory === '/repo' ? owner : '',
+      sessionService: { resolveDirectory: async () => '/repo' },
+    });
+    const call = (sessionID, action, parameters = {}) => runtime.execute({
+      tool: 'openchamber_knowledge', sessionID, input: { action, ...parameters },
+    });
+    await call('ses_A', 'save', { kind: 'note', body: 'v1' });
+    const a = (await call('ses_A', 'list')).data.notes[0];
+    const b = (await call('ses_B', 'list')).data.notes[0];
+    expect(a.body).toBe('v1');
+    expect(b.body).toBe('v1');
+    expect(await call('ses_A', 'save', { kind: 'note', id: a.id, body: 'v2', expected: a.body }))
+      .toMatchObject({ ok: true, action: 'knowledge.save', data: { projectId: owner, note: { body: 'v2' } } });
+    const committed = await fs.readFile(projectContextRuntime.contextPathFor(owner), 'utf8');
+    const events = onChanged.mock.calls.length;
+    expect(await call('ses_B', 'save', { kind: 'note', id: b.id, body: 'v3', expected: b.body }))
+      .toEqual({ schemaVersion: 1, ok: false, action: 'knowledge.save', error: {
+        kind: 'usage', message: 'Project note changed; reload before saving',
+      } });
+    expect(await fs.readFile(projectContextRuntime.contextPathFor(owner), 'utf8')).toBe(committed);
+    expect(onChanged).toHaveBeenCalledTimes(events);
+    const reread = (await call('ses_B', 'list')).data.notes[0];
+    expect(reread).toMatchObject({ body: 'v2', origin: { sessionId: 'ses_A' } });
+    expect(await call('ses_B', 'save', { kind: 'note', id: b.id, body: 'v3', expected: reread.body }))
+      .toMatchObject({ ok: true, data: { note: { body: 'v3', origin: { sessionId: 'ses_A' } } } });
+  });
+
+  it('runs generated knowledge calls through authenticated HTTP and persistent storage', async () => {
+    const directory = '/repo';
+    const owner = createProjectIdFromPath(directory);
+    const onChanged = vi.fn();
+    const showPlan = vi.fn(() => 1);
+    const { runtime, dataDir } = await createRuntime({
+      resolveSessionDirectory: async (id) => id === 'ses_caller' ? directory : null,
+      executeAction: (...args) => service.execute(...args),
+    });
+    const projectContextRuntime = createProjectContextRuntime({
+      fsPromises: fs, path, projectsDirPath: path.join(dataDir, 'projects'),
+      createId: () => crypto.randomUUID(), onChanged,
+      resolveSharedPlansDir: async () => path.join(dataDir, 'shared-plans'),
+    });
+    const service = createOpenChamberControlService({
+      projectContextRuntime,
+      resolveProjectContextId: async (resolved) => resolved === directory ? owner : '',
+      sessionService: { resolveDirectory: async () => directory },
+      showPlan,
+    });
+    const prepared = await prepareManagedEnv(runtime, { includeControl: false, includeWeb: false, includeMemory: false, includeKnowledge: true });
+    const tools = await loadTools(dataDir, 'persistent-knowledge');
+    const app = express();
+    runtime.registerRoutes(app, express);
+    const server = await new Promise((resolve) => {
+      const listener = app.listen(0, '127.0.0.1', () => resolve(listener));
+    });
+    const originalUrl = process.env.OPENCHAMBER_AGENT_TOOL_URL;
+    const originalToken = process.env.OPENCHAMBER_AGENT_TOOL_TOKEN;
+    process.env.OPENCHAMBER_AGENT_TOOL_URL = `http://127.0.0.1:${server.address().port}/api/openchamber/agent-tool`;
+    process.env.OPENCHAMBER_AGENT_TOOL_TOKEN = prepared.OPENCHAMBER_AGENT_TOOL_TOKEN;
+    const call = async (action, parameters = {}) => JSON.parse((await tools.openchamber_knowledge.execute(
+      { action, parameters }, { sessionID: 'ses_caller', progress: async () => {} },
+    )).content);
+    try {
+      const created = await call('save', { kind: 'note', body: 'Agent note', source: 'manual', origin: { sessionId: 'spoof' } });
+      expect(created).toMatchObject({ ok: true, schemaVersion: 1, data: { projectId: owner, note: { body: 'Agent note', source: 'agent', origin: { sessionId: 'ses_caller' } } } });
+      const noteId = created.data.note.id;
+      const note = (await call('list')).data.notes.find((entry) => entry.id === noteId);
+      expect((await call('save', { kind: 'note', id: noteId, body: 'Edited note', expected: note.body })).ok).toBe(true);
+      const beforeNoteConflict = onChanged.mock.calls.length;
+      const beforeNoteWrite = await fs.readFile(projectContextRuntime.contextPathFor(owner), 'utf8');
+      expect(await call('save', { kind: 'note', id: noteId, body: 'Stale note', expected: note.body })).toMatchObject({
+        ok: false, error: { kind: 'usage', message: expect.stringContaining('reload before saving') },
+      });
+      expect(onChanged).toHaveBeenCalledTimes(beforeNoteConflict);
+      expect(await fs.readFile(projectContextRuntime.contextPathFor(owner), 'utf8')).toBe(beforeNoteWrite);
+
+      const todoId = (await call('save', { kind: 'todo', body: 'First' })).data.todo.id;
+      await projectContextRuntime.createTodo(owner, { text: 'UI item' });
+      expect((await call('save', { kind: 'todo', id: todoId, completed: true })).data.todo).toMatchObject({ id: todoId, completed: true });
+
+      const createdPlan = (await call('save', { kind: 'plan', body: '# Agent plan\n\n- [ ] Original' })).data.plan;
+      const planId = createdPlan.id;
+      // The agent reads and ticks the plan through its file, by the path save gave.
+      const original = await fs.readFile(createdPlan.path, 'utf8');
+      expect(original).toBe('# Agent plan\n\n- [ ] Original');
+      await fs.writeFile(createdPlan.path, original.replace('- [ ]', '- [x]'));
+      const raw = '# Agent plan\r\n\r\n- [x] Original, rewritten';
+      expect((await call('save', { kind: 'plan', id: planId, body: raw, expected: '# Agent plan\n\n- [x] Original' })).data.plan.path).toBe(createdPlan.path);
+      const beforeConflict = onChanged.mock.calls.length;
+      expect(await call('save', { kind: 'plan', id: planId, body: '# Stale', expected: original })).toMatchObject({ ok: false, error: { kind: 'usage' } });
+      expect(onChanged).toHaveBeenCalledTimes(beforeConflict);
+      expect((await call('show', { kind: 'plan', id: planId })).data).toEqual({ projectId: owner, planId, shown: true });
+      expect(showPlan).toHaveBeenCalledWith({ projectId: owner, planId, title: 'Agent plan', directory, sessionId: 'ses_caller' });
+
+      const listed = (await call('list')).data;
+      expect(listed.notes[0]).toMatchObject({ id: noteId, body: 'Edited note', source: 'agent' });
+      expect(listed.todos.map((todo) => todo.text)).toEqual(['UI item', 'First']);
+      expect(listed.plans).toEqual([expect.objectContaining({ id: planId, title: 'Agent plan', path: createdPlan.path })]);
+      expect(await fs.readFile(listed.plans[0].path, 'utf8')).toBe(raw);
+
+      // Plan work: links, dependencies, filters and the plan session through the
+      // generated tool; null and [] reach storage as clears, never as omissions.
+      const one = (await call('save', { kind: 'todo', body: 'Step one', planId })).data.todo;
+      const two = (await call('save', { kind: 'todo', body: 'Step two', planId, dependsOn: [one.id] })).data.todo;
+      // A model can send dependsOn as a JSON string, nested or beside the
+      // action as a recorded GLM call did. It is parsed once and kept only as an
+      // array; every other value reaches the strict server check unchanged.
+      expect((await call('save', { kind: 'todo', id: two.id, dependsOn: '[]' })).data.todo).not.toHaveProperty('dependsOn');
+      const flat = await tools.openchamber_knowledge.execute(
+        { action: 'knowledge.save', kind: 'todo', id: two.id, dependsOn: JSON.stringify([one.id]) },
+        { sessionID: 'ses_caller', progress: async () => {} },
+      );
+      expect(JSON.parse(flat.content).data.todo).toMatchObject({ dependsOn: [one.id] });
+      for (const dependsOn of ['[not json', JSON.stringify({ id: one.id }), one.id, '[1]']) {
+        expect(await call('save', { kind: 'todo', id: two.id, dependsOn }))
+          .toMatchObject({ ok: false, error: { message: 'dependsOn must be an array of todo ids' } });
+      }
+      expect((await call('save', { kind: 'note', id: noteId, planId })).data.note)
+        .toMatchObject({ body: 'Edited note', planId, origin: { sessionId: 'ses_caller' } });
+      const readyInPlan = async () => (await call('list', { planId, ready: true })).data.todos.map((todo) => todo.text);
+      expect(await readyInPlan()).toEqual(['Step one']);
+      expect((await call('save', { kind: 'todo', id: one.id, completed: true })).ok).toBe(true);
+      expect(await readyInPlan()).toEqual(['Step two']);
+      expect((await call('list', { planId })).data).toMatchObject({
+        notes: [{ id: noteId }], todos: [{ id: two.id }, { id: one.id }], plans: [{ id: planId, path: createdPlan.path }],
+      });
+
+      expect((await call('save', { kind: 'plan', id: planId, sessionId: 'ses_worker' })).data.plan)
+        .toMatchObject({ id: planId, path: createdPlan.path, session: { sessionId: 'ses_worker' } });
+      const beforeMixed = await fs.readFile(projectContextRuntime.contextPathFor(owner), 'utf8');
+      expect(await call('save', { kind: 'plan', id: planId, sessionId: 'ses_other', body: '# Mixed' })).toMatchObject({ ok: false, error: { kind: 'usage' } });
+      expect(await fs.readFile(projectContextRuntime.contextPathFor(owner), 'utf8')).toBe(beforeMixed);
+      expect(await fs.readFile(createdPlan.path, 'utf8')).toBe(raw);
+      expect((await call('save', { kind: 'plan', id: planId, sessionId: null })).data.plan).not.toHaveProperty('session');
+
+      expect((await call('save', { kind: 'note', id: noteId, planId: null })).data.note).not.toHaveProperty('planId');
+      // Deleting the first step drops it from the second's dependencies.
+      expect((await call('delete', { kind: 'todo', id: one.id })).ok).toBe(true);
+      expect((await call('list', { planId })).data.todos).toEqual([expect.not.objectContaining({ dependsOn: expect.anything() })]);
+      expect((await call('delete', { kind: 'todo', id: two.id })).ok).toBe(true);
+
+      await fs.mkdir(path.join(dataDir, 'shared-plans'));
+      await fs.writeFile(path.join(dataDir, 'shared-plans', 'team.md'), '# Team\n');
+      const sharedId = 'shared:team.md';
+      expect((await call('save', { kind: 'plan', id: sharedId, body: '# Team edited\n', expected: '# Team\n' })).ok).toBe(true);
+      expect(await fs.readFile(path.join(dataDir, 'shared-plans', 'team.md'), 'utf8')).toBe('# Team edited\n');
+      for (const [kind, id] of [['plan', sharedId], ['note', noteId], ['todo', todoId], ['plan', planId]]) {
+        expect((await call('delete', { kind, id })).ok).toBe(true);
+      }
+      expect((await call('show', { kind: 'plan', id: planId })).ok).toBe(false);
+      expect(await projectContextRuntime.readContext(owner)).toMatchObject({ notes: [], plans: [], todos: [{ text: 'UI item' }] });
+      expect(onChanged.mock.calls.every(([projectId]) => projectId === owner)).toBe(true);
+      process.env.OPENCHAMBER_AGENT_TOOL_TOKEN = 'wrong-token';
+      expect((await call('list')).ok).toBe(false);
+    } finally {
+      if (originalUrl === undefined) delete process.env.OPENCHAMBER_AGENT_TOOL_URL;
+      else process.env.OPENCHAMBER_AGENT_TOOL_URL = originalUrl;
+      if (originalToken === undefined) delete process.env.OPENCHAMBER_AGENT_TOOL_TOKEN;
+      else process.env.OPENCHAMBER_AGENT_TOOL_TOKEN = originalToken;
+      await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it('exposes project knowledge as its own tool carrying only its own inputs', async () => {
+    const { runtime, dataDir } = await createRuntime();
+    await prepareManagedEnv(runtime, { includeKnowledge: true });
+    const tools = await loadTools(dataDir, 'knowledge-schema');
+    const knowledge = tools.openchamber_knowledge;
+    expect(knowledge.description).toContain('Project knowledge panel');
+    const actions = knowledge.input.properties.action.oneOf.map((entry) => entry.const);
+    expect(actions).toEqual(['knowledge.list', 'knowledge.save', 'knowledge.delete', 'knowledge.show']);
+    const parameters = knowledge.input.properties.parameters.properties;
+    expect(Object.keys(parameters).sort()).toEqual(['body', 'completed', 'dependsOn', 'directory', 'expected', 'id', 'kind', 'planId', 'projectId', 'ready', 'sessionId']);
+    expect(parameters.kind.enum).toEqual(['note', 'todo', 'plan']);
+    expect(parameters.completed.type).toBe('boolean');
+    expect(parameters.ready.type).toBe('boolean');
+    expect(parameters.planId.type).toEqual(['string', 'null']);
+    expect(parameters.sessionId.type).toEqual(['string', 'null']);
+    expect(parameters.dependsOn).toMatchObject({ type: 'array', items: { type: 'string' } });
+    expect(tools.openchamber.input.properties.action.oneOf.map((entry) => entry.const)).not.toContain('knowledge.list');
+    // The control tool keeps its own session id, a plain string.
+    expect(tools.openchamber.input.properties.parameters.properties.sessionId).toEqual({ type: 'string' });
+    for (const tool of ['openchamber', 'openchamber_web', 'openchamber_memory']) {
+      for (const field of ['kind', 'expected', 'completed', 'planId', 'dependsOn', 'ready']) {
+        expect(tools[tool].input.properties.parameters.properties).not.toHaveProperty(field);
+      }
+    }
+    await runtime.materializePlugin({ includeKnowledge: false });
+    expect(await loadTools(dataDir, 'knowledge-disabled')).not.toHaveProperty('openchamber_knowledge');
+  });
+
+  it('tells an agent how to recover from a knowledge save conflict', async () => {
+    const { runtime, dataDir } = await createRuntime();
+    await prepareManagedEnv(runtime, { includeKnowledge: true });
+    const tools = await loadTools(dataDir, 'knowledge-recovery');
+    const knowledge = tools.openchamber_knowledge;
+
+    // The loaded tool the model reads carries the recovery path.
+    const expected = knowledge.input.properties.parameters.properties.expected;
+    expect(expected.description).toContain('knowledge.list');
+    expect(expected.description).toContain('same id');
+    expect(knowledge.description).toContain('retry the save with the same id');
+  });
+
+  it('uses the callback session for knowledge scope and provenance', async () => {
+    const { runtime, executeAction } = await createRuntime({ resolveSessionDirectory: async (id) => id === 'ses_real' ? '/real' : null });
+    const input = { action: 'knowledge.save', kind: 'note', body: 'Note', origin: { sessionId: 'spoof' }, sessionId: 'spoof' };
+    await runtime.execute({ tool: 'openchamber_knowledge', input, sessionID: 'ses_real', contextDirectory: '/spoof', contextSessionId: 'spoof' });
+    expect(executeAction).toHaveBeenCalledWith('knowledge.save', input, '/real', { contextSessionId: 'ses_real' });
+    await runtime.execute({ tool: 'openchamber_knowledge', input, sessionID: 'missing', contextDirectory: '/spoof' });
+    expect(executeAction).toHaveBeenLastCalledWith('knowledge.save', input, undefined, { contextSessionId: 'missing' });
+    const rejected = await runtime.execute({ tool: 'openchamber_memory', input });
+    expect(rejected.ok).toBe(false);
+    expect(executeAction).toHaveBeenCalledTimes(2);
+  });
+
+
+  it('introduces the worktree move and leaves the choice to the user', async () => {
+    const { runtime, dataDir } = await createRuntime();
+
+    await runtime.materializePlugin({});
+    const tool = await loadTools(dataDir, 'worktree-intro');
+
+    expect(tool.openchamber.description).toContain('Whether that fits depends on how the user works');
+    expect(tool.openchamber.description).toContain('such as a pull request of its own');
+    // OpenCode's own worktree_create makes a detached copy of the current commit.
+    expect(tool.openchamber.description).toContain('Unlike git worktree add, the session moves along');
+    expect(tool.openchamber.description).not.toContain('without asking');
+    expect(tool.openchamber.input.properties.action.oneOf.map((entry) => entry.const)).toContain('session.moveToWorktree');
+    expect(tool.openchamber.input.properties.parameters.properties.carry).toEqual(expect.objectContaining({ type: 'array' }));
+  });
+
   it('materializes the plugin and mints a per-child callback token', async () => {
     const { runtime, dataDir } = await createRuntime();
 
@@ -116,12 +368,12 @@ describe('managed agent tool runtime', () => {
     expect(source).not.toContain('"schedule.status"');
     const tool = await loadTools(dataDir, 'schema');
     expect(tool.openchamber.description).toContain('A dispatch returns at once');
-    expect(tool.openchamber.description).toContain('final answer then arrives in this session as a message');
+    expect(tool.openchamber.description).toContain('returnResult brings its final answer back here');
     // Agents also have OpenCode's own subagent tool; the line between the two is drawn up front.
     expect(tool.openchamber.description).toContain('use the subagent tool');
     expect(tool.openchamber.input.properties.action.oneOf).toContainEqual({
       const: 'session.messages',
-      description: 'Read text-only messages and current sessionStatus for sessionId; directory and limit 10 are defaults',
+      description: 'Text messages and sessionStatus of sessionId',
     });
     // An agent never blocks on a session: no wait or timeout in its schema.
     const controlParameters = tool.openchamber.input.properties.parameters.properties;
@@ -143,11 +395,15 @@ describe('managed agent tool runtime', () => {
     const controlActions = tool.openchamber.input.properties.action.oneOf.map((entry) => entry.const);
     const webActions = tool.openchamber_web.input.properties.action.oneOf.map((entry) => entry.const);
     expect(webActions).toContain('browser.open');
+    expect(webActions).toContain('browser.close');
+    expect(webActions).toContain('browser.select');
     expect(controlActions).not.toContain('browser.open');
     expect(webActions).not.toContain('session.create');
 
     // Turning one tool off has to remove its inputs too, not just its actions.
     expect(Object.keys(tool.openchamber_web.input.properties.parameters.properties)).toContain('url');
+    expect(Object.keys(tool.openchamber_web.input.properties.parameters.properties)).toContain('label');
+    expect(Object.keys(tool.openchamber_web.input.properties.parameters.properties)).toContain('value');
     expect(Object.keys(tool.openchamber.input.properties.parameters.properties)).not.toContain('url');
     expect(Object.keys(tool.openchamber.input.properties.parameters.properties)).toContain('sessionId');
     expect(Object.keys(tool.openchamber.input.properties.parameters.properties)).toContain('path');
@@ -166,6 +422,17 @@ describe('managed agent tool runtime', () => {
     for (const entry of Object.values(tool)) {
       expect(entry.input.properties.action.oneOf).toBeInstanceOf(Array);
       expect(entry.input.properties.action).not.toHaveProperty('enum');
+    }
+  });
+
+  it('declares inputs only inside parameters and lets flattened ones through', async () => {
+    const { runtime, dataDir } = await createRuntime();
+    await prepareManagedEnv(runtime, { includeControl: true, includeWeb: true, includeMemory: true, includeKnowledge: true, includeNotify: true, includeRender: true });
+    const tools = await loadTools(dataDir, 'root-shape');
+
+    for (const tool of Object.values(tools)) {
+      expect(Object.keys(tool.input.properties).sort()).toEqual(['action', 'parameters']);
+      expect(tool.input.additionalProperties).toBe(true);
     }
   });
 
@@ -214,6 +481,103 @@ describe('managed agent tool runtime', () => {
     // v2 tools get no directory; the session id is what OpenChamber resolves from.
     expect(sent[2].sessionID).toBe('ses_1');
     expect(sent[2].contextDirectory).toBeUndefined();
+  });
+
+  it('runs the one action of a single-action tool, reviving a call stuffed into the action as JSON', async () => {
+    const { runtime, dataDir } = await createRuntime();
+    const prepared = await prepareManagedEnv(runtime, { includeControl: true, includeRender: true });
+    const tools = await loadTools(dataDir, 'single-action');
+
+    // Nothing to choose: the schema takes any string and does not require one.
+    expect(tools.openchamber_render.input.properties.action).toEqual({ type: 'string', description: expect.stringContaining('render.page: ') });
+    expect(tools.openchamber_render.input.required).toEqual([]);
+    // A tool with several actions keeps its strict list.
+    expect(tools.openchamber.input.properties.action.oneOf.length).toBeGreaterThan(1);
+    expect(tools.openchamber.input.required).toEqual(['action']);
+
+    const sent = [];
+    const originalFetch = globalThis.fetch;
+    const originalUrl = process.env.OPENCHAMBER_AGENT_TOOL_URL;
+    const originalToken = process.env.OPENCHAMBER_AGENT_TOOL_TOKEN;
+    process.env.OPENCHAMBER_AGENT_TOOL_URL = prepared.OPENCHAMBER_AGENT_TOOL_URL;
+    process.env.OPENCHAMBER_AGENT_TOOL_TOKEN = prepared.OPENCHAMBER_AGENT_TOOL_TOKEN;
+    globalThis.fetch = async (_endpoint, init) => {
+      sent.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ schemaVersion: 1, ok: true, action: 'render.page', data: {} }));
+    };
+    const context = { sessionID: 'ses_1', agent: 'build', messageID: 'msg_1', id: 'call_1', signal: new AbortController().signal, progress: async () => {} };
+
+    try {
+      // The shape a model produced: title inside a JSON action, html beside it.
+      await tools.openchamber_render.execute({ action: '{"action": "render.page", "title": "Commits"}', html: '<p>a</p>' }, context);
+      // A revived field never replaces one the call carried itself.
+      await tools.openchamber_render.execute({ action: '{"parameters": {"title": "Stuffed"}}', parameters: { html: '<p>b</p>', title: 'Real' } }, context);
+      // No action at all still runs the only one.
+      await tools.openchamber_render.execute({ parameters: { html: '<p>c</p>', title: 'Bare' } }, context);
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.OPENCHAMBER_AGENT_TOOL_URL = originalUrl;
+      process.env.OPENCHAMBER_AGENT_TOOL_TOKEN = originalToken;
+    }
+
+    expect(sent[0].input).toEqual({ action: 'render.page', html: '<p>a</p>', title: 'Commits' });
+    expect(sent[1].input).toEqual({ action: 'render.page', html: '<p>b</p>', title: 'Real' });
+    expect(sent[2].input).toEqual({ action: 'render.page', html: '<p>c</p>', title: 'Bare' });
+  });
+
+  it('normalizes the two string boolean spellings a model sends, and nothing else', async () => {
+    const { runtime, dataDir } = await createRuntime();
+    const prepared = await prepareManagedEnv(runtime, { includeKnowledge: true });
+    const tools = await loadTools(dataDir, 'boolean-strings');
+
+    const sent = [];
+    const originalFetch = globalThis.fetch;
+    const originalUrl = process.env.OPENCHAMBER_AGENT_TOOL_URL;
+    const originalToken = process.env.OPENCHAMBER_AGENT_TOOL_TOKEN;
+    process.env.OPENCHAMBER_AGENT_TOOL_URL = prepared.OPENCHAMBER_AGENT_TOOL_URL;
+    process.env.OPENCHAMBER_AGENT_TOOL_TOKEN = prepared.OPENCHAMBER_AGENT_TOOL_TOKEN;
+    globalThis.fetch = async (_endpoint, init) => {
+      sent.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ schemaVersion: 1, ok: true, action: 'session.list', data: {} }));
+    };
+    const context = { sessionID: 'ses_1', agent: 'build', messageID: 'msg_1', id: 'call_1', progress: async () => {} };
+
+    try {
+      const call = (tool, input) => tools[tool].execute(input, context);
+      // Real booleans travel unchanged in both shapes.
+      await call('openchamber', { action: 'session.list', parameters: { withStatus: true } });
+      await call('openchamber', { action: 'session.list', parameters: { withStatus: false } });
+      await call('openchamber', { action: 'session.list', withStatus: true });
+      await call('openchamber', { action: 'session.list', withStatus: false });
+      // Exactly the stringified "true"/"false" spellings are normalized.
+      await call('openchamber', { action: 'session.list', parameters: { withStatus: 'true' } });
+      await call('openchamber', { action: 'session.list', parameters: { withStatus: 'false' } });
+      await call('openchamber', { action: 'session.list', withStatus: 'true' });
+      await call('openchamber', { action: 'session.list', withStatus: 'false' });
+      // The field names come from the calling tool's own schema, so other
+      // tools' booleans normalize there too, not only `completed`.
+      await call('openchamber_web', { action: 'browser.type', parameters: { selector: '#q', value: 'x', submit: 'true' } });
+      await call('openchamber_knowledge', { action: 'knowledge.save', parameters: { kind: 'todo', id: 't1', completed: 'false' } });
+      // Every other spelling or value keeps its identity for the strict check.
+      for (const value of ['TRUE', 'False', 'yes', '1', 1, 0, null]) {
+        await call('openchamber', { action: 'session.list', parameters: { withStatus: value } });
+      }
+      // A boolean another tool declares is not a field of this tool, so it is
+      // left alone here.
+      await call('openchamber_web', { action: 'browser.type', parameters: { selector: '#q', value: 'x', withStatus: 'true' } });
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalUrl === undefined) delete process.env.OPENCHAMBER_AGENT_TOOL_URL;
+      else process.env.OPENCHAMBER_AGENT_TOOL_URL = originalUrl;
+      if (originalToken === undefined) delete process.env.OPENCHAMBER_AGENT_TOOL_TOKEN;
+      else process.env.OPENCHAMBER_AGENT_TOOL_TOKEN = originalToken;
+    }
+
+    expect(sent.slice(0, 8).map(({ input }) => input.withStatus)).toEqual([true, false, true, false, true, false, true, false]);
+    expect(sent[8].input.submit).toBe(true);
+    expect(sent[9].input.completed).toBe(false);
+    expect(sent.slice(10, 17).map(({ input }) => input.withStatus)).toEqual(['TRUE', 'False', 'yes', '1', 1, 0, null]);
+    expect(sent[17].input.withStatus).toBe('true');
   });
 
   it('omits a tool the user turned off', async () => {
@@ -268,7 +632,131 @@ describe('managed agent tool runtime', () => {
     expect(Object.keys(await loadTools(plainDir, 'nonotify'))).toEqual(['openchamber']);
   });
 
-  it('registers every tool as a direct tool unless Code Mode is asked for', async () => {
+  it('exposes render as its own tool carrying only the page and its title', async () => {
+    const { runtime, dataDir } = await createRuntime();
+    await prepareManagedEnv(runtime, { includeControl: true, includeWeb: false, includeMemory: false, includeRender: true });
+    const tool = await loadTools(dataDir, 'render');
+
+    expect(Object.keys(tool)).toEqual(['openchamber', 'openchamber_render']);
+    expect(Object.keys(tool.openchamber_render.input.properties.parameters.properties).sort()).toEqual(['awaitAnswer', 'html', 'title']);
+    expect(Object.keys(tool.openchamber.input.properties.parameters.properties)).not.toContain('html');
+    // How to write the page rides on its input, which no client cuts short.
+    expect(tool.openchamber_render.input.properties.parameters.properties.html.description).toContain('--chart-1');
+    expect(tool.openchamber_render.description).toContain('add no outer card, border or banner title');
+  });
+
+  it('takes away the OpenCode tools the control tool replaces, and only while it is on', async () => {
+    const { runtime, dataDir } = await createRuntime();
+    await prepareManagedEnv(runtime, { includeControl: true, includeWeb: false, includeMemory: false });
+    const removed = [];
+    await loadTools(dataDir, 'replaced', {}, removed);
+    expect(removed).toEqual(['opencode_worktree_create', 'opencode_models']);
+
+    await runtime.materializePlugin({ includeControl: false, includeWeb: true });
+    const kept = [];
+    await loadTools(dataDir, 'replaced-off', {}, kept);
+    expect(kept).toEqual([]);
+  });
+
+  it('exposes scheduled tasks as their own tool, out of the control tool', async () => {
+    const { runtime, dataDir } = await createRuntime();
+    await prepareManagedEnv(runtime, { includeControl: true, includeSchedule: true, includeWeb: false, includeMemory: false });
+    const tools = await loadTools(dataDir, 'schedule');
+
+    expect(Object.keys(tools)).toEqual(['openchamber', 'openchamber_schedule']);
+    const scheduleActions = tools.openchamber_schedule.input.properties.action.oneOf.map((entry) => entry.const);
+    expect(scheduleActions).toEqual(['schedule.list', 'schedule.create', 'schedule.update', 'schedule.run', 'schedule.delete', 'schedule.toggle']);
+    expect(tools.openchamber.input.properties.action.oneOf.map((entry) => entry.const).filter((action) => action.startsWith('schedule.'))).toEqual([]);
+    const scheduleParameters = tools.openchamber_schedule.input.properties.parameters.properties;
+    expect(Object.keys(scheduleParameters)).toEqual(expect.arrayContaining(['taskId', 'daily', 'cron', 'prompt', 'model', 'projectId']));
+    for (const field of ['taskId', 'daily', 'cron', 'disabled', 'targetSessionId']) {
+      expect(tools.openchamber.input.properties.parameters.properties).not.toHaveProperty(field);
+    }
+    expect(scheduleParameters.disabled.type).toBe('boolean');
+
+    await runtime.materializePlugin({ includeControl: true, includeSchedule: false });
+    expect(await loadTools(dataDir, 'schedule-disabled')).not.toHaveProperty('openchamber_schedule');
+  });
+
+  it('runs a schedule action from the schedule tool and no longer from the control tool', async () => {
+    const { runtime, executeAction } = await createRuntime();
+    const listed = await runtime.execute({ tool: 'openchamber_schedule', input: { action: 'list' }, sessionID: 'ses_a' });
+    expect(listed.ok).toBe(true);
+    expect(executeAction).toHaveBeenCalledWith('schedule.list', expect.anything(), undefined, expect.anything());
+    const refused = await runtime.execute({ tool: 'openchamber', input: { action: 'schedule.list' }, sessionID: 'ses_a' });
+    expect(refused.ok).toBe(false);
+  });
+
+  it('keeps every tool description within the length Claude Code passes on whole', async () => {
+    const { runtime, dataDir } = await createRuntime();
+    await prepareManagedEnv(runtime, { includeSchedule: true, includeKnowledge: true, includeNotify: true, includeRender: true });
+    const tools = await loadTools(dataDir, 'description-length');
+
+    expect(Object.keys(tools).sort()).toEqual(['openchamber', 'openchamber_knowledge', 'openchamber_memory', 'openchamber_notify', 'openchamber_render', 'openchamber_schedule', 'openchamber_web']);
+    for (const tool of Object.values(tools)) {
+      // Claude Code before 2.1.296 cuts an MCP tool description at 2048
+      // characters, and the plugin runs whichever CLI the user installed.
+      expect(tool.description.length).toBeLessThanOrEqual(2048);
+    }
+  });
+
+  it('returns the answer a page waited for, or ends the wait when the user writes in the chat', async () => {
+    const service = createOpenChamberControlService({ sessionService: { resolveDirectory: async () => '/repo' } });
+    const { runtime, dataDir } = await createRuntime({
+      resolveSessionDirectory: async () => '/repo',
+      executeAction: (...args) => service.execute(...args),
+    });
+    const prepared = await prepareManagedEnv(runtime, { includeControl: false, includeWeb: false, includeMemory: false, includeRender: true });
+    const hooks = {};
+    const tools = await loadTools(dataDir, 'render-answer', hooks);
+    const app = express();
+    runtime.registerRoutes(app, express);
+    const server = await new Promise((resolve) => {
+      const listener = app.listen(0, '127.0.0.1', () => resolve(listener));
+    });
+    const originalUrl = process.env.OPENCHAMBER_AGENT_TOOL_URL;
+    const originalToken = process.env.OPENCHAMBER_AGENT_TOOL_TOKEN;
+    process.env.OPENCHAMBER_AGENT_TOOL_URL = `http://127.0.0.1:${server.address().port}/api/openchamber/agent-tool`;
+    process.env.OPENCHAMBER_AGENT_TOOL_TOKEN = prepared.OPENCHAMBER_AGENT_TOOL_TOKEN;
+    const ask = (id, awaitAnswer = true) => tools.openchamber_render.execute(
+      { action: 'render.page', parameters: { html: '<p>Pick</p>', title: 'Pick a layout', awaitAnswer } },
+      { sessionID: 'ses_caller', id, signal: new AbortController().signal, progress: async () => {} },
+    );
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    try {
+      const answered = ask('call_1');
+      await vi.waitFor(() => service.answerPage({ sessionId: 'ses_caller', callId: 'call_1', summary: 'Layout B', data: { layout: 'b' } }));
+      const result = await answered;
+      expect(JSON.parse(result.content)).toMatchObject({ ok: true, data: { answer: { answered: true, summary: 'Layout B', data: { layout: 'b' } } } });
+      expect(result.metadata.openchamber).toMatchObject({ ok: true, answer: { answered: true, summary: 'Layout B', data: { layout: 'b' } } });
+      // Bun would otherwise end the waiting request after about six minutes;
+      // a page that only shows keeps the default.
+      expect(fetchSpy.mock.lastCall?.[1]).toMatchObject({ timeout: false });
+      await ask('call_shown', false);
+      expect(fetchSpy.mock.lastCall?.[1]).not.toHaveProperty('timeout');
+
+      const closed = ask('call_2');
+      // Lets the call reach the server and start waiting there.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await hooks.prompt({ sessionID: 'ses_other' });
+      await hooks.prompt({ sessionID: 'ses_caller' });
+      const closedResult = await closed;
+      expect(JSON.parse(closedResult.content)).toMatchObject({ ok: true, data: { answer: { answered: false, reason: 'chat' } } });
+      expect(closedResult.metadata.openchamber).toMatchObject({ ok: true, answer: { answered: false, reason: 'chat' } });
+      // The server let go of the page too, so a late answer finds nothing.
+      await vi.waitFor(() => expect(() => service.answerPage({ sessionId: 'ses_caller', callId: 'call_2', summary: 'B' }))
+        .toThrow(expect.objectContaining({ statusCode: 404 })));
+    } finally {
+      fetchSpy.mockRestore();
+      if (originalUrl === undefined) delete process.env.OPENCHAMBER_AGENT_TOOL_URL;
+      else process.env.OPENCHAMBER_AGENT_TOOL_URL = originalUrl;
+      if (originalToken === undefined) delete process.env.OPENCHAMBER_AGENT_TOOL_TOKEN;
+      else process.env.OPENCHAMBER_AGENT_TOOL_TOKEN = originalToken;
+      await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it('registers every tool as a direct tool unless Code Mode is asked for, and the render tool always direct', async () => {
     const { runtime, dataDir } = await createRuntime();
     await prepareManagedEnv(runtime, { includeControl: true, includeWeb: true, includeMemory: true, includeNotify: true });
     const direct = await loadTools(dataDir, 'direct');
@@ -276,11 +764,13 @@ describe('managed agent tool runtime', () => {
       expect(tool.options).toEqual({ codemode: false });
     }
 
-    await prepareManagedEnv(runtime, { includeControl: true, includeWeb: true, includeMemory: true, includeNotify: true, codeMode: true });
-    const behindExecute = await loadTools(dataDir, 'codemode');
+    await prepareManagedEnv(runtime, { includeControl: true, includeWeb: true, includeMemory: true, includeNotify: true, includeRender: true, codeMode: true });
+    const { openchamber_render: render, ...behindExecute } = await loadTools(dataDir, 'codemode');
+    expect(Object.keys(behindExecute).length).toBeGreaterThan(0);
     for (const tool of Object.values(behindExecute)) {
       expect(tool.options).toEqual({ codemode: true });
     }
+    expect(render.options).toEqual({ codemode: false });
   });
 
   it('refuses to inject a plugin with no tools in it', async () => {
@@ -329,6 +819,28 @@ describe('managed agent tool runtime', () => {
     expect(result).toEqual(expect.objectContaining({ ok: false, action, error: expect.objectContaining({ kind: 'usage' }) }));
     expect(result.error.message).toContain(hint);
     expect(executeAction).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['session.create', 'openchamber', { prompt: 'x', goal: 'true' }, 'goal'],
+    ['session.list', 'openchamber', { withStatus: 'true' }, 'withStatus'],
+    ['browser.type', 'openchamber_web', { selector: '#q', value: 'x', submit: 'yes' }, 'submit'],
+    ['knowledge.save', 'openchamber_knowledge', { kind: 'todo', id: 't1', completed: 'false' }, 'completed'],
+    ['notify.send', 'openchamber_notify', { title: 't', showWhenFocused: 1 }, 'showWhenFocused'],
+  ])('refuses a %s whose boolean %s field is not a boolean', async (action, tool, input, field) => {
+    const { runtime, executeAction } = await createRuntime();
+    const result = await runtime.execute({ input: { action, ...input }, sessionID: 'ses_1', tool });
+
+    expect(result).toEqual(expect.objectContaining({ ok: false, action, error: { message: `${field} must be a boolean`, kind: 'usage' } }));
+    expect(executeAction).not.toHaveBeenCalled();
+  });
+
+  it('passes a real boolean goal through', async () => {
+    const { runtime, executeAction } = await createRuntime();
+    const result = await runtime.execute({ input: { action: 'session.create', prompt: 'x', goal: true }, sessionID: 'ses_1', tool: 'openchamber' });
+
+    expect(result.ok).toBe(true);
+    expect(executeAction).toHaveBeenCalledTimes(1);
   });
 
   it('passes returnResult through with the calling session', async () => {
@@ -608,6 +1120,67 @@ describe('managed agent tool runtime', () => {
       expect(progress).toHaveBeenCalledWith(expect.objectContaining({
         openchamber: expect.objectContaining({ description: 'List configured projects' }),
       }));
+    } finally {
+      if (previousUrl === undefined) delete process.env.OPENCHAMBER_AGENT_TOOL_URL;
+      else process.env.OPENCHAMBER_AGENT_TOOL_URL = previousUrl;
+      if (previousToken === undefined) delete process.env.OPENCHAMBER_AGENT_TOOL_TOKEN;
+      else process.env.OPENCHAMBER_AGENT_TOOL_TOKEN = previousToken;
+      await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+});
+
+describe('session.link parameter normalization', () => {
+  it('revives a stringified link and leaves every other string alone', async () => {
+    const executeAction = vi.fn(async () => ({ linked: true }));
+    const { runtime, dataDir } = await createRuntime({ executeAction });
+    const prepared = await prepareManagedEnv(runtime, { includeControl: true, includeWeb: false, includeMemory: false });
+    const tools = await loadTools(dataDir, 'link-normalization');
+    const app = express();
+    runtime.registerRoutes(app, express);
+    const server = await new Promise((resolve) => {
+      const listener = app.listen(0, '127.0.0.1', () => resolve(listener));
+    });
+    const previousUrl = process.env.OPENCHAMBER_AGENT_TOOL_URL;
+    const previousToken = process.env.OPENCHAMBER_AGENT_TOOL_TOKEN;
+    process.env.OPENCHAMBER_AGENT_TOOL_URL = `http://127.0.0.1:${server.address().port}/api/openchamber/agent-tool`;
+    process.env.OPENCHAMBER_AGENT_TOOL_TOKEN = prepared.OPENCHAMBER_AGENT_TOOL_TOKEN;
+    const call = (action, input = {}) => tools.openchamber.execute(
+      { action, ...input },
+      { sessionID: 'ses_caller', progress: async () => {} },
+    );
+    const forwarded = () => executeAction.mock.calls.at(-1)[1];
+    const link = { url: 'https://github.com/acme/app/issues/7', title: 'Crash on save', kind: 'issue', identifier: '#7' };
+    try {
+      // The documented shape, as it arrives from the model: nested objects come
+      // through the transport JSON-stringified (issue #4591).
+      await call('session.link', { parameters: { link: JSON.stringify(link) } });
+      expect(forwarded().link).toEqual(link);
+
+      // A genuine nested object passes through untouched.
+      await call('session.link', { parameters: { link: { ...link } } });
+      expect(forwarded().link).toEqual(link);
+
+      // The bare-name alias behaves the same.
+      await call('link', { parameters: { link: JSON.stringify(link) } });
+      expect(forwarded().link).toEqual(link);
+
+      // Flat fields beside the action still reach the service, and an explicit
+      // parameters object still wins key conflicts.
+      await call('session.link', { url: link.url, title: 'Flat title', kind: 'issue', parameters: { title: 'Nested title' } });
+      expect(forwarded()).toMatchObject({ url: link.url, title: 'Nested title', kind: 'issue' });
+
+      // Parse once, accept only plain objects: stringified nulls, arrays,
+      // scalars, double-encoded objects and malformed JSON arrive exactly as
+      // sent, for the service to reject with its own validation error.
+      for (const value of ['null', '[1,2]', '"text"', '"{\\"url\\":\\"x\\"}"', '{not json']) {
+        await call('session.link', { parameters: { link: value } });
+        expect(forwarded().link).toBe(value);
+      }
+
+      // Free-form strings that merely look like JSON stay text.
+      await call('session.create', { parameters: { title: '[]', prompt: '{"task":"summarize"}' } });
+      expect(forwarded()).toMatchObject({ title: '[]', prompt: '{"task":"summarize"}' });
     } finally {
       if (previousUrl === undefined) delete process.env.OPENCHAMBER_AGENT_TOOL_URL;
       else process.env.OPENCHAMBER_AGENT_TOOL_URL = previousUrl;

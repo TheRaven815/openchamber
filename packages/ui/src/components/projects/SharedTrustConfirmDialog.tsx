@@ -21,7 +21,9 @@ import {
  * App-level dialog shown the first time a team's shared setup commands or
  * shared actions (from `<repo>/.openchamber/project.json`) are about to run.
  * It lists exactly what would run. Dismissing via the close button, Escape,
- * or the backdrop counts as "run without the shared commands this time".
+ * or the backdrop settles the request the way it asked to be dismissed:
+ * worktree creation cancels, everything else runs without the shared
+ * commands this time.
  */
 export const SharedTrustConfirmDialog = () => {
   const { t } = useI18n();
@@ -40,7 +42,7 @@ export const SharedTrustConfirmDialog = () => {
       open={Boolean(request)}
       onOpenChange={(open: boolean) => {
         if (!open) {
-          settle('skip');
+          settle(request?.dismissChoice ?? 'skip');
         }
       }}
     >
@@ -57,7 +59,7 @@ export const SharedTrustConfirmDialog = () => {
           {request && request.setupCommands.length > 0 ? (
             <div className="space-y-1">
               <p className="typography-meta text-muted-foreground">{t('projects.sharedTrust.setupCommands')}</p>
-              <div className="rounded-lg bg-[var(--surface-muted)] px-3 py-2 font-mono text-[13px] leading-relaxed break-all text-[var(--surface-foreground)]">
+              <div className="rounded-lg bg-[var(--surface-muted)] px-3 py-2 font-mono text-[0.8125rem] leading-relaxed break-all text-[var(--surface-foreground)]">
                 {request.setupCommands.map((command, index) => (
                   <div key={`${index}-${command}`}>{command}</div>
                 ))}
@@ -67,7 +69,7 @@ export const SharedTrustConfirmDialog = () => {
           {request && request.actions.length > 0 ? (
             <div className="space-y-1">
               <p className="typography-meta text-muted-foreground">{t('projects.sharedTrust.actions')}</p>
-              <div className="rounded-lg bg-[var(--surface-muted)] px-3 py-2 text-[13px] leading-relaxed break-all text-[var(--surface-foreground)]">
+              <div className="rounded-lg bg-[var(--surface-muted)] px-3 py-2 text-[0.8125rem] leading-relaxed break-all text-[var(--surface-foreground)]">
                 {request.actions.map((action) => (
                   <div key={action.id}>
                     <span>{action.name}</span>

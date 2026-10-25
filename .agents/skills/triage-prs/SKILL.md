@@ -44,7 +44,7 @@ The intake workflow (`.github/workflows/pr-intake.yml`) adds `size:*` (changed l
 
 The review bot's `review:*` labels are a pre-sort, not a verdict: `review:ready` PRs go first (the bot found no code defects — likely MERGE/MERGE-THEN-FIX), `review:blocked` ones carry a bot comment whose findings the verdict review verifies rather than rediscovers. Bot labels never replace the pr-review pass — the bot cannot judge product fit or maintainability scope. The reverse holds too: when the bot's BLOCKED findings are the whole story and the author has not answered, the maintainer never re-posts them in their own voice — the PR is *waiting on author* and the report says so in one line.
 
-Split the clean pool smallest-first (tiny diffs are fast wins and most likely mergeable). Fan out the `pr-reviewer` subagent (`.opencode/agent/pr-reviewer.md`, which loads the `pr-review` skill and carries the hard rules). It takes one PR or several per call — group related PRs together when one context can serve them, give a large or contentious PR its own call; fall back to a general subagent that receives the full `pr-review` skill text when `pr-reviewer` is unavailable. The subagent inherits the chat's model; never hand verdicts to a smaller model to save quota — a verdict from a small model is a pre-sort, not a decision. Each returns per-PR verdict blocks in the skill's output format.
+Split the clean pool smallest-first (tiny diffs are fast wins and most likely mergeable). Fan out the `review` subagent (`.opencode/agent/review.md`, which loads the `pr-review` skill and carries the hard rules). It takes one PR or several per call — group related PRs together when one context can serve them, give a large or contentious PR its own call; fall back to a general subagent that receives the full `pr-review` skill text when `review` is unavailable. The subagent inherits the chat's model; never hand verdicts to a smaller model to save quota — a verdict from a small model is a pre-sort, not a decision. Each returns per-PR verdict blocks in the skill's output format.
 
 **Report format.** The consolidated report is what the maintainer decides from — calibrate each entry so no follow-up question is needed, without ballooning:
 
@@ -92,8 +92,8 @@ When every card is answered, show one summary grouped by outcome, list what will
 After a batch of merges:
 
 1. Run the full type-check and every package's test suite on current `main`. `main` has no CI of its own, and PRs validated one by one were never validated together.
-2. Write a symptom map of what landed (area, PR, merge sha, which part we wrote) to `.opencode/plans/pr-triage-<date>-merged.md`, so a later regression can be traced to its PR quickly.
-3. Write the testing list for the maintainer to `.opencode/plans/pr-triage-<date>-what-changed.md`, in Ukrainian: grouped by area of the app, each entry a linked PR (or commit) and two or three sentences on what the user sees change, marking single-platform changes and the parts we rewrote.
+2. Write a symptom map of what landed (area, PR, merge sha, which part we wrote) to `docs/personal/pr-triage/pr-triage-<date>-merged.md`, so a later regression can be traced to its PR quickly.
+3. Write the testing list for the maintainer to `docs/personal/pr-triage/pr-triage-<date>-what-changed.md`, in Ukrainian: grouped by area of the app, each entry a linked PR (or commit) and two or three sentences on what the user sees change, marking single-platform changes and the parts we rewrote.
 
 ## Message templates
 

@@ -3,13 +3,17 @@ import { ChatViewProvider } from './ChatViewProvider';
 import { SessionEditorPanelProvider } from './SessionEditorPanelProvider';
 import { createOpenCodeManager, type OpenCodeManager } from './opencode';
 import { configureOpenCodeCredentials, openCodeCredentialSource } from './opencodeAuth';
+import { configureProjectStartCommandSource, openCodeProjectStartCommandSource } from '../../web/server/lib/opencode/project-start-command.js';
 import { startGlobalEventWatcher, stopGlobalEventWatcher, setChatViewProvider } from './sessionActivityWatcher';
 import { pathsEqualWithNormalizedDriveLetter } from './pathUtils';
 import { resolveWorkspaceFolders } from './workspaceResolver';
 import { InlineCommentThreads, SIDEBAR_SURFACE_ID } from './InlineCommentThreads';
 import { applyConnectAttemptTimeout } from './networkDefaults';
+import { disposeOutputChannel, getOutputChannel } from './outputChannel';
 import { stopGitProcesses } from './bridge-git-process-runtime';
 import { registerGenerateCommitMessageCommand } from './scmCommitMessage';
+import { createSessionNotifier } from './sessionNotifications';
+import { vscodeSettingsNavigationSchema, type VSCodeSettingsNavigation } from '../../ui/src/lib/settings/vscodeNavigation';
 
 let chatViewProvider: ChatViewProvider | undefined;
 
@@ -55,7 +59,7 @@ const formatDurationMs = (value: number | null | undefined) => {
 
 export async function activate(context: vscode.ExtensionContext) {
   applyConnectAttemptTimeout();
-  outputChannel = vscode.window.createOutputChannel('OpenChamber');
+  outputChannel = getOutputChannel();
 
   let moveToRightSidebarScheduled = false;
 
@@ -142,6 +146,16 @@ export async function activate(context: vscode.ExtensionContext) {
   openCodeManager = createOpenCodeManager(context);
   // Quota lookups read provider credentials from the running OpenCode.
   configureOpenCodeCredentials(openCodeCredentialSource(openCodeManager));
+  // A new worktree runs the start command OpenCode keeps on the project record.
+  const manager = openCodeManager;
+  configureProjectStartCommandSource(openCodeProjectStartCommandSource({
+    buildOpenCodeUrl: () => {
+      const apiUrl = manager.getApiUrl();
+      if (!apiUrl) throw new Error('OpenCode API URL is not available');
+      return apiUrl;
+    },
+    getOpenCodeAuthHeaders: () => manager.getOpenCodeAuthHeaders(),
+  }));
 
   // Create chat view provider with manager reference
   // The webview will show a loading state until OpenCode is ready
@@ -266,6 +280,22 @@ export async function activate(context: vscode.ExtensionContext) {
       chatViewProvider?.notifyPermissionAutoAcceptSynced(snapshot);
       sessionEditorProvider?.notifyPermissionAutoAcceptSynced(snapshot);
     })
+  );
+
+  const showSessionNotification = createSessionNotifier({
+    isChatAttended: () => vscode.window.state.focused
+      && Boolean(chatViewProvider?.isVisible() || sessionEditorProvider?.hasVisiblePanel()),
+    show: (message, ...actions) => vscode.window.showInformationMessage(message, ...actions),
+    openSession: async (sessionId) => {
+      if (await revealChatViewForPayload()) {
+        chatViewProvider?.openSession(sessionId);
+      }
+    },
+    openSessionLabel: t('Open Session'),
+  });
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openchamber.internal.showNotification', showSessionNotification)
   );
 
   context.subscriptions.push(
@@ -647,9 +677,14 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.showSettings', () => {
-      chatViewProvider?.showSettings();
+    vscode.commands.registerCommand('openchamber.showSettings', (input?: VSCodeSettingsNavigation) => {
+      const navigation = input === undefined ? undefined : vscodeSettingsNavigationSchema.parse(input);
+      sessionEditorProvider?.showSettings(navigation);
     })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('openchamber.closeSettings', () => sessionEditorProvider?.closeSettings()),
   );
 
   context.subscriptions.push(
@@ -893,6 +928,6 @@ export async function deactivate() {
   openCodeManager = undefined;
   chatViewProvider = undefined;
   sessionEditorProvider = undefined;
-  outputChannel?.dispose();
+  disposeOutputChannel();
   outputChannel = undefined;
 }

@@ -17,8 +17,9 @@ import {
   SettingsCardSearch,
   type SettingsCardTone,
 } from '@/components/sections/shared/SettingsCards';
-import { findIntegrationForProvider, getProviderCardStatus, readProviderApiKeySetting, type ProviderCardStatus } from './providerAuth';
-import { SETTINGS_CALLOUT_TITLE_CLASS } from '@/components/sections/shared/SettingsSection';
+import { findIntegrationForProvider, getProviderCardStatus, readProviderApiKeySetting, usesMachineCredentials, type ProviderCardStatus } from './providerAuth';
+import { SETTINGS_CALLOUT_TITLE_CLASS, SettingsSection } from '@/components/sections/shared/SettingsSection';
+import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useEnterpriseMode, useEnterprisePolicyStore } from '@/stores/useEnterprisePolicyStore';
 import { useRoutingStore } from '@/stores/useRoutingStore';
@@ -76,10 +77,10 @@ const EnterpriseProvidersNotice: React.FC<{ directory: string | null; integratio
   return (
     <div
       className={cn(
-        'mb-4 flex items-start gap-2 rounded-lg border p-3',
+        'mb-4 flex items-start gap-2 rounded-lg p-3',
         warning
-          ? 'border-[var(--status-warning)]/30 bg-[var(--status-warning)]/5'
-          : 'border-[var(--status-info-border)] bg-[var(--status-info-background)]/30',
+          ? 'bg-[var(--status-warning)]/10'
+          : 'bg-[var(--status-info-background)]/60',
       )}
     >
       <Icon
@@ -150,6 +151,9 @@ interface ProviderGridProps {
   onSelect: (providerId: string) => void;
   onConnect: () => void;
   onOpenClassification: () => void;
+  /** Providers turned off in the user's config; null where the runtime cannot tell. */
+  disabledProviders?: readonly string[] | null;
+  onEnableProvider?: (providerId: string) => void;
 }
 
 /**
@@ -208,11 +212,15 @@ const StatusPill: React.FC<{ status: ProviderCardStatus }> = ({ status }) => {
 };
 
 /** Browse view of the Providers page: one card per provider OpenCode reports. */
-export const ProviderGrid: React.FC<ProviderGridProps> = ({ providers, integrations, directory, onSelect, onConnect, onOpenClassification }) => {
+export const ProviderGrid: React.FC<ProviderGridProps> = ({ providers, integrations, directory, onSelect, onConnect, onOpenClassification, disabledProviders, onEnableProvider }) => {
   const { t } = useI18n();
   const [query, setQuery] = React.useState('');
   const projectIds = useProjectProviderIds(providers, directory);
-  const filtered = rankByQuery([...providers], query, (provider) => [provider.name || provider.id, provider.id]);
+  // Alphabetical by name, so a card is found by scanning rather than in the
+  // order the providers happened to be configured.
+  const alphabetical = React.useMemo(() => [...providers].sort((a, b) =>
+    (a.name || a.id).localeCompare(b.name || b.id, undefined, { sensitivity: 'base' })), [providers]);
+  const filtered = rankByQuery(alphabetical, query, (provider) => [provider.name || provider.id, provider.id]);
   const hasQuery = query.trim().length > 0;
   // The server refuses new providers and keys; this only keeps the way in hidden.
   const locked = useEnterpriseMode();
@@ -222,6 +230,7 @@ export const ProviderGrid: React.FC<ProviderGridProps> = ({ providers, integrati
       title={t('settings.page.providers.title')}
       description={t('settings.providers.grid.description')}
       headerEnd={<SettingsProjectSelector className="w-full min-w-0 @xl:w-56" />}
+      className="[&>section:first-of-type]:pt-8"
     >
       {locked ? <EnterpriseProvidersNotice directory={directory} integrations={integrations} /> : null}
       {providers.length > 0 ? (
@@ -249,13 +258,13 @@ export const ProviderGrid: React.FC<ProviderGridProps> = ({ providers, integrati
             integrations,
             providerId: provider.id,
             optionsApiKey: readProviderApiKeySetting(provider),
+            machineCredentials: usesMachineCredentials(provider),
           });
           return (
             <SettingsCard
               key={provider.id}
               icon={<ProviderLogo providerId={provider.id} className="size-5" />}
               title={provider.name || provider.id}
-              subtitle={provider.id}
               badges={status ? <StatusPill status={status} /> : null}
               footer={(
                 <>
@@ -271,6 +280,23 @@ export const ProviderGrid: React.FC<ProviderGridProps> = ({ providers, integrati
           );
         })}
       </div>
+
+      {/* OpenCode drops a disabled provider from its list, so this is the only way back. */}
+      {disabledProviders && disabledProviders.length > 0 && onEnableProvider ? (
+        <SettingsSection title={t('settings.providers.disabled.title')} info={t('settings.providers.disabled.info')}>
+          <div className="space-y-1">
+            {disabledProviders.map((providerId) => (
+              <div key={providerId} className="flex items-center gap-2 py-1">
+                <ProviderLogo providerId={providerId} className="size-4 shrink-0 opacity-60" />
+                <span className="min-w-0 flex-1 truncate typography-ui-label text-muted-foreground">{providerId}</span>
+                <Button size="xs" variant="outline" className="!font-normal" onClick={() => onEnableProvider(providerId)}>
+                  {t('settings.providers.disabled.enable')}
+                </Button>
+              </div>
+            ))}
+          </div>
+        </SettingsSection>
+      ) : null}
     </SettingsPageLayout>
   );
 };

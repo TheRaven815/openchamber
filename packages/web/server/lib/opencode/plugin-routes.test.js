@@ -190,6 +190,21 @@ describe('opencode plugin routes', () => {
     expect(getNpmInfo).not.toHaveBeenCalled();
   });
 
+  test('GET /registry reports a Git spec as its own kind without querying npm', async () => {
+    // Before this, a Git spec fell through to the npm branch: the registry was
+    // queried with the literal spec and answered 405, so a working plugin showed
+    // as an unreachable registry.
+    const getNpmInfo = mock(async () => ({ ok: true, latest: '1.0.0', versions: ['1.0.0'], distTags: { latest: '1.0.0' } }));
+    createRegistryApp(getNpmInfo);
+
+    const response = await request(app)
+      .get(`/api/config/plugins/registry?specs=${encodeURIComponent('github:acme/opencode-plugin')}`)
+      .expect(200);
+
+    expect(response.body.results[0]).toEqual({ kind: 'git-ok', spec: 'github:acme/opencode-plugin' });
+    expect(getNpmInfo).not.toHaveBeenCalled();
+  });
+
   testUnlessRoot('GET /registry reports unreadable path plugin', async () => {
     createRegistryApp(mock(async () => ({ ok: true, latest: '1.0.0', versions: ['1.0.0'], distTags: { latest: '1.0.0' } })));
     const tmpFile = path.join(fs.mkdtempSync(path.join(rootDir, 'plugin-unreadable-')), 'plugin.js');
@@ -290,6 +305,17 @@ describe('opencode plugin routes', () => {
       .expect(409);
 
     expect(response.body.error).toContain('already exists');
+  });
+
+  test('POST a spec OpenCode cannot load returns 400 with its code and adds nothing', async () => {
+    const response = await request(app)
+      .post('/api/config/plugins/entry')
+      .send({ spec: 'https://example.com/plugin.tgz', scope: 'user' })
+      .expect(400);
+
+    expect(response.body.code).toBe('UNLOADABLE_SPEC');
+    const after = await request(app).get('/api/config/plugins').expect(200);
+    expect(after.body.entries).toEqual([]);
   });
 
   test('PATCH /entry/:id updates entry in same array index', async () => {

@@ -106,7 +106,7 @@ export const isLoopbackHttpUrl = (url: string): boolean => {
 };
 
 const LOOPBACK_URL_PATTERN
-  // eslint-disable-next-line no-control-regex
+  // oxlint-disable-next-line no-control-regex
   = /\bhttps?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d{2,5})?(?:\/[^\s<>"'`\u0000-\u001f]*)?/gi;
 
 /**
@@ -179,11 +179,14 @@ const openValidatedExternalUrl = async (url: string): Promise<boolean> => {
       await desktop.openExternal(normalizedTarget);
       return true;
     } catch {
+      if (isAppLinkUrl(normalizedTarget)) return false;
       // Fall through to window.open
     }
   }
 
   try {
+    // With `noopener` the call returns null even when the tab opened, so a
+    // null handle cannot tell a blocked popup from a successful open.
     window.open(normalizedTarget, '_blank', 'noopener,noreferrer');
     return true;
   } catch {

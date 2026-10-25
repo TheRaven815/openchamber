@@ -23,12 +23,11 @@
 
 import React from 'react';
 import { history, historyKeymap, standardKeymap } from '@codemirror/commands';
-import { Compartment, EditorState, Prec, type Extension } from '@codemirror/state';
+import { Annotation, Compartment, EditorState, Prec, type Extension } from '@codemirror/state';
 import {
     EditorView,
     drawSelection,
     keymap,
-    placeholder as placeholderExtension,
     type KeyBinding,
 } from '@codemirror/view';
 
@@ -44,6 +43,7 @@ import { composerEditorTheme, composerSelectionExtension } from './theme';
 import { handleComposerHostMouseDown } from './hostMouseDown';
 import { getComposerHeightLimit, isComposerContentCapped } from './heightLimit';
 import { restoreDeferredEnterModifiers } from '../keyboardPolicy';
+import { timerCaretBlink } from '@/lib/codemirror/caretBlink';
 
 export interface ComposerSelection {
     start: number;
@@ -57,6 +57,12 @@ export interface ComposerChange {
     fromPaste: boolean;
     /** The text this edit inserted, empty for deletions. */
     insertedText: string;
+    /**
+     * True when the edit only applied a new `value` prop: text the app put
+     * there (a restored draft, a prepared prompt), not anything the user typed
+     * or pasted. Callers must not open pickers for it.
+     */
+    fromValueProp: boolean;
 }
 
 export interface ComposerEditorHandle {
@@ -97,12 +103,22 @@ export interface ComposerEditorProps {
     editable?: boolean;
     spellCheck?: boolean;
     /**
+     * Show the mobile keyboard's return key as a send action
+     * (`enterkeyhint="send"`), which also enables IME voice swipe-up send.
+     */
+    returnKeySends?: boolean;
+    /**
      * The content element's autocorrect keyword. See `autocorrect.ts` for the
      * case-sensitive CodeMirror workaround.
      */
     autoCorrect?: ComposerAutoCorrect;
     autoCapitalize?: 'none' | 'sentences';
-    /** Retain the untouched key policy before a mobile user opts in. */
+    /**
+     * Restore the real Shift onto the deferred Enter. Callers gate it on
+     * whether Shift can be trusted: iOS autocapitalization reports a
+     * phantom Shift at sentence starts, which return-key send must treat
+     * as Send rather than newline.
+     */
     preserveDeferredEnterShift?: boolean;
     /** Fill the available height instead of growing with the content. */
     fillContainer?: boolean;
@@ -166,8 +182,44 @@ function isDeferredSyntheticEvent(event: KeyboardEvent): boolean {
  */
 const editableCompartment = new Compartment();
 const placeholderCompartment = new Compartment();
+const enterKeyHintCompartment = new Compartment();
 
-export const ComposerEditor = React.forwardRef<ComposerEditorHandle, ComposerEditorProps>(
+/**
+ * The return-key hint lives in a compartment so a settings flip applies
+ * immediately: iOS picks the keycap when the keyboard opens, and a provider
+ * that only re-evaluates on the next editor update would lag one keystroke
+ * behind the setting.
+ */
+const enterKeyHintExtension = (send: boolean): Extension =>
+    send ? EditorView.contentAttributes.of({ enterkeyhint: 'send' }) : [];
+
+/**
+ * CSS placeholder, not CodeMirror's `placeholder()` widget: a widget at
+ * position 0 wraps the caret in a zero-width buffer image and a
+ * `contenteditable=false` span, and IMEs that probe the text context before
+ * committing — iOS smart-spacing keyboards among them — fail that probe on an
+ * empty document, so the first character never arrives. The pseudo-element
+ * driven by these attributes is invisible to the probe.
+ */
+const composerEmptyClass = EditorView.contentAttributes.of((view) =>
+    view.state.doc.length === 0 ? { class: 'cm-composer-empty' } : null);
+
+function placeholderContentAttributes(text: string) {
+    return EditorView.contentAttributes.of({
+        'aria-placeholder': text,
+        // `content: attr(...)` reads the pseudo-element's own element, so the
+        // text reaches `.cm-line::before` through a custom property instead.
+        // JSON.stringify quotes it as a CSS string.
+        style: `--composer-placeholder: ${JSON.stringify(text)}`,
+    });
+}
+
+/** Marks the transaction that writes a changed `value` prop into the editor. */
+const valuePropWrite = Annotation.define<true>();
+
+// Memoized: the view is built once and reads its handlers through a ref, so a
+// parent render with equal props has nothing to tell it.
+export const ComposerEditor = React.memo(React.forwardRef<ComposerEditorHandle, ComposerEditorProps>(
     function ComposerEditor(props, ref) {
         const {
             value,
@@ -175,6 +227,7 @@ export const ComposerEditor = React.forwardRef<ComposerEditorHandle, ComposerEdi
             placeholder,
             editable = true,
             spellCheck = false,
+            returnKeySends = false,
             autoCorrect = 'off',
             autoCapitalize = 'none',
             fillContainer = false,
@@ -262,20 +315,36 @@ export const ComposerEditor = React.forwardRef<ComposerEditorHandle, ComposerEdi
                         // makes CodeMirror enforce cursor association on the
                         // native selection, which iOS answers with severe lag.
                         drawSelection(),
+                        // Blinks the drawn caret from a timer; CodeMirror's
+                        // CSS blink keeps the compositor busy every frame.
+                        timerCaretBlink(),
                         composerSelectionExtension(),
                         EditorView.lineWrapping,
                         // Highest precedence: the composer's own keys must win
                         // over CodeMirror's defaults (Enter sends, ArrowUp
                         // walks history, Escape closes a picker).
                         Prec.highest(keymap.of(interceptKeys)),
-                        keymap.of([...standardKeymap, ...historyKeymap]),
+                        keymap.of([
+                            // At a document boundary these commands return false.
+                            // Chromium's native page movement can then scroll
+                            // hidden-overflow ancestors of the empty placeholder.
+                            ...standardKeymap.map((binding) =>
+                                binding.key === 'PageUp' || binding.key === 'PageDown'
+                                    ? { ...binding, preventDefault: true }
+                                    : binding),
+                            ...historyKeymap,
+                        ]),
                         composerLanguage(handlersRef.current.languageContext),
                         composerBidi,
                         editableCompartment.of(
                             EditorView.editable.of(handlersRef.current.editable ?? true),
                         ),
+                        composerEmptyClass,
+                        enterKeyHintCompartment.of(
+                            enterKeyHintExtension(handlersRef.current.returnKeySends === true),
+                        ),
                         placeholderCompartment.of(
-                            placeholderExtension(handlersRef.current.placeholder ?? ''),
+                            placeholderContentAttributes(handlersRef.current.placeholder ?? ''),
                         ),
                         composerEditorTheme,
                         EditorView.updateListener.of((update) => {
@@ -295,6 +364,9 @@ export const ComposerEditor = React.forwardRef<ComposerEditorHandle, ComposerEdi
                                     selection,
                                     fromPaste,
                                     insertedText,
+                                    fromValueProp: update.transactions.every(
+                                        (transaction) => !transaction.docChanged || transaction.annotation(valuePropWrite) === true,
+                                    ),
                                 });
                                 return;
                             }
@@ -356,7 +428,7 @@ export const ComposerEditor = React.forwardRef<ComposerEditorHandle, ComposerEdi
             };
             // Created once: every changing input is applied through a
             // dispatch below rather than by rebuilding the view.
-            // eslint-disable-next-line react-hooks/exhaustive-deps
+            // oxlint-disable-next-line react-hooks/exhaustive-deps
         }, []);
 
         // Controlled value: only write back when the prop and the document
@@ -378,7 +450,10 @@ export const ComposerEditor = React.forwardRef<ComposerEditorHandle, ComposerEdi
             // keeping the old caret instead left it stranded before the
             // inserted text, and the next insertion or keystroke landed inside
             // the previous one.
-            view.dispatch(replaceWithCaret(view.state, 0, current.length, value));
+            view.dispatch({
+                ...replaceWithCaret(view.state, 0, current.length, value),
+                annotations: valuePropWrite.of(true),
+            });
             // A large insert can push the caret below the fold, and a
             // transaction-time `scrollIntoView` cannot reach it: wrapped-line
             // heights are still estimates during the update, and the
@@ -408,9 +483,17 @@ export const ComposerEditor = React.forwardRef<ComposerEditorHandle, ComposerEdi
 
         React.useEffect(() => {
             viewRef.current?.dispatch({
-                effects: placeholderCompartment.reconfigure(placeholderExtension(placeholder ?? '')),
+                effects: placeholderCompartment.reconfigure(
+                    placeholderContentAttributes(placeholder ?? ''),
+                ),
             });
         }, [placeholder]);
+
+        React.useEffect(() => {
+            viewRef.current?.dispatch({
+                effects: enterKeyHintCompartment.reconfigure(enterKeyHintExtension(returnKeySends === true)),
+            });
+        }, [returnKeySends]);
 
         // Grow with the content up to `maxLines`, then scroll. The limit is
         // measured from the rendered line height rather than assumed, so it
@@ -596,7 +679,7 @@ export const ComposerEditor = React.forwardRef<ComposerEditorHandle, ComposerEdi
             />
         );
     },
-);
+));
 
 function readSelection(state: EditorState): ComposerSelection {
     const range = state.selection.main;

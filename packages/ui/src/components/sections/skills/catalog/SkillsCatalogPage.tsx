@@ -2,6 +2,7 @@ import { rankByQuery } from '@/lib/search/fuzzySearch';
 import React from 'react';
 
 import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { SettingsPageLayout } from '@/components/sections/shared/SettingsPageLayout';
 import { SettingsSection } from '@/components/sections/shared/SettingsSection';
@@ -17,6 +18,9 @@ import {
 import { Icon } from '@/components/icon/Icon';
 
 import { useSkillsCatalogStore } from '@/stores/useSkillsCatalogStore';
+import { useSkillsStore } from '@/stores/useSkillsStore';
+import { useSettingsDirectory } from '@/hooks/useSettingsDirectory';
+import { toast } from '@/components/ui';
 import { useShallow } from 'zustand/react/shallow';
 import { cn } from '@/lib/utils';
 import type { SkillsCatalogItem, SkillsCatalogSource } from '@/lib/api/types';
@@ -25,6 +29,8 @@ import { getCurrentIntlLocale, useI18n } from '@/lib/i18n';
 
 import { AddCatalogDialog } from './AddCatalogDialog';
 import { InstallSkillDialog } from './InstallSkillDialog';
+import { SkillsCatalogRows } from './SkillsCatalogRows';
+import { skillCatalogUrl } from './skillCatalogUrl';
 
 type SkillsMode = 'manual' | 'external';
 
@@ -33,25 +39,6 @@ interface SkillsCatalogPageProps {
   onModeChange: (mode: SkillsMode) => void;
   showModeTabs?: boolean;
 }
-
-const GITHUB_REPO_PATTERN = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
-
-const getRepoUrl = (source: string): string | null => {
-  const trimmed = source.trim();
-  if (!GITHUB_REPO_PATTERN.test(trimmed)) {
-    return null;
-  }
-  return `https://github.com/${trimmed}`;
-};
-
-const getSkillUrl = (item: SkillsCatalogItem): string | null => {
-  const repoUrl = getRepoUrl(item.repoSource);
-  if (!repoUrl) {
-    return null;
-  }
-  const skillPath = [item.repoSubpath, item.skillDir].filter(Boolean).join('/');
-  return skillPath ? `${repoUrl}/tree/HEAD/${skillPath}` : repoUrl;
-};
 
 let cachedStarsFormatter: { locale: string; formatter: Intl.NumberFormat } | null = null;
 
@@ -116,11 +103,11 @@ const SourceCard: React.FC<{
       onClick={onSelect}
       aria-pressed={isActive}
       className={cn(
-        'oc-surface-elevated w-full min-h-24 text-left rounded-lg border bg-surface-elevated p-3.5 flex gap-3 items-start transition-colors',
+        'oc-tile w-full min-h-24 text-start rounded-lg p-3.5 flex gap-3 items-start',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
         isActive
-          ? 'border-border bg-interactive-selection text-interactive-selection-foreground'
-          : 'border-border hover:border-interactive-border-hover'
+          ? 'bg-interactive-selection text-interactive-selection-foreground'
+          : 'oc-tile-hover'
       )}
     >
       <span className="min-w-0 flex-1 block">
@@ -187,12 +174,18 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
   })));
 
   const [search, setSearch] = React.useState('');
-  const [addCatalogOpen, setAddCatalogOpen] = React.useState(false);
+  const [catalogDialogOpen, setCatalogDialogOpen] = React.useState(false);
+  const [editingCatalogId, setEditingCatalogId] = React.useState<string | null>(null);
   const [installDialogOpen, setInstallDialogOpen] = React.useState(false);
-  const [installItem, setInstallItem] = React.useState<SkillsCatalogItem | null>(null);
+  const [installItems, setInstallItems] = React.useState<SkillsCatalogItem[]>([]);
+  const [selectedSkillKeys, setSelectedSkillKeys] = React.useState<Set<string>>(new Set());
+  const [uninstallItems, setUninstallItems] = React.useState<SkillsCatalogItem[]>([]);
+  const [isUninstalling, setIsUninstalling] = React.useState(false);
   const [isRemovingCatalog, setIsRemovingCatalog] = React.useState(false);
   const [isRemoveCatalogDialogOpen, setIsRemoveCatalogDialogOpen] = React.useState(false);
   const searchInputRef = React.useRef<HTMLInputElement | null>(null);
+  const deleteSkill = useSkillsStore((state) => state.deleteSkill);
+  const settingsDirectory = useSettingsDirectory();
 
   React.useEffect(() => {
     void loadCatalog();
@@ -257,6 +250,85 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
 
   const isCustomSource = Boolean(selectedSourceId && selectedSourceId.startsWith('custom:'));
 
+  const itemKey = React.useCallback((item: SkillsCatalogItem) => `${item.sourceId}:${item.skillDir}`, []);
+  const selectedItems = React.useMemo(
+    () => filtered.filter((item) => selectedSkillKeys.has(itemKey(item))),
+    [filtered, itemKey, selectedSkillKeys],
+  );
+  const selectedSourceForBatch = selectedItems[0]?.sourceId ?? (isSearching
+    ? filtered.find((item) => item.installable || item.installed?.isInstalled)?.sourceId
+    : selectedSourceId);
+  const selectedToInstall = selectedItems.filter((item) => !item.installed?.isInstalled);
+  const selectedToUninstall = selectedItems.filter((item) => item.installed?.isInstalled);
+  const selectableItems = filtered.filter((item) => (
+    (item.installable || item.installed?.isInstalled)
+    && item.sourceId === selectedSourceForBatch
+  ));
+  const batchSourceLabel = sources.find((source) => source.id === selectedSourceForBatch)?.label;
+  const allSelected = selectableItems.length > 0 && selectableItems.every((item) => selectedSkillKeys.has(itemKey(item)));
+
+  React.useEffect(() => {
+    const availableKeys = new Set(filtered.filter((item) => item.installable || item.installed?.isInstalled).map(itemKey));
+    setSelectedSkillKeys((current) => new Set([...current].filter((key) => availableKeys.has(key))));
+  }, [filtered, itemKey]);
+
+  const toggleSelectedSkill = (item: SkillsCatalogItem, checked: boolean) => {
+    const key = itemKey(item);
+    setSelectedSkillKeys((current) => {
+      const selected = filtered.find((candidate) => current.has(itemKey(candidate)));
+      if (checked && selected && selected.sourceId !== item.sourceId) return current;
+      const next = new Set(current);
+      if (checked) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  };
+
+  const toggleAllSkills = (checked: boolean) => {
+    setSelectedSkillKeys((current) => {
+      const next = new Set(current);
+      for (const item of selectableItems) {
+        if (checked) next.add(itemKey(item));
+        else next.delete(itemKey(item));
+      }
+      return next;
+    });
+  };
+
+  const openInstallDialog = (items: SkillsCatalogItem[]) => {
+    if (items.length === 0) return;
+    setInstallItems(items);
+    setInstallDialogOpen(true);
+  };
+
+  const uninstallSelectedSkill = async () => {
+    if (uninstallItems.length === 0) return;
+    setIsUninstalling(true);
+    const remaining: SkillsCatalogItem[] = [];
+    const refreshedSources = new Set<string>();
+    for (const item of uninstallItems) {
+      const directory = item.installed?.scope === 'project' ? settingsDirectory : null;
+      const success = (item.installed?.scope !== 'project' || Boolean(directory))
+        && await deleteSkill(item.skillName, directory);
+      if (success) {
+        refreshedSources.add(item.sourceId);
+        setSelectedSkillKeys((current) => {
+          const next = new Set(current);
+          next.delete(itemKey(item));
+          return next;
+        });
+      } else {
+        remaining.push(item);
+      }
+    }
+    setUninstallItems(remaining);
+    await Promise.all([...refreshedSources].map((sourceId) => loadSource(sourceId, { refresh: true })));
+    if (remaining.length > 0) toast.error(t('settings.skills.sidebar.toast.deleteSkillFailed'));
+    else if (uninstallItems.length === 1) toast.success(t('settings.skills.sidebar.toast.skillDeleted', { name: uninstallItems[0].skillName }));
+    else toast.success(t('settings.skills.catalog.page.toast.deleted', { count: uninstallItems.length }));
+    setIsUninstalling(false);
+  };
+
   const removeSelectedCatalog = async () => {
     if (!selectedSourceId || !isCustomSource) {
       return;
@@ -267,12 +339,24 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
       const settings = await loadDesktopSettings();
       // A failed load is not an empty list: writing [] here would drop every
       // other catalog along with the selected one.
-      if (!settings) return;
+      if (!settings) {
+        toast.error(t('settings.skills.catalog.add.toast.saveFailed'));
+        return;
+      }
       const catalogs = settings.skillCatalogs ?? [];
       const updated = catalogs.filter((c) => c.id !== selectedSourceId);
-      await updateDesktopSettings({ skillCatalogs: updated });
-      await loadCatalog({ refresh: true });
+      const saved = await updateDesktopSettings({ skillCatalogs: updated });
+      if (!saved.ok) {
+        toast.error(t('settings.skills.catalog.add.toast.saveFailed'));
+        return;
+      }
+      if (!await loadCatalog({ refresh: true })) {
+        toast.error(t('settings.skills.catalog.add.toast.saveFailed'));
+        return;
+      }
       setIsRemoveCatalogDialogOpen(false);
+    } catch {
+      toast.error(t('settings.skills.catalog.add.toast.saveFailed'));
     } finally {
       setIsRemovingCatalog(false);
     }
@@ -297,14 +381,16 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
       >
       {showModeTabs && (
             <div className="mb-4">
-              <div className="h-10">
+              <div className="h-7">
                 <SortableTabsStrip
                   items={[
                     { id: 'manual', label: t('settings.skills.catalog.page.mode.manual') },
                     { id: 'external', label: t('settings.skills.catalog.page.mode.external') },
                   ]}
                   activeId={mode}
-                  onSelect={(next) => onModeChange(next as 'manual' | 'external')}
+                  onSelect={(next) => {
+                    if (next === 'manual' || next === 'external') onModeChange(next);
+                  }}
                   layoutMode="fit"
                   variant="animated"
                   animateActivePill={false}
@@ -320,13 +406,13 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
 
         <div data-settings-item="skills.catalog.search" className="mb-5">
           <div className="relative max-w-md">
-            <Icon name="search" className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+            <Icon name="search" className="absolute inset-s-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
             <Input
               ref={searchInputRef}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder={t('settings.skills.catalog.page.searchAllPlaceholder')}
-              className={cn('h-8 pl-8 w-full', search && 'pr-8')}
+              className={cn('h-8 ps-8 w-full', search && 'pe-8')}
             />
             {search && (
               <button
@@ -335,7 +421,7 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
                   setSearch('');
                   searchInputRef.current?.focus();
                 }}
-                className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center justify-center h-4 w-4 rounded text-muted-foreground hover:text-foreground transition-colors"
+                className="absolute inset-e-2 top-1/2 -translate-y-1/2 flex items-center justify-center h-4 w-4 rounded text-muted-foreground hover:text-foreground transition-colors"
                 title={t('settings.skills.catalog.page.search.clear')}
               >
                 <Icon name="close" className="h-3 w-3" />
@@ -366,8 +452,11 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
             <button
               type="button"
               data-settings-item="skills.catalog.add-catalog"
-              onClick={() => setAddCatalogOpen(true)}
-              className="min-h-24 text-left rounded-lg border border-dashed border-[var(--interactive-border)] hover:border-[var(--interactive-border-hover)] hover:bg-[var(--surface-muted)] p-3.5 flex gap-3 items-start transition-colors"
+              onClick={() => {
+                setEditingCatalogId(null);
+                setCatalogDialogOpen(true);
+              }}
+              className="min-h-24 text-start rounded-lg border border-dashed border-[color-mix(in_srgb,var(--foreground)_14%,transparent)] oc-tile-hover p-3.5 flex gap-3 items-start transition-colors"
             >
               <span className="flex items-center justify-center rounded-md bg-transparent text-muted-foreground w-8 h-8 shrink-0">
                 <Icon name="add" className="h-4 w-4" />
@@ -386,9 +475,22 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
 
         {lastCatalogError && (
           <SettingsSection>
-            <div className="rounded-lg border border-[var(--status-error-border)] bg-[var(--status-error-background)] px-4 py-3">
+            <div className="rounded-lg bg-[var(--status-error-background)] px-4 py-3">
               <div className="typography-ui-label font-medium text-[var(--status-error)]">{t('settings.skills.catalog.page.error.catalogTitle')}</div>
               <div className="typography-meta text-[var(--status-error)]/80 mt-1">{lastCatalogError.message}</div>
+              {lastCatalogError.kind === 'authRequired' && isCustomSource && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="mt-2"
+                  onClick={() => {
+                    setEditingCatalogId(selectedSourceId);
+                    setCatalogDialogOpen(true);
+                  }}
+                >
+                  {t('settings.skills.catalog.page.actions.editCatalog')}
+                </Button>
+              )}
             </div>
           </SettingsSection>
         )}
@@ -424,6 +526,20 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
                 <Button
                   variant="ghost"
                   size="xs"
+                  className="!font-normal h-6 w-6 px-0"
+                  onClick={() => {
+                    setEditingCatalogId(selectedSourceId);
+                    setCatalogDialogOpen(true);
+                  }}
+                  title={t('settings.skills.catalog.page.actions.editCatalog')}
+                >
+                  <Icon name="edit" className="h-3.5 w-3.5" />
+                </Button>
+              )}
+              {isCustomSource && !isSearching && (
+                <Button
+                  variant="ghost"
+                  size="xs"
                   className="!font-normal h-6 w-6 px-0 text-[var(--status-error)] hover:text-[var(--status-error)]"
                   onClick={() => setIsRemoveCatalogDialogOpen(true)}
                   disabled={isRemovingCatalog}
@@ -435,28 +551,70 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
             </div>
           </div>
 
-          {isSelectedSourceLoading || (isLoadingSource && filtered.length === 0) ? (
+          {selectableItems.length > 0 && (
+            <div className="flex items-center justify-between gap-3 pb-2 min-h-8">
+              <div className="flex items-center gap-2 typography-meta text-muted-foreground">
+                <Checkbox
+                  checked={allSelected}
+                  indeterminate={selectedItems.length > 0 && !allSelected}
+                  onChange={(checked) => toggleAllSkills(checked)}
+                  ariaLabel={t(allSelected ? 'settings.skills.catalog.page.actions.deselectAll' : 'settings.skills.catalog.installFromRepo.actions.selectAll')}
+                />
+                <span>
+                  {t(allSelected ? 'settings.skills.catalog.page.actions.deselectAll' : 'settings.skills.catalog.installFromRepo.actions.selectAll')}
+                  {isSearching && batchSourceLabel ? ` · ${batchSourceLabel}` : ''}
+                </span>
+              </div>
+              {selectedItems.length > 0 && (
+                <div className="flex items-center gap-2">
+                  <span className="typography-meta text-muted-foreground">
+                    {t('settings.skills.catalog.installFromRepo.selectedCount', { selected: selectedItems.length, total: selectableItems.length })}
+                  </span>
+                  {selectedToInstall.length > 0 && (
+                    <Button size="xs" onClick={() => openInstallDialog(selectedToInstall)}>
+                      {t('settings.skills.catalog.installFromRepo.actions.installSelected')}
+                    </Button>
+                  )}
+                  {selectedToUninstall.length > 0 && (
+                    <Button size="xs" variant="destructive" onClick={() => setUninstallItems(selectedToUninstall)}>
+                      {t('settings.skills.catalog.page.actions.delete')}
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {isSelectedSourceLoading || (isLoadingSource && filtered.length === 0) || (isLoadingCatalog && sources.length === 0) ? (
               <div className="py-8 text-center text-muted-foreground">
                 <Icon name="refresh" className="mx-auto mb-3 h-5 w-5 animate-spin opacity-50" />
                 <p className="typography-meta">{t('settings.skills.catalog.page.loading.skills')}</p>
               </div>
             ) : filtered.length === 0 ? (
               <div className="py-8 text-center text-muted-foreground">
-                <p className="typography-body">{t('settings.skills.catalog.page.empty.noSkillsTitle')}</p>
+                <p className="typography-ui-label">{t('settings.skills.catalog.page.empty.noSkillsTitle')}</p>
                 <p className="typography-meta mt-1 opacity-75">{t('settings.skills.catalog.page.empty.noSkillsDescription')}</p>
               </div>
             ) : (
-              <div className="divide-y divide-[var(--surface-subtle)]">
-                {filtered.map((item) => {
+              <SkillsCatalogRows
+                items={filtered}
+                itemKey={itemKey}
+                renderRow={(item) => {
                   const installed = item.installed?.isInstalled;
                   const installedScope = item.installed?.scope;
-                  const skillUrl = getSkillUrl(item);
+                  const skillUrl = skillCatalogUrl(item);
 
                   return (
-                    <div key={`${item.sourceId}:${item.skillDir}`} className="py-2">
+                    <div className="py-2">
                       <div className="flex items-start justify-between gap-4">
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2">
+                            <Checkbox
+                              checked={selectedSkillKeys.has(itemKey(item))}
+                              onChange={(checked) => toggleSelectedSkill(item, checked)}
+                              disabled={(!installed && !item.installable) || Boolean(selectedItems.length > 0 && selectedSourceForBatch !== item.sourceId)}
+                              ariaLabel={`${installed ? t('settings.skills.catalog.page.actions.delete') : t('settings.skills.catalog.shared.actions.install')} ${item.skillName}`}
+                            />
                             <span className="typography-ui-label font-medium text-foreground truncate">{item.skillName}</span>
                             {installed && (
                               <span className="typography-micro text-[var(--status-success)] bg-[var(--status-success)]/10 px-1.5 py-0.5 rounded flex-shrink-0">
@@ -519,9 +677,15 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
                             </Button>
                           )}
                           {installed ? (
-                            <span className="text-[var(--status-success)] flex items-center justify-center w-7 h-7" title={t('settings.skills.catalog.page.badge.installed', { scope: installedScope || '' })}>
+                            <Button
+                              variant="ghost"
+                              size="xs"
+                              className="!font-normal h-7 w-7 px-0 text-[var(--status-success)] hover:text-[var(--status-error)]"
+                              onClick={() => setUninstallItems([item])}
+                              title={t('settings.skills.sidebar.deleteDialog.title')}
+                            >
                               <Icon name="check" className="h-4 w-4" />
-                            </span>
+                            </Button>
                           ) : (
                             <Button
                               variant="outline"
@@ -529,8 +693,7 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
                               className="!font-normal"
                               disabled={!item.installable}
                               onClick={() => {
-                                setInstallItem(item);
-                                setInstallDialogOpen(true);
+                                openInstallDialog([item]);
                               }}
                             >
                               {t('settings.skills.catalog.shared.actions.install')}
@@ -540,15 +703,36 @@ export const SkillsCatalogPage: React.FC<SkillsCatalogPageProps> = ({ mode, onMo
                       </div>
                     </div>
                   );
-                })}
-              </div>
+                }}
+              />
             )}
         </SettingsSection>
       </SettingsPageLayout>
 
         {/* Dialogs */}
-        <AddCatalogDialog open={addCatalogOpen} onOpenChange={setAddCatalogOpen} />
-        <InstallSkillDialog open={installDialogOpen} onOpenChange={setInstallDialogOpen} item={installItem} />
+        <AddCatalogDialog open={catalogDialogOpen} onOpenChange={setCatalogDialogOpen} catalogId={editingCatalogId} />
+        <InstallSkillDialog open={installDialogOpen} onOpenChange={setInstallDialogOpen} items={installItems} />
+
+        <Dialog open={uninstallItems.length > 0} onOpenChange={(open) => !open && !isUninstalling && setUninstallItems([])}>
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>{t('settings.skills.sidebar.deleteDialog.title')}</DialogTitle>
+              <DialogDescription>
+                {uninstallItems.length === 1
+                  ? t('settings.skills.sidebar.deleteDialog.description', { name: uninstallItems[0].skillName })
+                  : uninstallItems.map((item) => item.skillName).join(', ')}
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button size="sm" variant="ghost" onClick={() => setUninstallItems([])} disabled={isUninstalling}>
+                {t('settings.common.actions.cancel')}
+              </Button>
+              <Button size="sm" variant="destructive" onClick={() => void uninstallSelectedSkill()} disabled={isUninstalling}>
+                {t('settings.common.actions.delete')}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
         <Dialog
           open={isRemoveCatalogDialogOpen}

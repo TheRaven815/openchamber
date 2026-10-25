@@ -1,11 +1,13 @@
 import React from 'react';
-import { cn, fuzzyMatch } from '@/lib/utils';
-import { selectSkillsForDirectory, useSkillsStore } from '@/stores/useSkillsStore';
+import { cn } from '@/lib/utils';
+import { selectAvailableSkillsForDirectory, useSkillsStore } from '@/stores/useSkillsStore';
 import { useEffectiveDirectory } from '@/hooks/useEffectiveDirectory';
 import { useUIStore } from '@/stores/useUIStore';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { useMobileAutocompleteMaxHeight } from './useMobileAutocompleteMaxHeight';
 import { AutocompleteRowTooltip } from './composer/ui/AutocompleteRowTooltip';
+import { useAutocompleteDetails } from './composer/ui/useAutocompleteDetails';
+import { rankSkillAutocompleteItems } from './skillAutocompleteItems';
 
 interface SkillInfo {
   name: string;
@@ -39,10 +41,12 @@ export const SkillAutocomplete = React.forwardRef<SkillAutocompleteHandle, Skill
   const keyboardNavigationRef = React.useRef(false);
   const [filteredSkills, setFilteredSkills] = React.useState<SkillInfo[]>([]);
   const itemRefs = React.useRef<(HTMLDivElement | null)[]>([]);
+  const { listRef, detailsVisible, onListScroll, onItemMouseMove, onKeyboardNavigate } =
+    useAutocompleteDetails(selectedIndex, itemRefs);
   // Skills of the directory the composer sends to (session directory, or the
   // Chats root for a chat draft), not of the project the app was on last.
   const effectiveDirectory = useEffectiveDirectory();
-  const skills = useSkillsStore((s) => selectSkillsForDirectory(s, effectiveDirectory));
+  const skills = useSkillsStore((s) => selectAvailableSkillsForDirectory(s, effectiveDirectory));
   const loadSkills = useSkillsStore((s) => s.loadSkills);
 
   React.useEffect(() => {
@@ -51,30 +55,12 @@ export const SkillAutocomplete = React.forwardRef<SkillAutocompleteHandle, Skill
   }, [effectiveDirectory, loadSkills]);
 
   React.useEffect(() => {
-    const normalizedQuery = searchQuery.trim();
-    const matches = normalizedQuery.length
-      ? skills.filter((skill) => fuzzyMatch(skill.name, normalizedQuery))
-      : skills;
-
-    const sorted = [...matches].sort((a, b) => {
-      // Sort by project scope first, then name
-      if (a.scope === 'project' && b.scope !== 'project') return -1;
-      if (a.scope !== 'project' && b.scope === 'project') return 1;
-      return a.name.localeCompare(b.name);
-    });
-
-    setFilteredSkills(sorted);
+    setFilteredSkills(rankSkillAutocompleteItems(skills, searchQuery));
     setSelectedIndex(0);
   }, [skills, searchQuery]);
 
   React.useEffect(() => {
     selectedIndexRef.current = selectedIndex;
-  }, [selectedIndex]);
-
-  React.useEffect(() => {
-    itemRefs.current[selectedIndex]?.scrollIntoView({
-      block: 'nearest',
-    });
   }, [selectedIndex]);
 
   React.useEffect(() => {
@@ -107,12 +93,14 @@ export const SkillAutocomplete = React.forwardRef<SkillAutocompleteHandle, Skill
 
       if (key === 'ArrowDown') {
         keyboardNavigationRef.current = true;
+        onKeyboardNavigate();
         setSelectedIndex((prev) => (prev + 1) % filteredSkills.length);
         return;
       }
 
       if (key === 'ArrowUp') {
         keyboardNavigationRef.current = true;
+        onKeyboardNavigate();
         setSelectedIndex((prev) => (prev - 1 + filteredSkills.length) % filteredSkills.length);
         return;
       }
@@ -125,13 +113,13 @@ export const SkillAutocomplete = React.forwardRef<SkillAutocompleteHandle, Skill
         }
       }
     },
-  }), [filteredSkills, onSkillSelect, onClose]);
+  }), [filteredSkills, onSkillSelect, onClose, onKeyboardNavigate]);
 
   const renderSkill = (skill: SkillInfo, index: number) => {
     const isProject = skill.scope === 'project';
     const source = skill.source || 'opencode';
     return (
-      <AutocompleteRowTooltip description={skill.description} active={!isMobile && index === selectedIndex}>
+      <AutocompleteRowTooltip description={skill.description} active={!isMobile && index === selectedIndex && detailsVisible}>
       <div
         key={`${skill.name}-${skill.scope}`}
         ref={(el) => {
@@ -145,6 +133,7 @@ export const SkillAutocomplete = React.forwardRef<SkillAutocompleteHandle, Skill
         onClick={() => onSkillSelect(skill.name)}
         onMouseMove={() => {
           keyboardNavigationRef.current = false;
+          onItemMouseMove();
           setSelectedIndex(index);
         }}
       >
@@ -152,14 +141,14 @@ export const SkillAutocomplete = React.forwardRef<SkillAutocompleteHandle, Skill
           <div className="flex items-center gap-2">
             <span className="font-semibold truncate">{skill.name}</span>
             <span className={cn(
-              "text-[10px] leading-none uppercase font-bold tracking-tight px-1.5 py-1 rounded border flex-shrink-0 transition-colors",
+              "text-[0.625rem] leading-none uppercase font-bold tracking-tight px-1.5 py-1 rounded border flex-shrink-0 transition-colors",
               isProject 
                 ? "bg-[var(--status-info-background)] text-[var(--status-info)] border-[var(--status-info-border)]"
                 : "bg-[var(--status-success-background)] text-[var(--status-success)] border-[var(--status-success-border)]"
             )}>
               {skill.scope}
             </span>
-            <span className="text-[10px] leading-none uppercase font-bold tracking-tight px-1.5 py-1 rounded border flex-shrink-0 bg-[var(--surface-muted)] text-muted-foreground border-[var(--interactive-border)]/60">
+            <span className="text-[0.625rem] leading-none uppercase font-bold tracking-tight px-1.5 py-1 rounded border flex-shrink-0 bg-[var(--surface-muted)] text-muted-foreground border-[var(--interactive-border)]/60">
               {source}
             </span>
           </div>
@@ -172,10 +161,10 @@ export const SkillAutocomplete = React.forwardRef<SkillAutocompleteHandle, Skill
   return (
     <div
       ref={containerRef}
-      className="absolute z-[100] min-w-0 w-full max-w-[450px] max-h-60 oc-glass-popover border-2 border-border/60 rounded-xl shadow-none bottom-full mb-2 left-0 flex flex-col"
+      className="absolute z-[100] min-w-0 w-full max-w-[450px] max-h-60 oc-glass-popover oc-glass-floating rounded-xl bottom-full mb-2 inset-s-0 flex flex-col"
       style={mobileMaxHeight !== undefined ? { ...style, maxHeight: mobileMaxHeight } : style}
     >
-      <ScrollableOverlay preventOverscroll outerClassName="flex-1 min-h-0" className="px-0 pb-2">
+      <ScrollableOverlay ref={listRef} onScroll={onListScroll} preventOverscroll outerClassName="flex-1 min-h-0" className="px-0 pb-2">
         {filteredSkills.length ? (
           <div>
             {filteredSkills.map((skill, index) => renderSkill(skill, index))}

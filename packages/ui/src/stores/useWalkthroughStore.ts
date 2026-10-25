@@ -17,8 +17,9 @@ import {
   type WalkthroughStage,
   type WalkthroughTarget,
 } from '@/lib/walkthrough/types';
+import { joinProjectPath } from '@/lib/source-control/projectPath';
 
-export type WalkthroughEntryStatus = 'idle' | 'loading' | 'generating' | 'ready' | 'error';
+type WalkthroughEntryStatus = 'idle' | 'loading' | 'generating' | 'ready' | 'error';
 
 export interface WalkthroughEntry {
   status: WalkthroughEntryStatus;
@@ -46,7 +47,9 @@ export const walkthroughSourceKey = (source: WalkthroughSource): string => {
   if (source.kind === 'working-tree') return `working-tree:${source.scope}`;
   if (source.kind === 'branch') return `branch:${source.baseRef}...${source.headRef}`;
   if (source.kind === 'commit') return `commit:${source.hash}`;
-  return source.sourceRepo ? `pr:${source.sourceRepo.owner}/${source.sourceRepo.repo}:${source.number}` : `pr:${source.number}`;
+  const pr = source.sourceRepo ? `pr:${joinProjectPath(source.sourceRepo.owner, source.sourceRepo.repo)}:${source.number}` : `pr:${source.number}`;
+  // An earlier revision is its own walkthrough; the current one keeps the key it always had.
+  return source.revision ? `${pr}@${source.revision}` : pr;
 };
 
 const walkthroughTargetKey = (target: WalkthroughTarget): string => {
@@ -58,7 +61,8 @@ const walkthroughTargetKey = (target: WalkthroughTarget): string => {
   return JSON.stringify([
     'pr',
     source.number,
-    source.sourceRepo ? `${source.sourceRepo.owner}/${source.sourceRepo.repo}` : null,
+    source.sourceRepo ? joinProjectPath(source.sourceRepo.owner, source.sourceRepo.repo) : null,
+    source.revision ?? null,
     ...sourceControlReadContextParts(context),
   ]);
 };
@@ -94,14 +98,15 @@ interface WalkthroughState {
 interface WalkthroughActions {
   getEntry: (directory: string, target: WalkthroughTarget) => WalkthroughEntry;
   /**
-   * `providerID` is the composer's provider: without a model of its own the
-   * walkthrough stays on it.
+   * `providerID` / `modelID` are the composer's: without a model of its own
+   * the walkthrough stays on that provider, and on that model when the
+   * provider has no small one.
    */
-  load: (directory: string, target: WalkthroughTarget, options?: { language?: string; providerID?: string }) => Promise<void>;
+  load: (directory: string, target: WalkthroughTarget, options?: { language?: string; providerID?: string; modelID?: string }) => Promise<void>;
   generate: (
     directory: string,
     target: WalkthroughTarget,
-    options?: { force?: boolean; language?: string; providerID?: string }
+    options?: { force?: boolean; language?: string; providerID?: string; modelID?: string }
   ) => Promise<void>;
   cancel: (directory: string, target: WalkthroughTarget) => void;
   requestTarget: (directory: string, target: WalkthroughTarget) => void;
@@ -193,6 +198,7 @@ export const useWalkthroughStore = create<WalkthroughState & WalkthroughActions>
           const result = await fetchWalkthrough(directory, target, {
             model: get().selectedModel[key],
             providerID: options.providerID,
+            modelID: options.modelID,
             language: options.language,
             signal: controller.signal,
           });
@@ -205,7 +211,7 @@ export const useWalkthroughStore = create<WalkthroughState & WalkthroughActions>
           }));
 
           if (result.generating) {
-            void get().generate(directory, target, { language: options.language, providerID: options.providerID });
+            void get().generate(directory, target, { language: options.language, providerID: options.providerID, modelID: options.modelID });
           }
         } catch (error) {
           if (controller.signal.aborted) return;
@@ -268,6 +274,7 @@ export const useWalkthroughStore = create<WalkthroughState & WalkthroughActions>
             force: options.force,
             model: get().selectedModel[key],
             providerID: options.providerID,
+            modelID: options.modelID,
             language: options.language,
             signal: controller.signal,
           });

@@ -7,9 +7,46 @@ description: Connect the services and subscriptions OpenChamber works with.
 
 **Settings → Integrations** is where you sign in to the services OpenChamber works with. The sign-in is stored on the OpenChamber server, so web, desktop, and a paired phone share it.
 
+## Integrations catalog
+
+The integrations catalog lists over 150 services you can give the agent in one click: Linear, Notion, Sentry, Supabase, Figma, observability tools, CRMs, meeting notes and more. Installing one usually adds the service's MCP server (the connection the agent uses to read and change things there), and sometimes skills or a plugin that come with it. It installs for your user, so every project gets it.
+
+1. Choose the store icon in the sidebar header.
+2. Find a service: search by name, or narrow the list with a category such as **Code** or **Quality and ops**. **OpenChamber** lists our own extensions and plugins.
+3. Choose **+** on its row, or open it and choose **Install**.
+4. Sign in the way the service asks:
+   - **OAuth**: the service's sign-in page opens in your browser. Approve access there.
+   - **Token**: paste an API token into **API token**. **Get a token** opens the page where the service hands one out.
+   - **No sign-in**: nothing to do.
+
+When it's done, the service shows a check mark and appears under **Installed** on the left, and its tools are available in your next message. A yellow dot or **Sign-in required** means the sign-in didn't finish; open the service and sign in again.
+
+Some entries need more than a sign-in:
+
+- **Local servers** run on the machine OpenCode runs on and may need Node.js, Python with uv, or Docker. The first start can take a while.
+- **Plugins** are code that runs inside OpenCode, so the catalog asks you to confirm and shows the plugin's license first.
+- **Skills** that come with a service install with it. If one is missing, its own **Install** appears on the service's page.
+
+To remove a service, open it, choose **More actions** (**⋯**), then **Uninstall**. This removes only what the catalog added; your account on the service stays as it is. You can also manage MCP servers, plugins and skills in Settings as usual.
+
+The catalog is in the web app and desktop app. It's hidden in [enterprise mode](/security/#enterprise-mode).
+
 ## GitHub
 
-Expand the **GitHub** card and choose **Connect GitHub** to sign in with a short device code. Once connected, OpenChamber can start sessions from issues and pull requests, attach them to messages, and open or update PRs. Everything GitHub can do is on [GitHub Issues & PRs](/github/).
+Expand the **GitHub** card and choose **Connect GitHub** to sign in with a short device code. Once connected, OpenChamber can start sessions from issues and pull requests, attach them to messages, and open or update PRs. Everything the git hosts can do is on [Git hosts](/github/).
+
+## GitLab, Gitea, Forgejo and Gerrit
+
+GitLab, Gitea, Forgejo and Gerrit each have their own card next to GitHub. Once connected, their issues and pull requests (merge requests on GitLab, changes on Gerrit) show on the [Issues and PRs](/issues-and-prs/) board and in the chat's **+** menu, like GitHub's.
+
+- **GitLab**: on gitlab.com, sign in with a short device code, a personal access token, or the `glab` login on the server. For a self-managed GitLab, add its address and paste a personal access token with the `api` scope. Device-code sign-in works there only when the server sets `OPENCHAMBER_GITLAB_CLIENT_ID` to an application registered on that instance.
+- **Gitea**: add your instance's address, such as `https://gitea.example.com`, and paste a personal access token with the `write:repository`, `write:issue` and `read:user` scopes. The card links to the page on your instance that creates one. Gitea has no device-code or CLI sign-in. It needs Gitea 1.21 or newer, served from the root of its address.
+- **Forgejo**: Codeberg is already on the card, so connecting it takes only a personal access token with the `write:repository`, `write:issue` and `read:user` scopes; the card links to the page on Codeberg that creates one. For another Forgejo server, add its address, such as `https://forgejo.example.com`, and paste a token with the same scopes. It needs Forgejo 7.0 or newer, served from the root of its address. A Forgejo server connects on this card and a Gitea server on the Gitea card.
+- **Gerrit**: add your instance's address, such as `https://gerrit.example.com`, then your Gerrit username and an HTTP password. Generate the password in Gerrit under **Settings → HTTP Credentials**; the card links there. Your sign-in password won't work, and an account without a username can't connect. It needs Gerrit 3.8 or newer, served from the root of its address. Sites whose review address differs from the Git address, such as googlesource.com with `.gitcookies`, aren't supported.
+
+On Gerrit you review changes. Each upload of a change is a patchset, and the change's preview lets you pick an earlier one to read. You review by voting on the project's labels, such as Code-Review and Verified, and land a change with **Submit** once its submit requirements are met. Gerrit has no issues, so only changes show. To create a change, or upload a new patchset to one, use **Push for review** in the Git panel; see [Git](/git/#push-for-review-on-gerrit).
+
+The project's remote decides which card's account OpenChamber uses, and an account on any of these cards can be a project's [Git identity](/git-identities/). An [extension](/extensions/#an-extension-as-a-git-host) can add another host with a card of its own.
 
 ## Linear
 
@@ -22,21 +59,20 @@ Connect another Linear organization with **Add workspace**. One workspace is cur
 
 ### Browse issues
 
-Once a workspace is connected, the **Linear** panel appears in the right-hand context rail. It lists the current workspace's issues and lets you:
+Linear issues live on the **Issues and PRs** board. Open it with the pull-request icon in the sidebar header, or press <kbd>⌘K</kbd> then <kbd>B</kbd> (<kbd>Ctrl+K</kbd> then <kbd>B</kbd> on Windows and Linux), and choose **Linear** at the top. The board lists the current workspace's issues and lets you:
 
-- filter by status (**Backlog**, **To Do**, **In Progress**, **In Review**, **Done**, **Canceled**, **Duplicate**), assignee (**Anyone** or **Assigned to me**), team, and priority
-- search by title, identifier, or a Linear URL
-- open an issue to read its description, comments, labels, and priority
-- change its **Status** or **Close issue**
-- switch the current **Workspace**
+- show one team or **All teams**
+- switch the current workspace, when more than one is connected
+- filter by status, by whose issues they are (**Assigned to me** or **Created by me**), and by priority, all at once, and search by title or identifier
+- read an issue's description, comments, labels, and priority beside the list
+- change its **Status**
 
 ### Start a session from an issue
 
-- In the Linear panel, open an issue and choose **Start session**. The button stays in the footer while the issue scrolls.
-- In the chat, choose **New Session From Linear Issue** to pick one from the list, with **Create in worktree** if you want a fresh branch.
-- In the **New Worktree** dialog, pick a Linear issue. The new session opens with the issue attached to the message box, and you write the first message yourself.
+- On the board, pick an issue and choose **Start in worktree…** for a fresh branch, or **New session** to work in the project as it is.
+- In the **New Worktree** dialog, pick a Linear issue.
 
-From the Linear panel and the chat, the session opens in the project mapped to the issue's team, with the issue as the first prompt. Map teams in the Linear card: **Default project** covers every team, and **Team projects** override it per team. An unmapped team asks you to map it first. The first message is built from the **Issue Review** magic prompt, which you can edit at **Settings → Magic Prompts → Linear**.
+Either way the session opens with the issue attached to the message box, and you write the first message yourself. The board starts it in the project mapped to the issue's team, shown next to **Start in**; pick another project there if you need to. Map teams in the Linear card: **Default project** covers every team, and **Team projects** override it per team. Without a mapping, the board uses the project it showed last.
 
 ### Link an issue to a message
 
@@ -80,8 +116,19 @@ Excalidraw lets you draw in `.excalidraw` files and Obsidian `.excalidraw.md` dr
 
 The card updates the extension when a new version is out, turns it back on if you paused it, and removes it. Your drawings stay as they are when you remove it; they just open as text. Web and desktop only.
 
+## Resource Monitor
+
+Resource Monitor shows how much CPU and memory your machine uses and how much of it goes to OpenChamber, OpenCode, everything they started, and the dev servers running under them. It's an OpenChamber extension, listed under **OpenChamber extensions** on the same page.
+
+1. Open **Settings → Integrations** and choose **Install** on the Resource Monitor card.
+2. Approve its local service in **Settings → Extensions**. The numbers come from a small process OpenChamber starts next to the panel. It measures only while the panel or the **Resources** section is on screen.
+3. Open **Resource Monitor** from the right-hand rail. A short readout also appears under **Resources** in the Work Status panel.
+
+Stop on a dev server or a job ends that command with everything it started, so a watcher can't bring the server back. **Stop all** in the Terminal group ends everything running in the terminal and project actions and leaves the terminal tabs open. OpenChamber itself and the OpenCode server have no Stop.
+
+Dev servers show up when they run under OpenChamber: started in the built-in terminal, or by an agent when OpenChamber started OpenCode itself. A server that detaches from its parent, or a container started with `docker compose up -d`, isn't listed. When you're connected to a remote OpenChamber, the monitor shows that machine. Web and desktop only.
+
 ## Related
 
-- [GitHub Issues & PRs](/github/) — everything GitHub can do in OpenChamber
+- [Git hosts](/github/) — everything GitHub, GitLab, Gitea, Forgejo and Gerrit can do in OpenChamber
 - [Worktree Sessions](/worktrees/) — where issue sessions can start
-- [Magic Prompts](/magic-prompts/) — edit the prompt a Linear session starts with

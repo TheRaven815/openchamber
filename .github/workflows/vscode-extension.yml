@@ -23,9 +23,9 @@ jobs:
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -45,7 +45,7 @@ jobs:
         run: bunx ovsx publish packages/vscode/*.vsix -p "$OVSX_PAT"
 
       - name: Upload VSIX artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: openchamber-vscode-vsix
           path: packages/vscode/*.vsix
@@ -56,5 +56,8 @@ jobs:
         with:
           files: packages/vscode/*.vsix
           generate_release_notes: false
+          # The release workflow publishes the release once every platform is
+          # on it; uploading here must not publish the draft early.
+          draft: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

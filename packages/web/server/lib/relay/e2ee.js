@@ -4,21 +4,22 @@
 // plain JS and cannot import from packages/ui, so the logic is copied verbatim
 // (converted to JSDoc'd JS) and MUST stay byte-compatible with those modules.
 // WebCrypto only: `globalThis.crypto.subtle` (Node >= 22).
-// Spec: .opencode/plans/private-relay/01-protocol-spec.md (Layer 2).
+// Spec: packages/web/server/lib/relay/DOCUMENTATION.md (Layer 2).
 
 const subtle = globalThis.crypto.subtle;
 
 export const RELAY_PROTOCOL_VERSION = 1;
-export const RELAY_HKDF_INFO = 'openchamber-relay-v1';
+const RELAY_HKDF_INFO = 'openchamber-relay-v1';
 
 // Encrypted frame layout: [1 byte version][12 byte IV][ciphertext + 16 byte GCM tag].
-export const ENCRYPTED_FRAME_VERSION = 1;
-export const ENCRYPTED_FRAME_IV_BYTES = 12;
-export const ENCRYPTED_FRAME_HEADER_BYTES = 1 + ENCRYPTED_FRAME_IV_BYTES;
+const ENCRYPTED_FRAME_VERSION = 1;
+const ENCRYPTED_FRAME_IV_BYTES = 12;
+const ENCRYPTED_FRAME_HEADER_BYTES = 1 + ENCRYPTED_FRAME_IV_BYTES;
 export const MAX_PLAINTEXT_FRAME_BYTES = 64 * 1024;
 
 // Relay-assigned WebSocket close codes (subset the host needs).
 export const RelayCloseCode = {
+  ControlReplaced: 4001,
   RekeyMismatch: 1008,
   ChannelFailure: 1011,
 };
@@ -31,7 +32,7 @@ const GCM_TAG_BYTES = 16;
 const IV_PREFIX_BYTES = 4;
 const IV_COUNTER_BYTES = 8;
 
-export class RelayCryptoError extends Error {
+class RelayCryptoError extends Error {
   constructor(message) {
     super(message);
     this.name = 'RelayCryptoError';
@@ -51,7 +52,7 @@ export const exportPublicKeyJwk = async (key) => {
 };
 
 /** @param {JsonWebKey} jwk */
-export const importEcdhPublicKey = async (jwk) => {
+const importEcdhPublicKey = async (jwk) => {
   if (jwk.kty !== 'EC' || jwk.crv !== 'P-256' || typeof jwk.x !== 'string' || typeof jwk.y !== 'string') {
     throw new RelayCryptoError('invalid ECDH public key JWK');
   }
@@ -79,7 +80,7 @@ export const importEcdhPrivateKey = async (jwk) => {
 
 // Stable fingerprint of a public key, used to detect rekey attempts on re-hello.
 /** @param {JsonWebKey} jwk */
-export const publicKeyJwkFingerprint = (jwk) =>
+const publicKeyJwkFingerprint = (jwk) =>
   JSON.stringify({ crv: jwk.crv, kty: jwk.kty, x: jwk.x, y: jwk.y });
 
 export const generateHandshakeNonce = () => {

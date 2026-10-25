@@ -31,6 +31,48 @@ const isUrl = (value: string): boolean => {
     }
 };
 
+/**
+ * One collapsible section of the summary.
+ *
+ * The chevron follows this `<details>`' own state. A shared `group-open`
+ * variant also matches an open ancestor, so a nested row that was still
+ * collapsed kept pointing down for as long as the section around it was open.
+ */
+const JsonSummarySection = React.memo(({
+    summary,
+    initiallyOpen,
+    children,
+}: {
+    summary: string;
+    initiallyOpen: boolean;
+    children: React.ReactNode;
+}) => {
+    const [expanded, setExpanded] = React.useState(initiallyOpen);
+    return (
+        <details
+            open={expanded}
+            onToggle={(event) => setExpanded(event.currentTarget.open)}
+        >
+            <summary className="flex cursor-pointer list-none items-center gap-1.5 py-1.5 typography-meta text-foreground hover:text-muted-foreground">
+                <Icon
+                    name="arrow-right-s"
+                    className={cn(
+                        'h-3.5 w-3.5 shrink-0 transition-transform',
+                        expanded && 'rotate-90 rtl:-rotate-90',
+                    )}
+                />
+                <span className="min-w-0 truncate font-medium">{summary}</span>
+            </summary>
+            <div className="relative ms-1 ps-3 pb-1">
+                <BlockLine bottomOffset={4} />
+                {children}
+            </div>
+        </details>
+    );
+});
+
+JsonSummarySection.displayName = 'JsonSummarySection';
+
 const JsonSummaryValue = React.memo(({
     value,
     label,
@@ -43,18 +85,11 @@ const JsonSummaryValue = React.memo(({
     if (Array.isArray(value)) {
         const summary = label ? `${formatKey(label)} (${value.length})` : `(${value.length})`;
         return (
-            <details open={depth < 2} className="group/json-summary">
-                <summary className="flex cursor-pointer list-none items-center gap-1.5 py-1.5 typography-meta text-foreground hover:text-muted-foreground">
-                    <Icon name="arrow-right-s" className="h-3.5 w-3.5 shrink-0 transition-transform group-open/json-summary:rotate-90" />
-                    <span className="min-w-0 truncate font-medium">{summary}</span>
-                </summary>
-                <div className="relative ml-1 pl-3 pb-1">
-                    <BlockLine bottomOffset={4} />
-                    <div className="space-y-1">
-                    {value.map((item, index) => <JsonSummaryValue key={index} value={item} depth={depth + 1} />)}
-                    </div>
+            <JsonSummarySection summary={summary} initiallyOpen={depth < 2}>
+                <div className="space-y-1">
+                {value.map((item, index) => <JsonSummaryValue key={index} value={item} depth={depth + 1} />)}
                 </div>
-            </details>
+            </JsonSummarySection>
         );
     }
 
@@ -73,16 +108,12 @@ const JsonSummaryValue = React.memo(({
         }
 
         return (
-            <details open={depth < 2} className="group/json-summary">
-                <summary className="flex cursor-pointer list-none items-center gap-1.5 py-1.5 typography-meta text-foreground hover:text-muted-foreground">
-                    <Icon name="arrow-right-s" className="h-3.5 w-3.5 shrink-0 transition-transform group-open/json-summary:rotate-90" />
-                    <span className="min-w-0 truncate font-medium">{summary ?? (label ? formatKey(label) : '{}')}</span>
-                </summary>
-                <div className="relative ml-1 pl-3 pb-1">
-                    <BlockLine bottomOffset={4} />
-                    {content}
-                </div>
-            </details>
+            <JsonSummarySection
+                summary={summary ?? (label ? formatKey(label) : '{}')}
+                initiallyOpen={depth < 2}
+            >
+                {content}
+            </JsonSummarySection>
         );
     }
 

@@ -13,11 +13,11 @@ import { HostRequestError, clampPromptRequest, clampStartSessionRequest } from '
 import type { I18nKey, I18nParams } from '@/lib/i18n';
 import { generateBranchSlug } from '@/lib/git/branchNameGenerator';
 import { buildLinkedGuestIssue, type LinkedGuestIssue } from '@/lib/linkedIssues';
-import { parseModelIdentifier } from '@/lib/modelIdentifier';
-import { modelVariantNames } from '@/lib/modelVariants';
+import { captureDefaultSendSelection } from '@/lib/defaultSendSelection';
 import { resolveProjectRef } from '@/lib/worktreeSessionCreator';
 import { createWorktreeWithDefaults } from '@/lib/worktrees/worktreeCreate';
 import { waitForWorktreeBootstrap } from '@/lib/worktrees/worktreeBootstrap';
+import { resolveWorktreeStartDirectory } from '@/lib/worktrees/worktreeStartDirectory';
 import { getWorktreeSetupWaitEnabled } from '@/lib/openchamberConfig';
 import { resolveWorktreeSetupCommands } from '@/lib/sharedTrustConfirmation';
 import { guestProject, guestProjectWorktrees } from './workspace';
@@ -26,7 +26,6 @@ import { subscribeRuntimeEndpointChanged } from '@/lib/runtime-switch';
 import type { WorktreeMetadata } from '@/types/worktree';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useUIStore } from '@/stores/useUIStore';
-import { useSelectionStore } from '@/sync/selection-store';
 import * as sessionActions from '@/sync/session-actions';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 
@@ -133,69 +132,11 @@ export const runStartGuestSession = async (
   return { ok: true, sessionId: created.id, sent };
 };
 
-const resolveDefaultAgentName = (): string | undefined => {
-  const configState = useConfigStore.getState();
-  if (configState.settingsDefaultAgent) {
-    return configState.settingsDefaultAgent;
-  }
-  const visibleAgents = configState.agents.filter((agent) => !agent.hidden);
-  return (
-    configState.currentAgentName
-    || visibleAgents.find((agent) => agent.mode === 'primary' || !agent.mode)?.name
-    || visibleAgents[0]?.name
-  );
-};
-
-const resolveDefaultModelSelection = (): { providerID: string; modelID: string } | null => {
-  const parsed = parseModelIdentifier(useConfigStore.getState().settingsDefaultModel);
-  if (!parsed) {
-    return null;
-  }
-  if (!useConfigStore.getState().getModelMetadata(parsed.providerId, parsed.modelId)) {
-    return null;
-  }
-  return { providerID: parsed.providerId, modelID: parsed.modelId };
-};
-
-const resolveDefaultVariant = (providerID: string, modelID: string): string | undefined => {
-  const configState = useConfigStore.getState();
-  const settingsDefaultVariant = configState.settingsDefaultVariant;
-  const currentVariant = configState.currentProviderId === providerID && configState.currentModelId === modelID
-    ? configState.currentVariant
-    : undefined;
-  const provider = configState.providers.find((entry) => entry.id === providerID);
-  const model = provider?.models.find((entry) => entry.id === modelID);
-  const variantNames = modelVariantNames(model);
-  if (variantNames.length === 0) {
-    return settingsDefaultVariant || currentVariant || undefined;
-  }
-  if (settingsDefaultVariant && variantNames.includes(settingsDefaultVariant)) {
-    return settingsDefaultVariant;
-  }
-  if (currentVariant && variantNames.includes(currentVariant)) {
-    return currentVariant;
-  }
-  return undefined;
-};
-
-const captureGuestSendSelection = () => {
-  const configState = useConfigStore.getState();
-  const lastUsedProvider = useSelectionStore.getState().lastUsedProvider;
-  const defaultModel = resolveDefaultModelSelection();
-  const providerID = defaultModel?.providerID || configState.currentProviderId || lastUsedProvider?.providerID;
-  const modelID = defaultModel?.modelID || configState.currentModelId || lastUsedProvider?.modelID;
-  const agentName = resolveDefaultAgentName() || configState.currentAgentName || undefined;
-  if (!providerID || !modelID) {
-    return null;
-  }
-  return { providerID, modelID, agentName, variant: resolveDefaultVariant(providerID, modelID) };
-};
-
 const sendGuestFirstMessage = async (
   sessionId: string,
   directory: string,
   text: string,
-  selection = captureGuestSendSelection(),
+  selection = captureDefaultSendSelection(),
 ): Promise<'sent' | 'no-model' | 'failed'> => {
   if (!selection) return 'no-model';
   try {
@@ -380,7 +321,7 @@ export const startGuestSession = async (args: {
   }
 
   const navigation = args.request.navigation ?? 'preserve';
-  const sendSelection = captureGuestSendSelection();
+  const sendSelection = captureDefaultSendSelection();
   let cancelled = false;
   const unsubscribe = subscribeRuntimeEndpointChanged(() => { cancelled = true; });
   const assertCurrent = () => {
@@ -396,12 +337,16 @@ export const startGuestSession = async (args: {
     return { directory: latest.path, name: latest.name ?? latest.label, branch: latest.branch,
       status: latest.worktreeStatus === 'not-a-repo' ? 'invalid' : latest.worktreeStatus ?? 'ready' };
   };
-  const createTargetSession = async (title: string, directory: string): Promise<CreatedSession | null> => {
+  const createTargetSession = async (title: string, requestedDirectory: string): Promise<CreatedSession | null> => {
+    let directory = requestedDirectory;
     if (metadata && project) {
       failure = 'bootstrap-failed';
       const wait = await getWorktreeSetupWaitEnabled(project);
       assertCurrent();
       if (wait) await waitForWorktreeBootstrap(metadata.path);
+      // Rejects only when the checkout failed to populate: that is `bootstrap-failed`,
+      // and the SDK contract keeps the worktree for the guest to decide on (packages/sdk/API.md).
+      directory = await resolveWorktreeStartDirectory(project, metadata.path);
     }
     assertCurrent();
     failure = 'session-create-failed';
@@ -426,7 +371,7 @@ export const startGuestSession = async (args: {
     if (metadata) {
       const latest = project ? guestProjectWorktrees(project.path).find((entry) => entry.path === metadata?.path) : undefined;
       metadata = { ...metadata, worktreeStatus: latest?.worktreeStatus ?? metadata.worktreeStatus };
-      useSessionUIStore.getState().setWorktreeMetadata(session.id, metadata);
+      useSessionUIStore.getState().setWorktreeMetadata(session.id, metadata, createdDirectory);
     }
     return { id: session.id, directory: createdDirectory };
   };

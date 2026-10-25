@@ -14,6 +14,7 @@ import {
   type GuestMessage,
   type HostMessage,
 } from './contract.ts';
+import { GUEST_SHELL_OUTPUT_TAIL_MAX } from './shells.ts';
 
 type Listener = (event: Event) => void;
 
@@ -896,6 +897,48 @@ describe('connectHost', () => {
     host.dispose();
   });
 
+  test('onLateGenerateResult listens only on a host that keeps late answers, and hands each one over', () => {
+    const frame = createFrame();
+    const host = connectHost({ target: frame, acceptSource: () => true });
+    const listens = () => frame.posted.filter((message) => message.type === 'generate-late-listen').length;
+    const results: unknown[] = [];
+    const stop = host.onLateGenerateResult((result) => results.push(result));
+    // No ready yet, then an older host without the feature: nothing to listen to.
+    frame.dispatch(new MessageEvent('message', { data: ready }));
+    expect(listens()).toBe(0);
+    const supporting = { ...ready, payload: { ...ready.payload, features: { lateGenerateResults: true } } };
+    frame.dispatch(new MessageEvent('message', { data: supporting }));
+    expect(listens()).toBe(1);
+    // Every later ready repeats it, so a host that re-attached knows again.
+    frame.dispatch(new MessageEvent('message', { data: supporting }));
+    expect(listens()).toBe(2);
+    const late = { request: { prompt: 'Summarize' }, ok: true, result: { text: 'Short.' } };
+    const failed = { request: { prompt: 'Again' }, ok: false, code: 'MODEL_FAILED', error: 'The Small Model could not complete this request.' };
+    frame.dispatch(new MessageEvent('message', { data: { channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'generate-late', payload: late } }));
+    frame.dispatch(new MessageEvent('message', { data: { channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'generate-late', payload: failed } }));
+    expect(results).toEqual([late, failed]);
+    stop();
+    frame.dispatch(new MessageEvent('message', { data: supporting }));
+    expect(listens()).toBe(2);
+    // The host may still push after the last listener left; the answer waits for the next one.
+    frame.dispatch(new MessageEvent('message', { data: { channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'generate-late', payload: late } }));
+    expect(results).toHaveLength(2);
+    const later: unknown[] = [];
+    host.onLateGenerateResult((result) => later.push(result));
+    expect(later).toEqual([late]);
+    host.dispose();
+  });
+
+  test('a listener registered after ready listens at once', () => {
+    const frame = createFrame();
+    const host = connectHost({ target: frame, acceptSource: () => true });
+    frame.dispatch(new MessageEvent('message', { data: { ...ready, payload: { ...ready.payload, features: { lateGenerateResults: true } } } }));
+    expect(frame.posted.some((message) => message.type === 'generate-late-listen')).toBe(false);
+    host.onLateGenerateResult(() => undefined);
+    expect(frame.posted.filter((message) => message.type === 'generate-late-listen')).toHaveLength(1);
+    host.dispose();
+  });
+
   test('refuses a bad file path or oversized content without posting', async () => {
     const parent = createFrame();
     const guest = createFrame();
@@ -1076,6 +1119,71 @@ describe('connectHost resolve and badge', () => {
     const seen: unknown[] = [];
     host.onItem((item) => seen.push(item));
     expect(seen).toEqual([messageItem]);
+    host.dispose();
+  });
+
+  test('shells subscriptions, output reads, and stops use the wire contract', async () => {
+    const guest = createFrame();
+    const host = connectHost({ target: guest, acceptSource: () => true });
+    const seen: string[] = [];
+    const subscription = host.onRunningShells({ kind: 'session', sessionId: 'ses_1' }, (snapshot) => seen.push(snapshot.scope.kind));
+    const call = guest.posted.at(-1);
+    if (call?.type !== 'shells-subscribe') throw new Error('Expected subscription');
+    expect(call.payload.scope).toEqual({ kind: 'session', sessionId: 'ses_1' });
+    guest.dispatch(new MessageEvent('message', { data: { channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'shells', payload: { subscriptionId: call.payload.subscriptionId, snapshot: { kind: 'shells', scope: { kind: 'session', sessionId: 'ses_1' }, shells: [], ended: [] } } } }));
+    guest.dispatch(new MessageEvent('message', { data: { channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'result', id: call.id, ok: true } }));
+    const stop = await subscription;
+    expect(seen).toEqual(['session']);
+    stop();
+    expect(guest.posted.at(-1)?.type).toBe('shells-unsubscribe');
+    guest.dispatch(new MessageEvent('message', { data: { channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'shells', payload: { subscriptionId: call.payload.subscriptionId, snapshot: { kind: 'shells', scope: { kind: 'session', sessionId: 'ses_1' }, shells: [], ended: [] } } } }));
+    expect(seen).toEqual(['session']);
+
+    const outputPromise = host.readShellOutput('sh_1', { cursor: 10, tailBytes: 1024 });
+    const outputCall = guest.posted.at(-1);
+    if (outputCall?.type !== 'shell-output') throw new Error('Expected output call');
+    expect(outputCall.payload).toEqual({ shellId: 'sh_1', cursor: 10, tailBytes: 1024 });
+    guest.dispatch(new MessageEvent('message', { data: { channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'result', id: outputCall.id, ok: true, payload: { output: 'tick', cursor: 14, skipped: false } } }));
+    await expect(outputPromise).resolves.toEqual({ output: 'tick', cursor: 14, skipped: false });
+
+    const stopPromise = host.stopShell('sh_1');
+    const stopCall = guest.posted.at(-1);
+    if (stopCall?.type !== 'shell-stop') throw new Error('Expected stop call');
+    guest.dispatch(new MessageEvent('message', { data: { channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'result', id: stopCall.id, ok: true, payload: { stopped: true } } }));
+    await expect(stopPromise).resolves.toEqual({ stopped: true });
+
+    await expect(host.readShellOutput('')).rejects.toMatchObject({ code: 'HOST_REJECTED' });
+    host.dispose();
+  });
+
+  test('project and global shell scopes post their scope and reject empty identities', async () => {
+    const guest = createFrame();
+    const host = connectHost({ target: guest, acceptSource: () => true });
+    const globalSubscription = host.onRunningShells({ kind: 'global' }, () => {});
+    const globalCall = guest.posted.at(-1);
+    if (globalCall?.type !== 'shells-subscribe') throw new Error('Expected subscription');
+    expect(globalCall.payload.scope).toEqual({ kind: 'global' });
+    guest.dispatch(new MessageEvent('message', { data: { channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'result', id: globalCall.id, ok: true } }));
+    await globalSubscription;
+    const projectSubscription = host.onRunningShells({ kind: 'project', projectId: 'p1' }, () => {});
+    const projectCall = guest.posted.at(-1);
+    if (projectCall?.type !== 'shells-subscribe') throw new Error('Expected subscription');
+    expect(projectCall.payload.scope).toEqual({ kind: 'project', projectId: 'p1' });
+    guest.dispatch(new MessageEvent('message', { data: { channel: OPENCHAMBER_SDK_CHANNEL, v: 1, type: 'result', id: projectCall.id, ok: true } }));
+    await projectSubscription;
+    await expect(host.onRunningShells({ kind: 'project', projectId: '' }, () => {})).rejects.toMatchObject({ code: 'HOST_REJECTED' });
+    await expect(host.onRunningShells({ kind: 'session', sessionId: ' ' }, () => {})).rejects.toMatchObject({ code: 'HOST_REJECTED' });
+    host.dispose();
+  });
+
+  test('readShellOutput refuses out-of-range options before posting', async () => {
+    const guest = createFrame();
+    const host = connectHost({ target: guest, acceptSource: () => true });
+    await expect(host.readShellOutput('sh_1', { cursor: -1 })).rejects.toMatchObject({ code: 'HOST_REJECTED' });
+    await expect(host.readShellOutput('sh_1', { cursor: 1.5 })).rejects.toMatchObject({ code: 'HOST_REJECTED' });
+    await expect(host.readShellOutput('sh_1', { tailBytes: 0 })).rejects.toMatchObject({ code: 'HOST_REJECTED' });
+    await expect(host.readShellOutput('sh_1', { tailBytes: GUEST_SHELL_OUTPUT_TAIL_MAX + 1 })).rejects.toMatchObject({ code: 'HOST_REJECTED' });
+    expect(guest.posted).toHaveLength(1);
     host.dispose();
   });
 });

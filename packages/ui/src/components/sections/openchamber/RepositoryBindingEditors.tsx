@@ -40,7 +40,6 @@ import { useGitIdentity } from '@/stores/useGitStore';
 import {
   SETTINGS_FIELDS_STACK_CLASS,
   SETTINGS_HELPER_CLASS,
-  SETTINGS_SELECT_SIZE,
   SettingsControlGroup,
   SettingsGroupTitle,
   SettingsStackedField,
@@ -177,7 +176,7 @@ export const AdditionalRemoteGrants: React.FC<SourceControlBindingSettingsProps>
           </div>
         );
       })}
-      {error ? <EditorStatus error>{t('settings.gitlab.status.operationFailed')}</EditorStatus> : null}
+      {error ? <EditorStatus error>{t('settings.sourceControl.instance.status.operationFailed')}</EditorStatus> : null}
     </SettingsControlGroup>
   );
 };
@@ -358,7 +357,7 @@ export const AuxiliaryBindingSettings: React.FC<SourceControlBindingSettingsProp
           setSelectedRequirement('');
           setIdentityChoice(null);
         }} disabled={!read?.binding || saving || recovery.blocked}>
-          <SelectTrigger size={SETTINGS_SELECT_SIZE} className="w-full" aria-label={t('gitView.hydration.parentRemote')}>
+          <SelectTrigger className="w-fit max-w-[28ch]" aria-label={t('gitView.hydration.parentRemote')}>
             <SelectValue placeholder={t('settings.sourceControl.transport.remoteLabel')} />
           </SelectTrigger>
           <SelectContent>{read?.binding?.remotes.filter((entry) => entry.readiness === 'ready').map((entry) => (
@@ -370,7 +369,7 @@ export const AuxiliaryBindingSettings: React.FC<SourceControlBindingSettingsProp
       {authorizationNeeded ? <p className={SETTINGS_HELPER_CLASS}>{t('gitView.hydration.authorizationNeeded')}</p> : null}
       {requirements.length ? <SettingsStackedField label={t('gitView.hydration.endpoint')} controlClassName={EDITOR_CONTROL_CLASS}>
         <Select value={selectedRequirement} onValueChange={setSelectedRequirement} disabled={saving}>
-          <SelectTrigger size={SETTINGS_SELECT_SIZE} className="w-full" aria-label={t('gitView.hydration.endpoint')}>
+          <SelectTrigger className="w-fit max-w-[28ch]" aria-label={t('gitView.hydration.endpoint')}>
             <SelectValue placeholder={t('gitView.hydration.chooseEndpoint')}>
               {selected ? `${selected.path} · ${kindLabel(selected.kind)} · ${selected.endpoint.displayUrl}` : undefined}
             </SelectValue>
@@ -398,7 +397,7 @@ export const AuxiliaryBindingSettings: React.FC<SourceControlBindingSettingsProp
       {latest?.hydration?.status === 'client-missing' ? <p role="alert" className={cn(SETTINGS_HELPER_CLASS, 'text-[var(--status-warning)]')}>
         {t('gitView.hydration.lfsMissing')}
       </p> : null}
-      {error ? <EditorStatus error>{t('settings.gitlab.status.operationFailed')}</EditorStatus> : null}
+      {error ? <EditorStatus error>{t('settings.sourceControl.instance.status.operationFailed')}</EditorStatus> : null}
       <div className={EDITOR_ACTIONS_CLASS}>
         <Button size="sm" variant="outline" disabled={!parentRemote || recovery.blocked || saving} onClick={() => void retryHydration()}>
           {t('gitView.hydration.retry')}

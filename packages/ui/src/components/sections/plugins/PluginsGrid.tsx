@@ -24,6 +24,7 @@ import {
   usePluginsStore,
   type PluginEntry,
   type PluginFile,
+  type PluginParsedKind,
 } from '@/stores/usePluginsStore';
 import {
   configEntryRuntimeTarget,
@@ -32,7 +33,21 @@ import {
   resolveUpdateFlag,
   type PluginRuntimeTarget,
 } from './pluginLoadState';
+import { pluginDisplayName } from './pluginDisplayName';
 import { usePluginPackageUpdate, usePluginRuntimeStatus } from './usePluginRuntimeStatus';
+
+/** How a plugin spec is loaded, as the card shows it. */
+const PARSED_KIND_ICON: Record<PluginParsedKind, 'code-box' | 'folder' | 'git-branch'> = {
+  npm: 'code-box',
+  path: 'folder',
+  git: 'git-branch',
+};
+
+const PARSED_KIND_LABEL_KEY = {
+  npm: 'settings.plugins.sidebar.kind.npm',
+  path: 'settings.plugins.sidebar.kind.path',
+  git: 'settings.plugins.sidebar.kind.git',
+} as const;
 
 /**
  * Status pills for one plugin: how OpenCode loaded it, whether a newer release
@@ -183,7 +198,7 @@ export const PluginsGrid: React.FC<{
     ...files.map((file): GridItem => ({ kind: 'file', file })),
   ];
   const filtered = rankByQuery(items, query, (item) => (
-    item.kind === 'entry' ? [item.entry.spec] : [item.file.fileName, item.file.absolutePath ?? '']
+    item.kind === 'entry' ? [pluginDisplayName(item.entry.spec), item.entry.spec] : [item.file.fileName, item.file.absolutePath ?? '']
   ));
   const hasQuery = query.trim().length > 0;
   const refreshing = isLoadingRegistry || isCheckingUpdates;
@@ -236,15 +251,17 @@ export const PluginsGrid: React.FC<{
         {filtered.map((item) => {
           if (item.kind === 'entry') {
             const { entry } = item;
+            const name = pluginDisplayName(entry.spec);
             return (
               <SettingsCard
                 key={entry.id}
-                icon={<SettingsCardIcon name={entry.parsedKind === 'npm' ? 'code-box' : 'folder'} />}
-                title={entry.spec}
+                icon={<SettingsCardIcon name={PARSED_KIND_ICON[entry.parsedKind]} />}
+                title={name}
+                subtitle={name === entry.spec ? undefined : entry.spec}
                 badges={<PluginPills target={runtimeTargets.get(entry.id) ?? null} spec={entry.spec} />}
                 footer={(
                   <>
-                    <span>{entry.parsedKind === 'npm' ? t('settings.plugins.sidebar.kind.npm') : t('settings.plugins.sidebar.kind.path')}</span>
+                    <span>{t(PARSED_KIND_LABEL_KEY[entry.parsedKind])}</span>
                     {entry.scope === 'project' ? <SettingsCardChip>{t('settings.plugins.grid.scope.project')}</SettingsCardChip> : null}
                   </>
                 )}

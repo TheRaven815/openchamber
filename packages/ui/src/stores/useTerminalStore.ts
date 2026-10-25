@@ -28,7 +28,7 @@ export interface TerminalChunk {
  * frequency. Keeping it here leaves tab metadata referentially stable, so
  * output cannot rerender the tab strip or rewrite the persisted snapshot.
  */
-export type TerminalBuffer = {
+type TerminalBuffer = {
   chunks: TerminalChunk[];
   byteLength: number;
   lastSequence: number;
@@ -66,7 +66,7 @@ export type TerminalTab = {
   previewUrlLocked: boolean;
 };
 
-export type DirectoryTerminalState = {
+type DirectoryTerminalState = {
   tabs: TerminalTab[];
   activeTabId: string | null;
 };
@@ -517,6 +517,22 @@ export const useTerminalStore = create<TerminalStore>()(
                 }
                 if (matchIndex < 0) {
                   matchIndex = actionMatchIndex;
+                }
+                // A listing taken after a new run was allocated, but before the
+                // server holds its session, still shows the action's last,
+                // finished run. That run says nothing about the one starting;
+                // adopting it would cancel the start without a word.
+                const target = matchIndex >= 0 ? tabs[matchIndex]! : null;
+                if (
+                  target
+                  && session.status !== 'running'
+                  && target.lifecycle === 'starting'
+                  && isProjectActionPurpose(target.purpose)
+                  && target.purpose.executionId !== null
+                  && target.purpose.executionId !== sessionPurpose.executionId
+                ) {
+                  matchedTabIds.add(target.id);
+                  continue;
                 }
               }
 

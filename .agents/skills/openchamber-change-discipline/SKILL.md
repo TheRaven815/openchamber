@@ -15,7 +15,6 @@ Make the smallest complete change and validate at the narrowest level that cover
 2. Classify every applicable change risk below.
 3. Identify every affected consumer, runtime, persisted format, and public export. This step is complete only when each risk has an owner and required validation.
 
-When instructions materially conflict, stop and resolve the conflict instead of silently choosing one.
 
 ## Risk Classification
 
@@ -66,9 +65,9 @@ Do not hide a required architectural migration behind a local heuristic. Do not 
 
 | Change | Minimum validation |
 |---|---|
-| Executable source | Focused tests plus package-scoped type-check and lint |
+| Executable source | Focused tests for the changed behavior; type-check and lint come from the pre-commit gate. TypeScript and lint do not cover server JS, CLI JS, Electron helpers, or native code: run `node --check`, focused tests, or the build for those |
 | Cross-workspace/shared contract | Workspace-wide type-check and lint plus affected builds/tests |
-| Added/deleted/renamed source file, export/type/entrypoint/import shape | `bun run dead-code` in addition to relevant checks |
+| Added/deleted/renamed source file, export/type/entrypoint/import shape | Relevant checks; dead code comes from the pre-commit gate |
 | Persisted or external contract | Compatibility and round-trip tests plus the applicable failure/ordering cases: missing-versus-empty, malformed data, stale reads versus newer mutations, out-of-order writes, lifecycle handling for debounced writes, conversion, and failed-write/migration rollback |
 | Dependency or lockfile | Workspace-wide checks and affected builds |
 | Added, renamed, or removed `packages/*` workspace | Mirror it in the Dockerfile `deps` stage, which copies those manifests by name, then run `docker build .`: a `COPY` of a missing workspace fails the build, and a workspace another one depends on fails the frozen install when absent. CI does not build the image. |
@@ -76,6 +75,10 @@ Do not hide a required architectural migration behind a local heuristic. Do not 
 | Docs-only or isolated config | Narrow syntax/schema/link validation; do not run unrelated full suites |
 | Platform/runtime behavior | Relevant runtime build or manual/integration check; static checks are insufficient |
 | Desktop update or quit/install sequence | A real update run; read `references/updater-testing.md` first, because a run done the obvious way completes the update and reports success while testing nothing |
+
+`bun run check:changed` is the pre-commit gate: run it once, right before a commit, on the finished diff. While iterating, run only the focused tests for the behavior you just changed; an edit to docs, comments, or strings needs no check at all.
+
+When several agents edit one checkout in parallel, they edit and run single test files only. The coordinator runs type-check, lint, builds and full suites once, serially, on the combined diff: each type-check holds over a gigabyte, parallel copies have frozen the machine, and a check run mid-edit reports the other agents' half-finished work.
 
 Use a sufficiently long timeout for broad checks. Report exactly what ran and what did not.
 
@@ -91,10 +94,23 @@ For type-only shared contracts, validate compile-time consumers. Add runtime ser
 - Keep refactor tests resilient to equivalent internal implementations.
 - For behavior-preserving refactors, establish the current behavior before changing structure.
 
+## Module Documentation
+
+A module's `DOCUMENTATION.md` lives in its folder and holds what the code cannot show the next agent: what the module owns, what must stay true, and why it is built this way. A module gets its own document when it owns a contract other code relies on, an invariant, or a non-obvious design choice; a folder without any of these is covered by its parent's document.
+
+The document has three parts:
+
+- **Ownership.** What the module owns and where its boundary is: what belongs here and which neighbouring module owns the rest.
+- **Invariants.** What must stay true, each stated so a change can be checked against it.
+- **Decisions.** One `### Why X and not Y` entry per non-obvious choice: the chosen approach, the alternative it was weighed against or replaced, and the reason in one or two sentences. A choice is non-obvious when a later reader could reasonably "fix" it back: a simpler design that was rejected, a deliberate workaround, a measured trade-off.
+
+The document describes the module as it is now. When a decision changes, rewrite its entry around the new choice and keep the old approach as the rejected alternative, so the file stays current and carries no history to unwind. Spend its lines on reasons and contracts; file listings and function-by-function walkthroughs restate the code and go stale first.
+
 ## Completion Standard
 
 - Implement the behavior end to end, including rollback and cleanup.
-- Run focused regression tests for the changed contract.
+- Run focused regression tests for the changed contract; when no test can cover it, say so in the report.
 - Preserve unrelated changes encountered in shared files.
-- Re-read the owning docs and update them when the implementation changed their truth.
-- Perform a final simplification pass: remove speculative branches, shallow wrappers, stale compatibility, and names that do not clarify intent.
+- The owning `DOCUMENTATION.md` is true of the new code and has a decision entry for every non-obvious choice the change made; a new module that meets the bar in *Module Documentation* has its own document.
+- Perform a final simplification pass over your own diff, hardest after a rework or a removal: every branch, condition, prop, parameter, export, key, and helper the change made unreachable, always-true, or single-valued is gone, along with speculative branches, shallow wrappers, stale compatibility, and names that do not clarify intent.
+- Before a commit, the pre-commit gate passes.

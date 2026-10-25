@@ -92,7 +92,7 @@ macOS builds create `dmg` and `zip` files. You need Xcode/build tools for notari
 
 Windows builds create an NSIS installer. If signing env vars are not set, the build script makes an unsigned installer.
 
-Linux builds produce an AppImage for the native x64 or arm64 host.
+Linux builds produce an AppImage, a `.deb` and an `.rpm` for the native x64 or arm64 host. The `.rpm` needs `rpmbuild` (the `rpm` package on Debian/Ubuntu).
 
 For desktop-specific details, see [`packages/electron/README.md`](./packages/electron/README.md).
 
@@ -151,7 +151,7 @@ Windows:
 bun run electron:build
 ```
 
-Linux x64 and arm64 AppImages are packaged natively on the matching host architecture. Use Bun for dependency installation and packaging orchestration:
+Linux x64 and arm64 packages are built natively on the matching host architecture. Use Bun for dependency installation and packaging orchestration:
 
 ```bash
 OPENCHAMBER_TARGET_ARCH=x64 bun run electron:build
@@ -177,6 +177,11 @@ web/server, and the root scripts. The UI, VS Code, and Electron suites keep
 module-level singletons, so `scripts/run-isolated-tests.mjs` gives each test file
 its own process instead of letting load order decide the result. Run a single
 file directly while iterating (`bun test <file>`).
+
+UI tests run on happy-dom, where DOMPurify stops visiting the siblings of a node
+it removed: test each malicious payload in its own call, or a combined payload
+passes or fails for the wrong reason. The UI's `bun:test` type shim is trimmed
+(no `test.each`, no `toMatch`): use loops and `regex.test()` with `toBe`.
 
 For docs-only changes, validation may be enough:
 
@@ -261,6 +266,12 @@ behavior before and after the change. Attach screenshots for static states and
 a short recording for motion, gestures, drag-and-drop, focus, or multi-step
 interactions.
 
+Evidence goes in the PR description: drag screenshots, recordings and logs into
+the GitHub editor and GitHub hosts them. Never commit them to the branch (an
+`evidence/` or `pr-evidence/` folder, request logs, traces): committed, they
+ship in every clone of the repository, and the intake check asks you to remove
+them.
+
 Claims about performance, memory, CPU, rendering, startup, or similar empirical
 behavior require relevant before and after measurements.
 
@@ -321,9 +332,9 @@ conversation remains chronological. Previous review comments are not rewritten.
 ### Size label and parking
 
 Every PR gets a `size:XS` to `size:XXL` label from its changed lines. Tests,
-lockfiles, translation catalogs (`packages/ui/src/lib/i18n/messages`) and PR
-evidence images don't count, so a one-line settings change that touches twelve
-locale files is still `size:XS`.
+lockfiles and translation catalogs (`packages/ui/src/lib/i18n/messages`) don't
+count, so a one-line settings change that touches twelve locale files is still
+`size:XS`.
 
 A `size:XL` or larger PR with no Ideas discussion linked in its body also gets
 `needs-discussion` and a comment. Link the discussion (or shrink the PR) and

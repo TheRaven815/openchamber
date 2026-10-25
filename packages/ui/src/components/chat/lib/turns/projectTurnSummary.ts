@@ -1,13 +1,14 @@
+import { isInvisibleText } from '@/lib/invisibleText';
 import { summarizeLiveActivity } from './liveActivitySummary';
-import type { ChatMessageEntry, TurnChangedFile, TurnDiffStats, TurnSummaryRecord } from './types';
+import type { ChatMessageEntry, TurnChangedFile, TurnSummaryRecord } from './types';
 
 const getTextFromPart = (part: unknown): string | undefined => {
     const text = (part as { text?: unknown }).text;
-    if (typeof text === 'string' && text.trim().length > 0) {
+    if (typeof text === 'string' && !isInvisibleText(text)) {
         return text;
     }
     const content = (part as { content?: unknown }).content;
-    if (typeof content === 'string' && content.trim().length > 0) {
+    if (typeof content === 'string' && !isInvisibleText(content)) {
         return content;
     }
     return undefined;
@@ -56,32 +57,6 @@ export const projectTurnSummary = (assistantMessages: ChatMessageEntry[]): TurnS
     }
 
     return {};
-};
-
-/**
- * "+N −M across F files" for a turn, summed from the edits the turn itself
- * made. v1 read these numbers off a working-tree snapshot on the user
- * message; v2 has none, so the tool-call patches are the source, and a file
- * whose patch carried no line counts contributes only to the file count.
- */
-export const projectTurnDiffStats = (changedFiles: TurnChangedFile[] | undefined): TurnDiffStats | undefined => {
-    if (!changedFiles || changedFiles.length === 0) {
-        return undefined;
-    }
-
-    let additions = 0;
-    let deletions = 0;
-
-    for (const change of changedFiles) {
-        additions += change.additions ?? 0;
-        deletions += change.deletions ?? 0;
-    }
-
-    return {
-        additions,
-        deletions,
-        files: changedFiles.length,
-    };
 };
 
 /**

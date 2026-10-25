@@ -14,6 +14,9 @@ performs its own fresh safety reads through RuntimeAPIs, outside this UI owner.
 - `idle`, `loading`, `ready`, `stale` and `error` distinguish an unresolved read, an actual
   request, successful empty binding and failure. Refresh failure retains the last
   complete `read` as stale, along with the original Error and its metadata.
+- A read of a worktree whose checkout is still running waits for its `git-ready`
+  phase first and stays `loading` meanwhile. Reading earlier fails, and that
+  error would stay until a manual retry. A failed checkout settles as `error`.
 - `contexts` grants provider-read demand only while the owner read is ready and
   the selected association's readiness is `ready` with a matching approved fetch
   fingerprint. Aggregate `needs-attention` does not suppress healthy siblings.
@@ -79,7 +82,7 @@ Anonymous HTTPS is a transport an identity may carry; identity pickers label it 
 
 ## Managed SSH onboarding
 
-`ManagedSshCredentials.tsx` is the key picker inside the identity editor — the one place a managed SSH key is chosen — through the optional `GitAPI.managedSshCredentials` operation. It starts no inventory, discovery, import, or provider authentication on mount. Explicit inventory returns safe labels, public fingerprints and opaque managed references. Explicit discovery returns short-lived opaque candidates from the connected server. Ready candidates show their exact fingerprint, require a keyboard/touch-capable confirmation checkbox, and keep Import disabled until confirmation. Import selects the returned managed credential in the current local draft when a selector is present, but never saves a repository grant, binds a provider, or changes author identity. Transport Save or clone execution remains the separate authorization action.
+`ManagedSshCredentials.tsx` is the key picker inside the identity editor — the one place a managed SSH key is chosen — through the optional `GitAPI.managedSshCredentials` operation. The editor mounts it only while the SSH method is chosen, and mounting reads the inventory so the saved key can be named; it starts no discovery, import, or provider authentication on mount. The editor draws the field's label, so the picker renders only the control column. Inventory returns safe labels, public fingerprints and opaque managed references. Explicit discovery returns short-lived opaque candidates from the connected server. Ready candidates show their exact fingerprint, require a keyboard/touch-capable confirmation checkbox, and keep Import disabled until confirmation. Import selects the returned managed credential in the current local draft when a selector is present, but never saves a repository grant, binds a provider, or changes author identity. Transport Save or clone execution remains the separate authorization action.
 
 Reads distinguish failure from empty success. Failed operations retain data but disable stale inventory selection; explicit buttons remain available for retry. Typed expiry, source-change, mismatch, unavailable, and capacity rejections tell the user to rediscover or repair host state. Runtime-will-change and unmount invalidate pending inventory, discovery, and import results. Runtime changes clear candidates, confirmation, and selection without loading the new host automatically.
 
@@ -174,17 +177,32 @@ menu re-reads the accounts when it opens, the Git Settings row says why the
 identity cannot be used, and nothing binds a repository to a credential that
 is gone.
 
+`accountUsableByIdentity` decides which listed accounts count. The server uses
+a provider's CLI login for Git transport only where the descriptor says so
+(`auth.cliTransport`: the gh CLI), and only while it is the provider's active
+account in Integrations, so the identity editor offers it, and an identity
+naming it counts as connected, only while that account is current. The OAuth
+account and the CLI account of the same person are separate options told apart
+by their source label. An identity that names the CLI account while it is not
+in use, disabled or signed out is not offered. `unavailableAccountReason` picks
+its Git Settings note: switch to the CLI account in Integrations
+(`cliAccountInactive`) while no CLI account is in use, else `accountGone`,
+since a CLI login in use as another person is not fixed by switching. A CLI
+login of a provider without `cliTransport` (the glab login) is never offered:
+Git transport reads only the credentials OpenChamber stores. The account
+labels name the provider by its descriptor's `label`.
+
 An identity is complete when it has a signature and a way to push:
 `isCompleteIdentity` accepts `account` with an account, a managed SSH key,
 anonymous HTTPS, or `system` (this machine's Git). The account is optional
 except for the `account` transport, so identities for hosts OpenChamber has no
-provider for (Bitbucket, Gitea, a private server) work. The editor creates
+provider for (Bitbucket, a private server) work. The editor creates
 nothing else and the server refuses anything else from a client.
 
 Records written before identities carried a transport have none; they read as
 `system` identities: choosing one writes the repository's author and leaves
 Git to this machine's configuration. Git Settings marks an identity it cannot
-use (`incomplete`, `accountGone`) and says why.
+use (`incomplete`, `accountGone`, `cliAccountInactive`) and says why.
 
 Checkout repair first runs `checkout-hydration` against a user-selected ready parent fetch remote. The immutable public plan exposes bounded repository-relative submodule/LFS paths and redacted endpoints, never raw URLs, absolute paths, or credential references. Failed hydration stays visible through `GitOperationStatus`. The user selects one discovered endpoint, explicitly chooses System, anonymous HTTPS, managed HTTPS account, or managed SSH key, and saves or removes only that grant through the narrow CAS API. Retry plans a new inspection; it never reclones the retained repository. Missing `git-lfs` has a specific install-and-retry warning. Runtime and directory changes clear all repair drafts, and late mutation results reconcile through the captured binding owner scope.
 
@@ -267,17 +285,291 @@ hydration, scoped controls and durable guards. These tests do not prove behavior
 after browser storage is explicitly cleared or a webview is replaced with a new
 storage context.
 
+## Provider registry
+
+`providers/` owns what the UI knows about each source-control provider. The
+connected server describes its providers as plain data
+(`SourceControlAPI.providers()`, `GET /api/source-control/providers`);
+`descriptor.ts` parses that data, `registry.ts` holds it per runtime, and
+`urlMatchers.ts`, `terminology.ts` and `components/sourceControl/ProviderIcon.tsx`
+turn it into links, labels and marks. React code reads it through
+`useSourceControlProvider(id)`, `useSourceControlProviders()` and
+`useChangeRequestTerm(id)`; non-React code receives descriptors as a parameter
+and never reads the store itself.
+
+Invariants:
+
+- `useSourceControlProvider` always returns a descriptor. An id the registry
+  does not hold reads as `unknownProviderDescriptor(id)`: its id as the label,
+  pull-request wording with `#`, the branch icon, no auth methods, no URL
+  patterns and every feature off. It is cached per id, so selectors see one
+  stable object, and such a provider still lists through the neutral
+  `issuesList` / `changeRequestsList`.
+- Provider ids match `^[a-z][a-z0-9-]{0,31}$` and share one namespace with the
+  tracker registry: `linear`, `guest`, `link`, `external` and `repository` are
+  refused. One malformed or reserved descriptor is left out of a list and never
+  fails the others; a repeated id keeps its first entry. A value a newer server
+  may send reads as its closest known meaning: an unknown change-request term as
+  `pullRequest`, an unknown CI term as `checks`, an unknown auth method is
+  dropped, an unknown settings field kind as `unknown`, a missing feature as off.
+  The change-review features (*Change-based review hosts* below) read a
+  missing or unknown value as the behavior every older host has:
+  `reviewModel: 'verdict'`, `revisions`, `submitRequirements` and
+  `createByPush` off, `branchHeads` on. A bad value in one of them never
+  drops the provider.
+- `SourceControlProvider` is that open id, not a list of known providers.
+  Persisted values that name a provider (the change-request status cache,
+  comment drafts, message context parts, the remembered repository provider,
+  identity accounts) are checked for id syntax only: a value written for a
+  provider the server no longer serves still reads, and resolves through the
+  fallback descriptor. One malformed entry is dropped, never its neighbours.
+- No shared UI source names a provider: `providers/neutrality.test.ts` fails on
+  any mention of `gitea` and on any string-literal comparison of a provider
+  (`provider === 'x'`, or any value against a served id) outside its
+  allowlist, where each entry gives its reason and must still match.
+- A failed refresh never becomes an empty list. The registry keeps what it holds
+  (`stale`) and reports `error` only when it holds nothing; `holdsList` says
+  whether a list (remembered or answered) is held, and until it is, which
+  providers are served is unknown, not none. `error` is retried by the
+  registry itself after 2 s, doubling to at most a minute, until an answer or
+  a runtime switch. An answered empty
+  list, as VS Code gives, is authoritative; a server that lists providers none
+  of which can be read fails the read in the web adapter instead of answering
+  empty.
+- The list is remembered per runtime in `localStorage`
+  (`openchamber.sourceControlProviders.v1`, at most 16 runtimes, validated on
+  read; a corrupt snapshot is ignored) and stands in until the server answers,
+  so surfaces do not start generic and then flip. The registry refreshes next
+  to `refreshSourceControlAuth` (`App.tsx`, `VSCodeApp.tsx`, `MobileApp.tsx`)
+  and `resetForRuntimeSwitch(runtimeKey)` in `runtimeEndpointReset.ts` drops the
+  previous runtime's list, shows the next runtime's remembered one, and rejects
+  answers to requests started before the switch. `refresh` reads
+  `getRuntimeKey()` itself and first switches to that runtime's remembered list
+  when it differs from the held key: the store is created at import, before
+  the runtime endpoint is initialized. A transient key (`isTransientRuntimeKey`:
+  `url:default`, `mobile-disconnected`) is never a snapshot slot.
+- The served set can change while the app runs: an extension whose service
+  provides `source-control` adds a provider (`ext-<guestId>`, marked with
+  `extension: { guestId, name, version }`) when it is approved, enabled or
+  updated, and drops it when paused, removed or updated without the role. The
+  server announces this as `openchamber:source-control-providers-changed`, a
+  payload-free event; `hooks/useSourceControlProviderSync.ts` (mounted in
+  `App.tsx` and `MobileApp.tsx`) answers it, and every `event-stream-ready`,
+  with `refresh` and a forced auth-store `refreshAll`, because a change during
+  a stream gap is never announced to this client. The auth store's instance
+  list names only registered providers, so without that re-read a provider
+  added mid-session would match no links and show no account status until a
+  reload. The event never carries the list: the registry re-reads it, so
+  the failure rules above hold. A `refresh` made while a read is out gets one
+  more read after that read settles (shared by every such call), never the
+  read on the wire: the server may have answered it before the change the
+  caller refreshes for. The tracker registry follows the same rule. A malformed `extension` marker is dropped
+  without dropping the provider, and nothing renders the marker yet. VS Code
+  has no OpenChamber event stream and an empty provider list, so it never
+  shows extension providers.
+- A refresh that answers the list already held keeps the held `ordered` and
+  `byId` objects (and the auth store keeps an unchanged `identities` array), so
+  a reconnect or resume does not rebuild every sidebar row's link matcher.
+- `parseRepositoryItemUrl` resolves a link in this order: a provider whose
+  instance the host is known to be (a connected account's instance or the
+  provider's default instance), else the only provider whose pattern matches,
+  else the first by `order`, so an unknown host with `/issues/N` or `/pull/N`
+  keeps reading as GitHub-shaped. Patterns name `{owner}` or `{namespace+}`,
+  `{repo}` and `{number}`, or `{project+}` (a whole project path, split on its
+  last slash) and `{number}`; a pattern that does not name each once is ignored.
+  `urls.discussion` patterns are read only while `features.discussions` is on,
+  so a link reads as `kind: 'discussion'` only on a host that keeps them; a
+  server from before discussions names neither, and both read as off.
+- Remotes are recognised on the instances a caller passes:
+  `resolveSourceControlTarget`, `getBoundSourceControlReadContexts` and
+  `repositoryLinkFromRemotes` take the connected instances plus each
+  provider's default instance (`defaultSourceControlIdentities(descriptors)`);
+  `identity.ts` names no default of its own. The repository binding owner reads
+  the registry for them and republishes contexts when the provider list
+  changes, since a list that lands after the accounts changes which remotes are
+  a provider's. `repositoryLinkFromRemotes` takes the descriptors too: a
+  provider without `repository.nestedNamespaces` names a project by
+  owner/name only.
+- `GITHUB_SOURCE_CONTROL_IDENTITY` (github.com) is kept for the github.com
+  device flow and its legacy auth wire only; no other surface picks a provider
+  by it.
+- Links are read through one matcher per render
+  (`repositoryUrlMatcher.ts`): `useRepositoryUrlMatcher()` memoizes the
+  registry's descriptors with the auth store's connected instances, and
+  `createRepositoryUrlMatcher` builds the same object for tests and non-React
+  callers. Non-React code that reads links (`lib/linkedIssues.ts`,
+  `components/references/listBackedReferences.ts`) takes it as a parameter. The
+  matcher reads `www.` in front of a default instance's host as that instance.
+- `useSourceControlDescriptorOf()` is the lookup for surfaces that name several
+  providers in one render, and `useSourceControlProviderServing(id)` gates
+  what only a served provider has (change-request diffs, walkthroughs): it is
+  `unknown` until a list is held, and those surfaces wait on `unknown` as on
+  loading. `useChangeRequestDiffServing(id)` narrows that to the diff: a
+  served provider with `features.changeRequestPatch` off reads as
+  `not-served`. A descriptor that does not name `changeRequestPatch` reads it
+  as on, the one feature not read as off when unnamed: every server older than
+  the field served the diff of every provider it listed. Text built outside React (message previews, chat display parts)
+  takes the lookup as a parameter; React callers pass
+  `useSourceControlDescriptorOf()` and keep it in their memo inputs, so wording
+  first drawn with the generic fallback is redrawn when the list arrives.
+  `readSourceControlProvider(id)` reads the registry as it is now, for text
+  that is not redrawn (toasts, model-facing context text).
+- `components/sourceControl/SourceControlAccountControl.tsx` is the connected
+  account of a project's host (avatar and switcher), drawn from that host's
+  descriptor; a project with no known host shows none.
+- An identity's icon key is either a built-in mark (`branch`, `briefcase`, ...)
+  or a provider id; the Git header, Git Settings and the identity editor draw a
+  provider id with `ProviderIcon`, and the editor offers one mark per served
+  provider. Stored keys `github` and `gitlab` therefore keep their marks.
+- Settings draws one `SourceControlProviderCard` per served descriptor
+  (`components/sections/DOCUMENTATION.md`, "Integrations: provider cards"):
+  sign-in methods are the descriptor's `auth.methods` the instance reports
+  available, instance input follows `instances` (format, loopback HTTP, port,
+  reserved), the token link is `auth.token.createPath` on the instance, and an
+  unknown settings field kind asks for an update. The github.com device flow is
+  selected by `instances.legacyFlow`, never by id.
+- `changeRequestCopy(key, term)` picks a message's wording by the provider's
+  `ChangeRequestTerm`, never by provider id: `TERM_COPY` holds one table per
+  term other than `pullRequest`, and every table words every message another
+  one does (`changeRequestCopy.test.ts` checks the keys exist in English and
+  take the same values).
+- `ProviderIcon` draws a sprite icon the descriptor names, else the served path
+  (path data only, checked by the schema, drawn as a `d` attribute), else the
+  branch icon. `providerIconSrc` gives the same mark as a data URI for surfaces
+  that mask an icon URL.
+
+### Why descriptors are fetched and not mirrored in the UI
+
+Desktop and mobile connect to servers of other versions. A copy in the UI would
+describe the UI's own release rather than the server's, and would have to name
+every provider the server may serve. The snapshot covers first paint; only the
+very first visit to a runtime shows generic labels until the answer lands.
+
+### Why the registry retries a failed read itself
+
+A first read that fails leaves nothing to show, and the app refreshes the
+registry only on connect, a runtime switch or a resume. Left to them, a single
+failed read made every gated surface read the provider as unserved for the
+rest of the session. The registry owns the failure, so it owns the retry; the
+shared snapshot, no-op check and wait live in `providers/runtimeList.ts`, used
+by the tracker registry too.
+
+### Why `ChangeRequestTerm` and settings field kinds are closed
+
+Server-supplied text cannot be translated. The descriptor therefore names a
+term (`pullRequest`, `mergeRequest` or `change`), a CI term (`checks` or `pipeline`, which
+picks the English noun of model-facing context text) and field kinds (`instance-url`,
+`personal-access-token`, `username`, `http-password`) that select whole translated sentences in the UI;
+product names, prefixes, abbreviations and URLs are literal values that stay
+untranslated in every locale. A kind this version does not know asks to update
+the app instead of showing an untranslated form.
+
+### Why the older-server fallback lives in the web adapter
+
+A server that predates the providers route answers 404 and serves exactly
+GitHub and GitLab. `packages/web/src/api/source-control-providers.ts` answers
+with their built-in descriptors, kept identical to the server's, so
+`packages/ui` never names a provider. The adapter is the one place that knows
+which server versions exist, and it already names the github.com default host
+of the repository-reference wire. The same adapter normalizes instances by the
+descriptor's `instances.format`. Every provider's server module emits the
+neutral DTOs, so the adapter has no provider branches for resources or auth.
+
+## Change-based review hosts
+
+A host that reviews changes patchset by patchset declares it through
+descriptor features, never through its id, and the shared UI serves it from
+those alone (`neutrality.test.ts` also fails on the first such host's name
+anywhere under `packages/ui/src`).
+
+- `terminology.changeRequest: 'change'` words every change-request message
+  through `changeRequestCopy` and the term-suffixed key families.
+- `features.reviewModel`: `reviewLabelsOf(descriptor, context)`
+  (`reviewLabels.ts`) is what the board reviews on. A verdict host gets one
+  implicit `approval` label, so `SourceBoardReply` keeps its two buttons and
+  sends `{ verdict, body }`; a votes host gets the labels its change's context
+  names (`voteLabels`), drawn by `SourceBoardVotes` with the values this
+  account may cast, and sends `{ votes, body }`. Votes go on the latest
+  revision only.
+- `features.revisions`: the context lists the change's revisions, the
+  preview offers a picker when there is more than one, and the detail of an
+  older one is read with `revision` (`useRepositoryReferenceDetail`), cached
+  apart from the latest.
+- `features.submitRequirements`: submit (`MergeMethod` `submit`, alone) waits
+  for the context's requirements and stays disabled while one is unmet
+  (`sourceBoard/mergeChoice.ts`). Methods this version has no words for are
+  dropped (`isKnownMergeMethod`), and submit is never remembered as the merge
+  method (`mergeMethodPreference.ts`).
+- `features.createByPush`: the Git panel creates a change by pushing for
+  review (`runBoundReviewPush`, a `push` operation with a `review` intent to
+  `refs/for/<target>` on the provider association's primary remote) and
+  uploads a new patchset while the status's `localRevision.uploadedAs` is
+  null. The status may also carry the change's chain (`stack`).
+- `features.branchHeads: false`: the head is a revision's ref, not a branch,
+  so nothing offers to stack on it or shows it as a branch, and a worktree
+  made from a change gets the branch `change-<number>`, the name the server
+  gives it.
+- `repository.pathStyle: 'path'`: a project is any path, top-level ones
+  included. Selectors keep `{ owner, name }` with an empty owner for a
+  top-level project; `projectPath.ts` joins (`owner ? owner/name : name`) and
+  splits (on the last slash) the path, and URL patterns name it as one
+  `{project+}` token. Keys and labels use the joined path, so every other
+  provider's keys stay byte-identical (`projectPath.test.ts`). The web
+  adapter refuses an empty owner from a provider whose descriptor says it is
+  not path-style, and lets one through from a provider whose descriptor it has
+  not read yet, for the server to validate. A one-segment remote path links
+  only for a path-style provider.
+- Settings field kinds `username` and `http-password`: the card asks for both
+  and sends the username with the token (`authSetToken(…, { username })`).
+
+### Why the verdict hosts' review goes through an implicit label
+
+One label model for both kinds of host would have changed the buttons, the
+wire and the stored digests of every existing host. The implicit `approval`
+label keeps the verdict branch exactly as it was, and votes stay a branch of
+their own that only a votes host reaches.
+
+### Why votes go on the latest revision only
+
+Review hosts refuse votes on an older patchset, and a vote meant for what the
+person is reading would land on a revision they did not read. The reply shows
+why it offers no votes while an older one is picked.
+
+### Why a push for review never falls back to Publish
+
+Pushing to `refs/heads/*` on a review host creates a branch that bypasses
+review. The change flow goes only through the review push, which the server
+plans only on a change host's primary remote.
+
+### Why only the checked-out commit gets a Change-Id here
+
+Amending the tip rewrites one commit and leaves its parents alone. An older
+commit without one needs a rebase the person should drive, so the push is held
+back and the message points at the host's commit-msg hook.
+
 ## Tests
 
-`repository-binding.test.ts` covers deferred failure, successful empty, concurrent
+`repository-binding.test.ts` covers deferred failure, successful empty, a read
+waiting for a worktree checkout, concurrent
 demand, mutation overlays, aliases, scope invalidation, conflict reconciliation
 and retention. The 100-consumer regression permits one initial request and no
 additional requests or notifications for 10,000 warm snapshot reads.
 `applyIdentity.test.ts` covers the provider/transport/author writes an identity
 produces, that grants an earlier identity saved on other remotes are removed so
 they follow the new one, and instance and scheme applicability;
-`identity.test.ts` covers remote traits and host proposal. Account cases in
+`identity.test.ts` covers remote traits, host proposal, account options and
+the gh CLI account rules. Account cases in
 `sourceControlOAuthPolling.test.tsx` cover localized retry and runtime switching.
 These tests do not validate a packaged runtime, real credentials or browser paint.
 
 `SourceControlBindingSettings.test.tsx` covers the repository dialog's all-locale copy.
+
+`providers/descriptor.test.ts` covers id syntax and reserved ids, per-descriptor
+failure, forward-compatible values (the change-review features included), a
+change host's descriptor and the fallback; `providers/registry.test.ts`
+covers snapshot hydration, a corrupt snapshot, failure keeping the held list,
+shared requests and a runtime switch rejecting a late answer;
+`providers/urlMatchers.test.ts` covers github.com, GitHub Enterprise, nested
+GitLab namespaces, a provider the UI has no code for, known-instance precedence
+and the ambiguous case. The web adapter's 404 fallback and format-driven
+normalization are covered in `packages/web/src/api/source-control-providers.test.ts`.

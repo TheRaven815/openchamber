@@ -81,6 +81,32 @@ describe('opencode plugins data layer', () => {
     expect(thrownBy(() => plugins.createPluginEntry({ spec: 'plain-plugin', scope: 'user' }, projectDir))).toHaveProperty('code', 'ENTRY_EXISTS');
   });
 
+  test('writes a plain repository address in the form OpenCode loads', () => {
+    plugins.createPluginEntry({ spec: ' https://github.com/owner/repo.git ', scope: 'user' }, projectDir);
+
+    expect(readJson(userConfigPath).plugins).toEqual(['git+https://github.com/owner/repo.git']);
+    expect(thrownBy(() => plugins.createPluginEntry({ spec: 'git+https://github.com/owner/repo.git', scope: 'user' }, projectDir)))
+      .toHaveProperty('code', 'ENTRY_EXISTS');
+  });
+
+  test('refuses a spec OpenCode cannot load and leaves the config untouched', () => {
+    writeJson(userConfigPath, { plugins: ['alpha'] });
+
+    expect(thrownBy(() => plugins.createPluginEntry({ spec: 'https://example.com/plugin.tgz', scope: 'user' }, projectDir)))
+      .toHaveProperty('code', 'UNLOADABLE_SPEC');
+    expect(thrownBy(() => plugins.updatePluginEntry(plugins.encodePluginId('config', 'user:alpha'), { spec: 'my plugin' }, projectDir)))
+      .toHaveProperty('code', 'UNLOADABLE_SPEC');
+    expect(readJson(userConfigPath)).toEqual({ plugins: ['alpha'] });
+  });
+
+  test('keeps an existing entry OpenCode cannot load when only its options change', () => {
+    const legacy = 'https://example.com/plugin.tgz';
+    writeJson(userConfigPath, { plugins: [legacy] });
+
+    plugins.updatePluginEntry(plugins.encodePluginId('config', `user:${legacy}`), { spec: legacy, options: { a: 1 } }, projectDir);
+    expect(readJson(userConfigPath).plugins).toEqual([{ package: legacy, options: { a: 1 } }]);
+  });
+
   test('routes project entries to project config and user entries to custom user config', () => {
     plugins.createPluginEntry({ spec: 'user-plugin', scope: 'user' }, projectDir);
     plugins.createPluginEntry({ spec: 'project-plugin', scope: 'project' }, projectDir);
@@ -153,7 +179,7 @@ describe('opencode plugins data layer', () => {
   });
 
   test('lists entries from user and project layers with scopes and parsed kinds', () => {
-    writeJson(userConfigPath, { plugin: ['npm-plugin', '/abs/plugin.js', '@scope/pkg@1.0.0'] });
+    writeJson(userConfigPath, { plugin: ['npm-plugin', '/abs/plugin.js', '@scope/pkg@1.0.0', 'github:acme/opencode-plugin'] });
     writeJson(path.join(projectDir, '.opencode', 'opencode.json'), { plugin: ['./local-plugin.js'] });
 
     const entries = plugins.listPluginEntries(projectDir);
@@ -161,6 +187,7 @@ describe('opencode plugins data layer', () => {
       expect.objectContaining({ spec: 'npm-plugin', scope: 'user', kind: 'config', parsedKind: 'npm', sourcePath: userConfigPath }),
       expect.objectContaining({ spec: '/abs/plugin.js', scope: 'user', kind: 'config', parsedKind: 'path', sourcePath: userConfigPath }),
       expect.objectContaining({ spec: '@scope/pkg@1.0.0', scope: 'user', kind: 'config', parsedKind: 'npm', sourcePath: userConfigPath }),
+      expect.objectContaining({ spec: 'github:acme/opencode-plugin', scope: 'user', kind: 'config', parsedKind: 'git', sourcePath: userConfigPath }),
       expect.objectContaining({ spec: './local-plugin.js', scope: 'project', kind: 'config', parsedKind: 'path', sourcePath: path.join(projectDir, '.opencode', 'opencode.json') }),
     ]);
     fs.rmSync(userConfigPath, { force: true });

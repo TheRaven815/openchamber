@@ -4,7 +4,7 @@ import { useChatColumnActions } from './chatColumnSession';
 import { MobileModelButton } from './MobileModelButton';
 import type { EditPermissionMode } from '@/stores/types/sessionTypes';
 import type { ModelMetadata } from '@/types';
-import type { Agent, PermissionRuleset } from '@/lib/opencode/model';
+import type { Agent, Message, PermissionRuleset, Session } from '@/lib/opencode/model';
 import type { PermissionEffect } from '@opencode/client';
 import {
     DropdownMenu,
@@ -20,6 +20,7 @@ import { ProviderLogo } from '@/components/ui/ProviderLogo';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { Icon } from "@/components/icon/Icon";
+import { Spinner } from "@/components/ui/spinner";
 import { ArrowsMerge } from '@/components/icons/ArrowsMerge';
 import type { IconName } from "@/components/icon/icons";
 import { ModelPickerList, type ModelPickerEntry } from '@/components/model-picker/ModelPickerList';
@@ -29,31 +30,35 @@ import { useAgentColors } from '@/hooks/useAgentColors';
 import { useDeviceInfo } from '@/lib/device';
 import { mergeModelMetadataWithLiveModel } from '@/lib/modelMetadata';
 import { getModelDisplayName as getSharedModelDisplayName } from '@/lib/modelDisplay';
+import { formatCompactNumber } from '@/lib/numberFormat';
 import { getEditModeColors } from '@/lib/permissions/editModeColors';
 import { cn } from '@/lib/utils';
+import { usePopupSideOnOpen } from '@/components/ui/popup-side';
 import { agentLabel } from '@/lib/agentLabel';
 import { matchesRankQuery, rankByQuery } from '@/lib/search/fuzzySearch';
 import { useContextStore } from '@/stores/contextStore';
 import { useConfigStore, isStaleAutoSelection, selectKnownAgent, selectKnownCatalogModel } from '@/stores/useConfigStore';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useSelectionStore } from '@/sync/selection-store';
-import { useSession, useSessionMessages, useSessionRenderable } from '@/sync/sync-context';
+import { useSessionMessagesSelector, useSessionRenderable, useSessionSelector } from '@/sync/sync-context';
+import type { State } from '@/sync/types';
 import { useSync } from '@/sync/use-sync';
 import { useUIStore } from '@/stores/useUIStore';
 import { useModelLists } from '@/hooks/useModelLists';
 import { useIsTextTruncated } from '@/hooks/useIsTextTruncated';
 import { formatEffortLabel, getCycledPrimaryAgentName, isPrimaryMode, type MobileControlsPanel } from './mobileControlsUtils';
-import { getCurrentIntlLocale, useI18n } from '@/lib/i18n';
+import { getCurrentIntlLocale, isRightToLeft, useI18n } from '@/lib/i18n';
 import { useOpenCodeReadiness } from '@/hooks/useOpenCodeReadiness';
 import { eventMatchesShortcut, getEffectiveShortcutCombo, normalizeCombo } from '@/lib/shortcuts';
 import { markStartupTrace } from '@/lib/startupTrace';
 import { AUTO_MODEL_ID, AUTO_PROVIDER_ID, isAutoModel } from '@/lib/routing/autoModel';
 import { selectAutoReady, useRoutingStore } from '@/stores/useRoutingStore';
 import {
+    areModelChoicesEqual,
+    extractSessionRecordModelChoice,
     findLatestUserModelChoice,
     shouldPreserveManualModelOverride,
 } from '@/lib/messages/userModelChoice';
-import { getSyncParts } from '@/sync/sync-refs';
 import type { BtwSelection } from '@/stores/useBtwStore';
 import { listModelVariantIds, type ModelVariantSource } from '@/lib/modelVariants';
 
@@ -64,6 +69,12 @@ type ProviderModel = Record<string, unknown> & { id?: string; name?: string };
 type MobileVariantTarget = { providerId: string; modelId: string };
 
 const buildModelRefKey = (providerID: string, modelID: string) => `${providerID}:${modelID}`;
+
+const selectSessionRecordAgent = (session: Session | undefined): string | undefined => session?.agent?.trim() || undefined;
+const selectLatestReplyModelChoice = (messages: Message[], state: State) => findLatestUserModelChoice(
+    messages,
+    (messageId) => state.part[messageId],
+);
 const MAX_INLINE_MOBILE_VARIANT_OPTIONS = 6;
 
 const AgentDescriptionTooltip: React.FC<{
@@ -80,11 +91,50 @@ const AgentDescriptionTooltip: React.FC<{
             <TooltipContent
                 side="right"
                 sideOffset={8}
-                className="max-w-xs text-left transition-none data-[starting-style]:opacity-100 data-[starting-style]:scale-100 data-[ending-style]:opacity-100 data-[ending-style]:scale-100"
+                className="max-w-xs text-start transition-none data-[starting-style]:opacity-100 data-[starting-style]:scale-100 data-[ending-style]:opacity-100 data-[ending-style]:scale-100"
             >
                 <span className="typography-meta text-muted-foreground">{description}</span>
             </TooltipContent>
         </Tooltip>
+    );
+};
+
+/**
+ * Star on an agent row. Starred agents are what Tab cycles through; the press
+ * is kept from the row so starring never picks the agent.
+ */
+const AgentFavoriteToggle: React.FC<{
+    favorite: boolean;
+    onToggle: () => void;
+    className?: string;
+}> = ({ favorite, onToggle, className }) => {
+    const { t } = useI18n();
+    const label = favorite ? t('chat.modelControls.removeFromFavorites') : t('chat.modelControls.agentFavoriteAdd');
+    const keepFromRow = (event: React.SyntheticEvent) => {
+        event.preventDefault();
+        event.stopPropagation();
+    };
+    return (
+        <button
+            type="button"
+            aria-pressed={favorite}
+            aria-label={label}
+            title={label}
+            onPointerDown={keepFromRow}
+            onPointerUp={keepFromRow}
+            onMouseUp={keepFromRow}
+            onClick={(event) => {
+                keepFromRow(event);
+                onToggle();
+            }}
+            className={cn(
+                'flex h-5 w-5 flex-shrink-0 items-center justify-center rounded hover:text-primary/80',
+                favorite ? 'text-primary' : 'text-muted-foreground',
+                className,
+            )}
+        >
+            <Icon name={favorite ? 'star-fill' : 'star'} className="h-3.5 w-3.5" />
+        </button>
     );
 };
 
@@ -194,13 +244,6 @@ const getModalityIcons = (metadata: ModelMetadata | undefined, direction: 'input
     }
     return result;
 };
-
-const formatCompactNumber = (value: number) => new Intl.NumberFormat(getCurrentIntlLocale(), {
-    notation: 'compact',
-    compactDisplay: 'short',
-    maximumFractionDigits: 1,
-    minimumFractionDigits: 0,
-}).format(value);
 
 const formatUsdCurrency = (value: number) => new Intl.NumberFormat(getCurrentIntlLocale(), {
     style: 'currency',
@@ -325,6 +368,11 @@ type ModelControlsProps = {
     }
 );
 
+/** Beside "Loading" the shared spinner; beside "Unavailable", an error, a still warning. */
+const ReadinessMark: React.FC<{ unavailable: boolean; className: string }> = ({ unavailable, className }) => (
+    unavailable ? <Icon name="error-warning" className={className} /> : <Spinner className={className} />
+);
+
 export const ModelControls: React.FC<ModelControlsProps> = ({
     className,
     mobilePanel,
@@ -341,6 +389,8 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
     const readinessLabel = isUnavailable ? t('common.unavailable') : t('common.loading');
     const providers = useConfigStore((state) => state.providers);
     const getAgentColor = useAgentColors();
+    const favoriteAgents = useUIStore((state) => state.favoriteAgents);
+    const toggleFavoriteAgent = useUIStore((state) => state.toggleFavoriteAgent);
     const currentProviderId = useConfigStore((state) => selection ? selection.model?.providerId ?? '' : state.currentProviderId);
     const currentModelId = useConfigStore((state) => selection ? selection.model?.modelId ?? '' : state.currentModelId);
     const effectiveCurrentVariant = useConfigStore((state) => state.currentVariant);
@@ -354,7 +404,9 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         : currentVariantSelection.override ?? effectiveCurrentVariant;
     if (selection) currentVariant = selection.variant ?? undefined;
     const currentAgentName = useConfigStore((state) => selection ? selection.agent : state.currentAgentName);
+    const settingsDefaultModel = useConfigStore((state) => state.settingsDefaultModel);
     const settingsDefaultVariant = useConfigStore((state) => state.settingsDefaultVariant);
+    const getDefaultVariantForModel = useConfigStore((state) => state.getDefaultVariantForModel);
     const settingsDefaultAgent = useConfigStore((state) => state.settingsDefaultAgent);
     const defaultsLoaded = useConfigStore((state) => state.settingsDefaultsLoaded);
     const agentsResolved = useConfigStore((state) => state.agentsLoaded);
@@ -500,6 +552,12 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
     });
     // Use global state for model selector (allows Ctrl+M shortcut)
     const agentMenuOpen = isModelSelectorOpen;
+    // The model and agent menus open upward from the composer, and downward
+    // only when the composer sits too close to the top to fit them.
+    const modelTriggerRef = React.useRef<HTMLDivElement>(null);
+    const agentTriggerRef = React.useRef<HTMLDivElement>(null);
+    const modelMenuSide = usePopupSideOnOpen(agentMenuOpen, modelTriggerRef, 'top');
+    const agentMenuSide = usePopupSideOnOpen(isAgentSelectorOpen, agentTriggerRef, 'top');
     const setAgentMenuOpen = selection ? setLocalModelSelectorOpen : setModelSelectorOpen;
     const openAddProviderSettings = React.useCallback(() => {
         requestProviderConnect(true);
@@ -717,35 +775,38 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         currentSessionId ?? '',
         currentSessionDirectory ?? undefined,
     );
-    const currentSessionMessagesFromSync = useSessionMessages(currentSessionId ?? '', currentSessionDirectory ?? undefined);
-    const currentSessionRecord = useSession(currentSessionId ?? undefined, currentSessionDirectory ?? undefined);
     // OpenCode 2 keeps the selection on the session record itself (`model`
     // with its variant, and `agent`), and that is what the next prompt runs
     // on, so it is the authority when a session opens. The last assistant
     // reply is the fallback for a record that has no model yet. The record's
     // agent is followed by its own effect below, so a choice carries an agent
     // only when the record has none.
-    const sessionRecordAgent = currentSessionRecord?.agent?.trim() || undefined;
-    const sessionRecordChoice = React.useMemo(() => {
-        const model = currentSessionRecord?.model;
-        if (!currentSessionRecord || !model?.providerID || !model.id) return null;
-        return {
-            id: `session:${currentSessionRecord.id}`,
-            agent: undefined,
-            providerID: model.providerID,
-            modelID: model.id,
-            variant: model.variant?.trim() || undefined,
-        };
-    }, [currentSessionRecord]);
+    // Both are read as derived choices: the record and the message list are
+    // replaced on every streamed step while the choice stays the same.
+    const sessionRecordAgent = useSessionSelector(
+        currentSessionId ?? undefined,
+        currentSessionDirectory ?? undefined,
+        selectSessionRecordAgent,
+    );
+    const sessionRecordChoice = useSessionSelector(
+        currentSessionId ?? undefined,
+        currentSessionDirectory ?? undefined,
+        extractSessionRecordModelChoice,
+        areModelChoicesEqual,
+    );
+    const latestReplyChoice = useSessionMessagesSelector(
+        currentSessionId ?? '',
+        currentSessionDirectory ?? undefined,
+        selectLatestReplyModelChoice,
+        areModelChoicesEqual,
+        // The choice is read from the reply's parts, which can load after it.
+        true,
+    );
     const latestLoadedUserChoice = React.useMemo(() => {
         if (selection) return null;
         if (sessionRecordChoice) return sessionRecordChoice;
-        const replyChoice = findLatestUserModelChoice(
-            currentSessionMessagesFromSync,
-            (messageId) => getSyncParts(messageId, currentSessionDirectory ?? undefined),
-        );
-        return replyChoice && sessionRecordAgent ? { ...replyChoice, agent: undefined } : replyChoice;
-    }, [currentSessionDirectory, currentSessionMessagesFromSync, selection, sessionRecordAgent, sessionRecordChoice]);
+        return latestReplyChoice && sessionRecordAgent ? { ...latestReplyChoice, agent: undefined } : latestReplyChoice;
+    }, [latestReplyChoice, selection, sessionRecordAgent, sessionRecordChoice]);
 
     const tryApplyModelSelection = React.useCallback(
         (providerId: string, modelId: string, agentName?: string): ModelApplyResult => {
@@ -822,11 +883,12 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
             agent?.model?.providerID === providerId
             && agent.model.id === modelId
         ) ? agent.model?.variant : undefined;
+        const configuredVariant = getDefaultVariantForModel(providerId, modelId);
         const candidates = currentSessionId
-            ? [agentVariant, settingsDefaultVariant, currentInherited]
-            : [currentInherited, agentVariant, settingsDefaultVariant];
+            ? [agentVariant, configuredVariant, currentInherited]
+            : [currentInherited, agentVariant, configuredVariant];
         return candidates.find((candidate) => candidate !== undefined && variantOptions.includes(candidate));
-    }, [agents, currentAgentName, currentModelId, currentProviderId, currentSessionId, currentVariantSelection, effectiveCurrentVariant, getModelVariantOptions, settingsDefaultVariant, uiAgentName]);
+    }, [agents, currentAgentName, currentModelId, currentProviderId, currentSessionId, currentVariantSelection, effectiveCurrentVariant, getDefaultVariantForModel, getModelVariantOptions, uiAgentName]);
 
     /**
      * The session's recorded choice for this model, in the selection store's
@@ -1238,8 +1300,12 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         }
 
         if (!hasRenderableCurrentSessionSnapshot) {
-            if (!sync.isLoading(currentSessionId)) {
-                void sync.ensureSessionRenderable(currentSessionId);
+            // The session's own directory: falling back to the sync directory
+            // loads a worktree session into the wrong store and races the
+            // chat's own load under a different dedupe key.
+            const sessionDirectory = currentSessionDirectory ?? undefined;
+            if (!sync.isLoading(currentSessionId, sessionDirectory)) {
+                void sync.ensureSessionRenderable(currentSessionId, false, sessionDirectory);
             }
             return;
         }
@@ -1252,6 +1318,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         restoredSessionSelectionRef.current = currentSessionId;
     }, [
         currentSessionId,
+        currentSessionDirectory,
         hasRenderableCurrentSessionSnapshot,
         latestLoadedUserChoice,
         agents,
@@ -1324,6 +1391,13 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         selection,
     ]);
 
+    // Declared before the re-sync below so that, on the render a model switch
+    // lands, a pick made on the previous model no longer holds back the new
+    // model's default.
+    React.useEffect(() => {
+        manualVariantSelectionRef.current = false;
+    }, [currentProviderId, currentModelId]);
+
     React.useEffect(() => {
         if (selection) return;
         // Missing discovery/context data cannot invalidate a configured effort.
@@ -1353,7 +1427,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
             return;
         }
 
-        // Draft state (no session yet): seed from settings default, but don't override
+        // Draft state (no session yet): seed from the model's configured default, but don't override
         // user selection while drafting.
         if (!currentSessionId) {
             if (currentVariantSelection.override === undefined && !manualVariantSelectionRef.current) {
@@ -1396,13 +1470,12 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         resolveInheritedVariantForModel,
         setCurrentVariant,
         setCurrentVariantOverride,
+        // `getDefaultVariantForModel` reads these from the store; listing them
+        // re-resolves the inherited effort when the Settings defaults change.
+        settingsDefaultModel,
         settingsDefaultVariant,
         selection,
     ]);
-
-    React.useEffect(() => {
-        manualVariantSelectionRef.current = false;
-    }, [currentProviderId, currentModelId]);
 
     const handleVariantSelect = React.useCallback((variant: string | undefined) => {
         if (currentProviderId && currentModelId) {
@@ -1454,12 +1527,15 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
     ]);
 
     const handleCycleAgentFromModelPicker = React.useCallback((direction: 1 | -1) => {
-        const nextAgentName = getCycledPrimaryAgentName(agents, currentAgentName, direction);
+        // Auto hides the agent control, so the shortcut must not change a
+        // choice the user cannot see.
+        if (isAutoSelected) return;
+        const nextAgentName = getCycledPrimaryAgentName(agents, currentAgentName, direction, useUIStore.getState().favoriteAgents);
         if (!nextAgentName) {
             return;
         }
         handleAgentChange(nextAgentName, { closeModelSelector: false });
-    }, [agents, currentAgentName, handleAgentChange]);
+    }, [agents, currentAgentName, handleAgentChange, isAutoSelected]);
 
     const getCycleAgentDirectionFromEvent = React.useCallback((event: KeyboardEvent | React.KeyboardEvent): 1 | -1 | null => {
         if (selection) return null;
@@ -1920,7 +1996,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                             type="button"
                             onClick={() => handleMobileModelApply(providerId, modelId, resolvedVariant)}
                             className={cn(
-                                'flex flex-1 min-w-0 items-start gap-2 text-left',
+                                'flex flex-1 min-w-0 items-start gap-2 text-start',
                                 'focus:outline-none focus-visible:ring-1 focus-visible:ring-ring rounded-lg'
                             )}
                         >
@@ -1947,7 +2023,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                             <span aria-hidden="true" className="h-3 w-px flex-shrink-0 bg-border/50" />
                                         ) : null}
                                         {indicatorIcons.length > 0 ? (
-                                            <div className="flex min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap pl-0.5">
+                                            <div className="flex min-w-0 items-center gap-1 overflow-hidden whitespace-nowrap ps-0.5">
                                                 {indicatorIcons.map(({ key, icon: iconName, label }) => (
                                                 <span
                                                     key={`meta-${providerId}-${modelId}-${key}`}
@@ -2056,7 +2132,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                 <div className="flex flex-col gap-2">
                     <div>
                         <div className="relative">
-                            <Icon name="search" className="absolute left-2 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground" />
+                            <Icon name="search" className="absolute inset-s-2 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground" />
                             <Input
                                 value={mobileModelQuery}
                                 onChange={(event) => {
@@ -2064,7 +2140,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                     setExpandedMobileModelKey(null);
                                 }}
                                         placeholder={t('chat.modelControls.searchProvidersOrModels')}
-                                className="pl-7 h-9 rounded-xl border-border/40 bg-[var(--surface-elevated)] typography-meta"
+                                className="ps-7 h-9 rounded-xl border-border/40 bg-[var(--surface-elevated)] typography-meta"
                             />
                             {mobileModelQuery && (
                                 <button
@@ -2073,7 +2149,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                         setMobileModelQuery('');
                                         setExpandedMobileModelKey(null);
                                     }}
-                                    className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                                    className="absolute inset-e-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                                     aria-label={t('chat.modelControls.clearSearch')}
                                 >
                                     <Icon name="close-circle" className="size-4" />
@@ -2105,7 +2181,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                     {filteredFavorites.length > 0 && (
                         <div className="rounded-xl border border-border/40 bg-[var(--surface-elevated)] overflow-hidden">
                             <div className="px-2 py-1.5 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-                                <Icon name="star-fill" className="size-3 inline-block mr-1.5 text-primary" />
+                                <Icon name="star-fill" className="size-3 inline-block me-1.5 text-primary" />
                                 {t('chat.modelControls.favorites')}
                             </div>
                             <div className="flex flex-col border-t border-border/30">
@@ -2123,7 +2199,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                     {filteredRecents.length > 0 && (
                         <div className="rounded-xl border border-border/40 bg-[var(--surface-elevated)] overflow-hidden">
                             <div className="px-2 py-1.5 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-                                <Icon name="time" className="size-3 inline-block mr-1.5" />
+                                <Icon name="time" className="size-3 inline-block me-1.5" />
                                 {t('chat.modelControls.recent')}
                             </div>
                             <div className="flex flex-col border-t border-border/30">
@@ -2155,7 +2231,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                         }
                                         toggleMobileProviderExpansion(provider.id);
                                     }}
-                                    className="flex w-full items-center justify-between gap-1.5 px-2 py-1.5 text-left"
+                                    className="flex w-full items-center justify-between gap-1.5 px-2 py-1.5 text-start"
                                     aria-expanded={isExpanded}
                                 >
                                     <div className="flex items-center gap-2">
@@ -2247,7 +2323,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                     <button
                         type="button"
                         className={cn(
-                            'flex w-full items-center justify-between gap-2 rounded-xl border px-2 py-1.5 text-left',
+                            'flex w-full items-center justify-between gap-2 rounded-xl border px-2 py-1.5 text-start',
                             'focus:outline-none focus-visible:ring-1 focus-visible:ring-ring',
                             isDefault ? 'border-border bg-interactive-selection text-interactive-selection-foreground' : 'border-border/40'
                         )}
@@ -2266,7 +2342,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                 key={variant}
                                 type="button"
                                 className={cn(
-                                    'flex w-full items-center justify-between gap-2 rounded-xl border px-2 py-1.5 text-left',
+                                    'flex w-full items-center justify-between gap-2 rounded-xl border px-2 py-1.5 text-start',
                                     'focus:outline-none focus-visible:ring-1 focus-visible:ring-ring',
                                     selected ? 'border-border bg-interactive-selection text-interactive-selection-foreground' : 'border-border/40'
                                 )}
@@ -2297,11 +2373,11 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                         const isSelected = agent.name === uiAgentName;
                         const agentColor = getAgentColor(agent.name);
                         return (
+                            <div key={agent.name} className="relative">
                             <button
-                                key={agent.name}
                                 type="button"
                                 className={cn(
-                                    'flex w-full flex-col gap-1.5 rounded-xl border px-3 py-2.5 text-left',
+                                    'flex w-full flex-col gap-1.5 rounded-xl border py-2.5 ps-3 pe-11 text-start',
                                     'focus:outline-none focus-visible:ring-2 focus-visible:ring-ring',
                                     'touch-manipulation cursor-pointer transition-colors',
                                     'active:bg-interactive-active',
@@ -2312,23 +2388,29 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                 onClick={() => handleAgentChange(agent.name)}
                             >
                                 <div className="flex items-center gap-2">
-                                    <div className={cn('size-2.5 rounded-full flex-shrink-0 agent-dot', agentColor.class)} />
+                                    <div className="size-2.5 rounded-full flex-shrink-0" style={{ background: agentColor.color }} />
                                     <span
                                         className="typography-ui-label font-semibold"
-                                        style={isSelected ? { color: `var(${agentColor.var})` } : undefined}
+                                        style={isSelected ? { color: agentColor.color } : undefined}
                                     >
                                         {agentLabel(agent)}
                                     </span>
                                     {isSelected && (
-                                        <Icon name="check" className="size-4 text-primary ml-auto flex-shrink-0" />
+                                        <Icon name="check" className="size-4 text-primary ms-auto flex-shrink-0" />
                                     )}
                                 </div>
                                 {agent.description && (
-                                    <span className="typography-meta text-muted-foreground pl-4.5">
+                                    <span className="typography-meta text-muted-foreground ps-4.5">
                                         {agent.description}
                                     </span>
                                 )}
                             </button>
+                            <AgentFavoriteToggle
+                                className="absolute inset-e-2 top-2 h-8 w-8"
+                                favorite={favoriteAgents.includes(agent.name)}
+                                onToggle={() => toggleFavoriteAgent(agent.name)}
+                            />
+                            </div>
                         );
                     })}
                 </div>
@@ -2448,7 +2530,9 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
             const variantsWithDefault: Array<string | undefined> = [undefined, ...variantKeys];
             const currentVariantIndex = variantsWithDefault.indexOf(activeModelVariant);
             const safeCurrentIndex = currentVariantIndex >= 0 ? currentVariantIndex : 0;
-            const direction = e.key === 'ArrowRight' ? 1 : -1;
+            // The next level lies toward the end of the line: right in LTR, left in RTL.
+            const forwardKey = isRightToLeft(e.currentTarget) ? 'ArrowLeft' : 'ArrowRight';
+            const direction = e.key === forwardKey ? 1 : -1;
             const nextVariantIndex = (safeCurrentIndex + direction + variantsWithDefault.length) % variantsWithDefault.length;
             const nextVariant = variantsWithDefault[nextVariantIndex];
 
@@ -2506,12 +2590,14 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
 
         const modelPickerLabels = {
             searchPlaceholder: t('chat.modelControls.searchModels'),
+            list: t('chat.modelControls.modelListAria'),
             noResults: t('chat.modelControls.noModelsFound'),
             favorites: t('chat.modelControls.favorites'),
             recent: t('chat.modelControls.recent'),
             keyboardHint: t('chat.modelControls.keyboardHintNavigate'),
             favorite: t('chat.modelControls.favoriteAria'),
             unfavorite: t('chat.modelControls.unfavoriteAria'),
+            provider: t('chat.modelControls.provider'),
             capabilities: t('chat.modelControls.capabilities'),
             capabilityToolCalling: t('chat.modelControls.capability.toolCalling'),
             capabilityReasoning: t('chat.modelControls.capability.reasoning'),
@@ -2550,8 +2636,9 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                 {!isCompact ? (
                     <DropdownMenu open={isReady && agentMenuOpen} onOpenChange={isReady ? handleModelMenuOpenChange : undefined}>
                         <TooltipTrigger asChild>
-                            <DropdownMenuTrigger asChild>
+                            <DropdownMenuTrigger asChild nativeButton={false}>
                                 <div
+                                    ref={modelTriggerRef}
                                     className={cn(
                                         'model-controls__model-trigger flex items-center gap-1.5 cursor-pointer select-none hover:bg-transparent hover:opacity-70 min-w-0',
                                         buttonHeight
@@ -2559,7 +2646,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                 >
                                     {!modelSelectionReady ? (
                                         <>
-                                            <Icon name="loader-4" className={cn(controlIconSize, 'animate-spin text-muted-foreground flex-shrink-0')} />
+                                            <ReadinessMark unavailable={isUnavailable} className={cn(controlIconSize, 'text-muted-foreground flex-shrink-0')} />
                                             <span className={cn(
                                                 'model-controls__model-label',
                                                 controlTextSize,
@@ -2603,7 +2690,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                             </DropdownMenuTrigger>
                         </TooltipTrigger>
                         <DropdownMenuContent
-                            side="top"
+                            side={modelMenuSide}
                             className="w-[min(380px,calc(100vw-2rem))] p-0 flex flex-col overflow-hidden"
                             align="end"
                             alignOffset={-40}
@@ -2618,7 +2705,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                     className="typography-meta group flex w-full items-center gap-1 rounded-md px-2 py-1.5 cursor-pointer hover:bg-interactive-hover/50"
                                 >
                                     <span className="flex size-4 items-center justify-center text-muted-foreground">
-                                        <Icon name="add" className="size-4 -mr-0.5" />
+                                        <Icon name="add" className="size-4 -me-0.5" />
                                     </span>
                                     <span className="font-medium text-foreground">{t('chat.modelControls.addNewProvider')}</span>
                                 </button>
@@ -2695,7 +2782,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                     >
                         {!modelSelectionReady ? (
                             <>
-                                <Icon name="loader-4" className={cn(controlIconSize, 'animate-spin text-muted-foreground flex-shrink-0')} />
+                                <ReadinessMark unavailable={isUnavailable} className={cn(controlIconSize, 'text-muted-foreground flex-shrink-0')} />
                                 <span className="typography-micro font-medium text-muted-foreground min-w-0">
                                     {readinessLabel}
                                 </span>
@@ -2864,9 +2951,15 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
             return null;
         }
 
-        const displayVariant = currentVariant ?? t('chat.modelControls.default');
+        const displayVariant = currentVariant ? formatEffortLabel(currentVariant) : t('chat.modelControls.default');
         const isDefault = !currentVariant;
         const colorClass = isDefault ? 'text-muted-foreground' : 'text-[color:var(--status-info)]';
+        // An effort nobody picked in this composer is this model's configured
+        // default; the tooltip says so.
+        const isInherited = !selection && !isDefault && currentVariantSelection.override === undefined;
+        const tooltipText = isInherited
+            ? t('chat.modelControls.inheritedVariantTooltip', { variant: displayVariant })
+            : `${t('chat.modelControls.thinking')}: ${displayVariant}`;
 
         if (isCompact) {
             return (
@@ -2901,7 +2994,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
             <Tooltip delayDuration={600}>
                 <DropdownMenu>
                     <TooltipTrigger asChild>
-                        <DropdownMenuTrigger asChild>
+                        <DropdownMenuTrigger asChild nativeButton={false}>
                             <div
                                 className={cn(
                                     'model-controls__variant-trigger flex items-center gap-1.5 transition-colors cursor-pointer select-none hover:bg-transparent hover:opacity-70 min-w-0',
@@ -2934,7 +3027,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                         {displayVariants.length > 0 && <DropdownMenuSeparator />}
                         {displayVariants.map((variant) => {
                             const selected = currentVariant === variant;
-                            const label = variant.charAt(0).toUpperCase() + variant.slice(1);
+                            const label = formatEffortLabel(variant);
                             return (
                                 <DropdownMenuItem
                                     key={variant}
@@ -2951,7 +3044,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                     </DropdownMenuContent>
                 </DropdownMenu>
                 <TooltipContent side="top">
-                    <p className="typography-meta">{t('chat.modelControls.thinking')}: {displayVariant}</p>
+                    <p className="typography-meta">{tooltipText}</p>
                 </TooltipContent>
             </Tooltip>
         );
@@ -2964,17 +3057,17 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                     <Tooltip delayDuration={600}>
                         <DropdownMenu open={canSelectAgent && isAgentSelectorOpen} onOpenChange={canSelectAgent ? setIsAgentSelectorOpen : undefined}>
                             <TooltipTrigger asChild>
-                                <DropdownMenuTrigger asChild>
-                                    <div className={cn(
+                                <DropdownMenuTrigger asChild nativeButton={false}>
+                                    <div ref={agentTriggerRef} className={cn(
                                         'flex items-center gap-1.5 transition-colors cursor-pointer select-none hover:bg-transparent hover:opacity-70 min-w-0',
                                         buttonHeight
                                     )}>
                                         {!agentSelectionReady ? (
                                             <>
-                                                <Icon name="loader-4"
+                                                <ReadinessMark unavailable={isUnavailable}
                                                     className={cn(
                                                         controlIconSize,
-                                                        'flex-shrink-0 animate-spin text-muted-foreground'
+                                                        'flex-shrink-0 text-muted-foreground'
                                                     )}
                                                 />
                                                 <span
@@ -2995,7 +3088,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                                         'flex-shrink-0',
                                                         uiAgentName ? '' : 'text-muted-foreground'
                                                     )}
-                                                    style={uiAgentName ? { color: `var(${getAgentColor(uiAgentName).var})` } : undefined}
+                                                    style={uiAgentName ? { color: getAgentColor(uiAgentName).color } : undefined}
                                                 />
                                                 <span
                                                     className={cn(
@@ -3004,7 +3097,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                                         'font-medium min-w-0 truncate',
                                                         isDesktop ? 'max-w-[220px]' : undefined
                                                     )}
-                                                    style={uiAgentName ? { color: `var(${getAgentColor(uiAgentName).var})` } : undefined}
+                                                    style={uiAgentName ? { color: getAgentColor(uiAgentName).color } : undefined}
                                                 >
                                                     {getAgentDisplayName()}
                                                 </span>
@@ -3013,10 +3106,10 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                     </div>
                                 </DropdownMenuTrigger>
                             </TooltipTrigger>
-                            <DropdownMenuContent side="top" align="end" alignOffset={-40} constrainToMain collisionAvoidance={{ side: 'none', align: 'shift' }} className="w-[min(280px,calc(100vw-2rem))] p-0 flex flex-col overflow-hidden">
+                            <DropdownMenuContent side={agentMenuSide} align="end" alignOffset={-40} constrainToMain collisionAvoidance={{ side: 'none', align: 'shift' }} className="w-[min(280px,calc(100vw-2rem))] p-0 flex flex-col overflow-hidden">
                                 <div className="p-2 border-b border-border/40">
                                     <div className="relative">
-                                        <Icon name="search" className="absolute left-2.5 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground" />
+                                        <Icon name="search" className="absolute inset-s-2.5 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground" />
                                         <Input
                                             type="text"
                                             placeholder={t('chat.modelControls.searchAgents')}
@@ -3025,7 +3118,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                             onKeyDown={(e) => {
                                                 e.stopPropagation();
                                             }}
-                                            className="pl-8 h-8 typography-meta"
+                                            className="ps-8 h-8 typography-meta"
                                         />
                                     </div>
                                 </div>
@@ -3056,12 +3149,14 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                                         className="typography-meta"
                                                         onSelect={() => handleAgentChange(agent.name)}
                                                     >
-                                                        <div className="flex items-center gap-1.5">
-                                                            <div className={cn(
-                                                                'h-1 w-1 rounded-full agent-dot',
-                                                                getAgentColor(agent.name).class
-                                                            )} />
+                                                        <div className="flex w-full items-center gap-1.5">
+                                                            <div className="h-1 w-1 rounded-full" style={{ background: getAgentColor(agent.name).color }} />
                                                             <span className="font-medium">{agentLabel(agent)}</span>
+                                                            <AgentFavoriteToggle
+                                                                className="ms-auto"
+                                                                favorite={favoriteAgents.includes(agent.name)}
+                                                                onToggle={() => toggleFavoriteAgent(agent.name)}
+                                                            />
                                                         </div>
                                                     </DropdownMenuItem>
                                                 </AgentDescriptionTooltip>
@@ -3093,10 +3188,10 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
             >
                 {!agentSelectionReady ? (
                     <>
-                        <Icon name="loader-4"
+                        <ReadinessMark unavailable={isUnavailable}
                             className={cn(
                                 controlIconSize,
-                                'flex-shrink-0 animate-spin text-muted-foreground'
+                                'flex-shrink-0 text-muted-foreground'
                             )}
                         />
                         <span
@@ -3117,7 +3212,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                 'flex-shrink-0',
                                 uiAgentName ? '' : 'text-muted-foreground'
                             )}
-                            style={uiAgentName ? { color: `var(${getAgentColor(uiAgentName).var})` } : undefined}
+                            style={uiAgentName ? { color: getAgentColor(uiAgentName).color } : undefined}
                         />
                         <span
                             className={cn(
@@ -3126,7 +3221,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                 'font-medium truncate min-w-0',
                                 isMobile && 'max-w-[60px]'
                             )}
-                            style={uiAgentName ? { color: `var(${getAgentColor(uiAgentName).var})` } : undefined}
+                            style={uiAgentName ? { color: getAgentColor(uiAgentName).color } : undefined}
                         >
                             {getAgentDisplayName()}
                         </span>

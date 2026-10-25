@@ -18,7 +18,9 @@ import type { Session } from '@/lib/opencode/model';
 import type { WorktreeMetadata } from '@/types/worktree';
 import { canDeleteWorktreeWithoutConfirm, getWorktreeStatus } from '@/lib/worktrees/worktreeStatus';
 import { getWorktreeDisplayName, removeProjectWorktree } from '@/lib/worktrees/worktreeManager';
-import { removeWorktreeThenArchiveSessions } from '@/lib/worktrees/worktreeRemovalFlow';
+import { leaveFinishedSessions } from '@/lib/sessionTabs';
+import { checkoutHoldsDirectory } from '@/lib/worktrees/worktreePaths';
+import { archiveSessionsThenRemoveWorktree } from '@/lib/worktrees/worktreeRemovalFlow';
 import { clearWorktreeRemoval, markWorktreeRemoving } from '@/lib/worktrees/worktreeRemovalState';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import * as sessionActions from '@/sync/session-actions';
@@ -55,7 +57,6 @@ export const SessionDialogs: React.FC = () => {
     const { t } = useI18n();
     const { git, sourceControl } = useRuntimeAPIs();
     const [isDirectoryDialogOpen, setIsDirectoryDialogOpen] = React.useState(false);
-    const [hasShownInitialDirectoryPrompt, setHasShownInitialDirectoryPrompt] = React.useState(false);
     const [deleteDialog, setDeleteDialog] = React.useState<DeleteDialogState | null>(null);
     const [deleteDialogSummaries, setDeleteDialogSummaries] = React.useState<Array<{ session: Session; metadata: WorktreeMetadata }>>([]);
     const [deleteDialogShouldRemoveRemote, setDeleteDialogShouldRemoveRemote] = React.useState(false);
@@ -72,11 +73,11 @@ export const SessionDialogs: React.FC = () => {
     const archiveSession = sessionActions.archiveSession;
     const deleteSessions = useSessionUIStore((s) => s.deleteSessions);
     const archiveSessions = useSessionUIStore((s) => s.archiveSessions);
+    const unarchiveSessions = useSessionUIStore((s) => s.unarchiveSessions);
     const showDeletionDialog = useUIStore((state) => state.showDeletionDialog);
     const setShowDeletionDialog = useUIStore((state) => state.setShowDeletionDialog);
     const currentDirectory = useDirectoryStore((s) => s.currentDirectory);
     const homeDirectory = useDirectoryStore((s) => s.homeDirectory);
-    const isHomeReady = useDirectoryStore((s) => s.isHomeReady);
     const projects = useProjectsStore((s) => s.projects);
     const activeProjectId = useProjectsStore((s) => s.activeProjectId);
     const { isMobile, isTablet, hasTouchInput } = useDeviceInfo();
@@ -121,20 +122,6 @@ export const SessionDialogs: React.FC = () => {
     const deleteLocalOptionDisabled = isProcessingDelete || !isWorktreeDelete;
 
     // Session loading is handled by sync bootstrap — no manual loadSessions needed.
-
-    React.useEffect(() => {
-        if (hasShownInitialDirectoryPrompt || !isHomeReady || projects.length > 0) {
-            return;
-        }
-
-        setHasShownInitialDirectoryPrompt(true);
-
-        setIsDirectoryDialogOpen(true);
-    }, [
-        hasShownInitialDirectoryPrompt,
-        isHomeReady,
-        projects.length,
-    ]);
 
     const openDeleteDialog = React.useCallback((payload: { sessions: Session[]; dateLabel?: string; mode?: 'session' | 'worktree'; worktree?: WorktreeMetadata | null }) => {
         setDeleteDialog({
@@ -352,11 +339,16 @@ export const SessionDialogs: React.FC = () => {
                 }
             );
 
+            // A directory inside the removed checkout, such as `<worktree>/sub`, goes with it.
+            const isInRemovedWorktree = (directory: string): boolean => Boolean(
+                normalizedWorktreePath
+                && directory
+                && checkoutHoldsDirectory(normalizedWorktreePath, directory)
+            );
             const draftDirectory = normalizeProjectDirectory(newSessionDraft?.directoryOverride);
             if (
                 newSessionDraft?.open
-                && normalizedWorktreePath
-                && draftDirectory === normalizedWorktreePath
+                && isInRemovedWorktree(draftDirectory)
                 && normalizedProjectPath
             ) {
                 setDraftBootstrapPendingDirectory(null);
@@ -366,13 +358,13 @@ export const SessionDialogs: React.FC = () => {
                 }, { force: true });
             }
 
-            if (normalizeProjectDirectory(currentDirectory) === normalizedWorktreePath && normalizedProjectPath) {
+            if (isInRemovedWorktree(normalizeProjectDirectory(currentDirectory)) && normalizedProjectPath) {
                 useDirectoryStore.getState().setDirectory(normalizedProjectPath, { showOverlay: false });
             }
 
             return true;
         } catch (error) {
-            toast.error(t('sessions.sidebar.sessionDialogs.worktree.errorRemoveTitle', { name: getWorktreeDisplayName(worktree) }), {
+            toast.error(t('sessions.sidebar.sessionDialogs.worktree.errorRemoveTitle'), {
                 id: toastId,
                 description: renderToastDescription(error instanceof Error ? error.message : t('sessions.sidebar.dialogs.deleteResult.tryAgain')),
             });
@@ -381,8 +373,8 @@ export const SessionDialogs: React.FC = () => {
     }, [canRemoveRemoteBranches, currentDirectory, deleteDialogShouldRemoveRemote, getProjectRefForWorktree, git, newSessionDraft?.directoryOverride, newSessionDraft?.open, setDraftBootstrapPendingDirectory, setNewSessionDraftTarget, sourceControl, t]);
 
     // Runs after the dialog closes so a slow removal cannot hold the UI. The
-    // worktree goes first: archiving sessions ahead of a removal that then
-    // fails would leave archived sessions attached to a worktree still on disk.
+    // sessions are archived while their folder still exists, and come back if
+    // the removal fails (`archiveSessionsThenRemoveWorktree`).
     const removeSelectedWorktreeInBackground = React.useCallback((
         worktree: WorktreeMetadata,
         sessionIds: string[],
@@ -394,9 +386,10 @@ export const SessionDialogs: React.FC = () => {
         markWorktreeRemoving(worktree.path);
         return (async () => {
             try {
-                const result = await removeWorktreeThenArchiveSessions({
+                const result = await archiveSessionsThenRemoveWorktree({
                     sessionIds,
                     removeWorktree: () => removeSelectedWorktree(worktree, deleteLocalBranch, toastId),
+                    restoreSessions: (ids) => unarchiveSessions(ids, { undo: true }),
                     archiveSessions: async (ids) => {
                         if (ids.length === 1) {
                             const success = await archiveSession(ids[0]);
@@ -408,13 +401,15 @@ export const SessionDialogs: React.FC = () => {
                     },
                 });
                 if (!result.removed) return;
+                // The removed work leaves the working set: its sessions' tabs
+                // close and the app moves off them, as Done does.
+                leaveFinishedSessions(sessionIds, { projectId: getProjectRefForWorktree(worktree).id });
 
-                const removalNote = shouldRemoveRemote
+                toast.success(shouldRemoveRemote
                     ? t('sessions.sidebar.sessionDialogs.worktree.removedWithRemote')
-                    : t('sessions.sidebar.sessionDialogs.worktree.removed');
-                toast.success(t('sessions.sidebar.sessionDialogs.worktree.removedTitle', { name: getWorktreeDisplayName(worktree) }), {
+                    : t('sessions.sidebar.sessionDialogs.worktree.removed'), {
                     id: toastId,
-                    description: renderToastDescription(removalNote),
+                    description: renderToastDescription(getWorktreeDisplayName(worktree)),
                 });
 
                 const { failedIds } = result.archive;
@@ -434,7 +429,7 @@ export const SessionDialogs: React.FC = () => {
                 clearWorktreeRemoval(worktree.path);
             }
         })();
-    }, [archiveSession, archiveSessions, canRemoveRemoteBranches, deleteDialogShouldRemoveRemote, removeSelectedWorktree, t]);
+    }, [archiveSession, archiveSessions, canRemoveRemoteBranches, deleteDialogShouldRemoveRemote, getProjectRefForWorktree, removeSelectedWorktree, t, unarchiveSessions]);
 
     // Paths whose quick delete is being checked or removed, so a repeated
     // Shift+click cannot remove the same worktree twice.
@@ -628,7 +623,7 @@ export const SessionDialogs: React.FC = () => {
                                 <span className={cn(!isWorktreeDelete && 'hidden')}>
                                     •
                                 </span>
-                                <span dir="auto" className="truncate">
+                                <span dir="auto" className="oc-ui-start-align truncate">
                                     {session.title || t('sessions.sidebar.session.untitled')}
                                 </span>
                             </li>

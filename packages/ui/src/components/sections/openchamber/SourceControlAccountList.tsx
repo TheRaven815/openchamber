@@ -1,5 +1,6 @@
 import React from 'react';
-import { Icon } from '@/components/icon/Icon';
+import { ProviderIcon } from '@/components/sourceControl/ProviderIcon';
+import { useSourceControlProvider } from '@/lib/source-control/providers/registry';
 import type { SourceControlAuthAccount } from '@/lib/api/types';
 
 type SourceControlAccountGroup = {
@@ -39,6 +40,11 @@ const groupSourceControlAccounts = (
 const credentialHandle = (id: string): string | null =>
   /[0-9a-f]{8}(?=-[0-9a-f]{4}-)/i.exec(id)?.[0] ?? null;
 
+/** An account without an avatar shows its provider's mark. */
+const ProviderMark: React.FC<{ provider: string }> = ({ provider }) => (
+  <ProviderIcon descriptor={useSourceControlProvider(provider)} variant="fill" className="size-4 text-muted-foreground" />
+);
+
 type SourceControlAccountListProps = {
   accounts: SourceControlAuthAccount[];
   avatarAlt: (username: string) => string;
@@ -68,16 +74,13 @@ export const SourceControlAccountList: React.FC<SourceControlAccountListProps> =
               <img
                 src={user.avatarUrl}
                 alt={avatarAlt(user.username)}
-                className="size-9 shrink-0 rounded-full border border-border bg-muted object-cover"
+                className="size-9 shrink-0 oc-tile-inset rounded-full object-cover"
                 loading="lazy"
                 referrerPolicy="no-referrer"
               />
             ) : (
-              <div className="flex size-9 shrink-0 items-center justify-center rounded-full border border-border bg-muted">
-                <Icon
-                  name={user.provider === 'github' ? 'github-fill' : user.provider === 'gitlab' ? 'gitlab' : 'git-branch'}
-                  className="size-4 text-muted-foreground"
-                />
+              <div className="flex size-9 shrink-0 items-center justify-center oc-tile-inset rounded-full">
+                <ProviderMark provider={user.provider} />
               </div>
             )}
             <div className="min-w-0">
@@ -89,7 +92,7 @@ export const SourceControlAccountList: React.FC<SourceControlAccountListProps> =
               </div>
             </div>
           </div>
-          <div className="ml-12 mt-2 divide-y divide-[var(--surface-subtle)]">
+          <div className="ms-12 mt-2 divide-y divide-[var(--surface-subtle)]">
             {group.accounts.map((account) => {
               const source = sourceLabel(account);
               const status = statusLabel(account);
@@ -112,7 +115,7 @@ export const SourceControlAccountList: React.FC<SourceControlAccountListProps> =
                       <span className="font-mono">{handle}</span>
                     </> : null}
                     {group.accounts.length > 1 && account.current
-                      ? <span className="rounded-full border border-border px-1.5">{currentLabel}</span> : null}
+                      ? <span className="oc-tile-inset rounded-full px-1.5">{currentLabel}</span> : null}
                   </div>
                   <div className="flex flex-wrap gap-2">{renderActions(account)}</div>
                 </div>

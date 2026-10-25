@@ -25,6 +25,7 @@ import {
   TOOLS_MOUNT_PATH,
   spaceWorkPath,
 } from './layout.js';
+import { isStartConfig, START_CONFIG_VARIABLE } from './space-opencode.js';
 import { FILLER_PROGRAM } from './tools-filler.js';
 import { TOOLS_STAGING_PATH } from './tools.js';
 
@@ -51,11 +52,14 @@ const FILLER_TMPFS_OPTIONS = 'rw,exec,nosuid,size=1g';
 // named on its own as well, so its message stays specific.
 const FORBIDDEN_ENVIRONMENT = ['OPENCHAMBER_UI_PASSWORD'];
 // The variables the pinned base image sets itself. Docker copies them into every container made
-// from it. Read on 2026-09-24 with
+// from it. Read on 2026-10-08 with
 // `docker image inspect <SPACE_BASE_IMAGE> --format '{{json .Config.Env}}'`, which answered
-// PATH, NODE_VERSION=22.23.2 and YARN_VERSION=1.22.22. Read them again when the digest changes.
+// PATH, NODE_VERSION=24.21.0 and YARN_VERSION=1.22.22. Read them again when the digest changes.
 const BASE_IMAGE_ENVIRONMENT_NAMES = ['PATH', 'NODE_VERSION', 'YARN_VERSION'];
-const SPACE_ENVIRONMENT_NAMES = new Set([...Object.keys(SPACE_ENVIRONMENT), ...BASE_IMAGE_ENVIRONMENT_NAMES]);
+// A space container may also carry OpenCode's start configuration in OPENCODE_CONFIG_CONTENT: the
+// window addresses of the custom providers given at creation and the placeholder key, nothing
+// else, which the checker reads whole.
+const SPACE_ENVIRONMENT_NAMES = new Set([...Object.keys(SPACE_ENVIRONMENT), ...BASE_IMAGE_ENVIRONMENT_NAMES, START_CONFIG_VARIABLE]);
 const GATEKEEPER_ENVIRONMENT_NAMES = new Set([...Object.keys(GATEKEEPER_ENVIRONMENT), ...BASE_IMAGE_ENVIRONMENT_NAMES]);
 
 // Container output lands in a file on the Docker host. One 10 MB file, no rotation copies.
@@ -69,6 +73,13 @@ const LOG_ARGS = ['--log-driver', LOG_DRIVER, '--log-opt', `max-size=${LOG_MAX_S
 // cannot reach services that listen on the host. Docker Engine 28 and newer.
 const GATEWAY_MODE_OPTION = 'com.docker.network.bridge.gateway_mode_ipv4';
 const GATEWAY_MODE = 'isolated';
+
+// The name under which the gatekeeper reaches the machine Docker runs on, for a model grant whose
+// provider listens on that machine's loopback (see "Grants" in DOCUMENTATION.md). Docker Desktop
+// and Colima resolve the name on their own; on a Linux daemon `host-gateway` gives it the
+// address of the host's bridge. The space never gets it: its network has no way to the host.
+export const HOST_NAME = 'host.docker.internal';
+const HOST_NAME_ENTRY = `${HOST_NAME}:host-gateway`;
 
 const NO_NEW_PRIVILEGES = ['no-new-privileges', 'no-new-privileges:true'];
 // What a correct container reports: '' for pid, uts and userns, 'private' for ipc and cgroupns.
@@ -143,6 +154,7 @@ export function buildGatekeeperCreateArgs({ containerName, labelArguments, netwo
     ...LOG_ARGS,
     '--network', network,
     '--network-alias', GATEKEEPER_ALIAS,
+    '--add-host', HOST_NAME_ENTRY,
     ...Object.entries(GATEKEEPER_ENVIRONMENT).flatMap(([name, value]) => ['--env', `${name}=${value}`]),
     image,
     ...GATEKEEPER_COMMAND,
@@ -153,7 +165,10 @@ export function buildGatekeeperCreateArgs({ containerName, labelArguments, netwo
  * The full `docker create` argv for a space container. Every restriction here has
  * a matching check in findHardeningViolations.
  */
-export function buildSpaceCreateArgs({ spaceId, containerName, labelArguments, network, workVolume, homeVolume, toolsVolume, memoryBytes, image }) {
+/**
+ * `startConfig` is OpenCode's start configuration from `buildStartConfig`, or null for none.
+ */
+export function buildSpaceCreateArgs({ spaceId, containerName, labelArguments, network, workVolume, homeVolume, toolsVolume, memoryBytes, image, startConfig = null }) {
   return [
     'create',
     '--name', containerName,
@@ -176,6 +191,7 @@ export function buildSpaceCreateArgs({ spaceId, containerName, labelArguments, n
     ...volumeMount(homeVolume, SPACE_HOME),
     ...readOnlyVolumeMount(toolsVolume, TOOLS_MOUNT_PATH),
     ...Object.entries(SPACE_ENVIRONMENT).flatMap(([name, value]) => ['--env', `${name}=${value}`]),
+    ...(startConfig === null ? [] : ['--env', `${START_CONFIG_VARIABLE}=${startConfig}`]),
     image,
     ...SPACE_SERVER_COMMAND,
   ];
@@ -276,13 +292,17 @@ const mentionsRuntimeSocket = (text) => String(text ?? '').includes('docker.sock
  * the tmpfs, the network the container must run on, and which mounts it may have, which
  * `mountViolations(mounts)` answers.
  */
-function findCommonViolations({ container, tmpfsOptions, networkMode, mountViolations, allowedEnvironment }) {
+function findCommonViolations({ container, tmpfsOptions, networkMode, mountViolations, allowedEnvironment, allowedExtraHosts = [] }) {
   const violations = [];
   const violate = (check, message) => violations.push({ check, message });
 
   const config = container?.Config ?? {};
   const host = container?.HostConfig ?? {};
   const mounts = container?.Mounts ?? [];
+
+  // An extra name is an address the container is told about; only the ones a container is created with pass.
+  const unexpectedHosts = (host.ExtraHosts ?? []).filter((entry) => !allowedExtraHosts.includes(entry));
+  if (unexpectedHosts.length > 0) violate('extra_hosts', `The container was given names nobody set for it: ${unexpectedHosts.join(', ')}`);
 
   const variableNames = (config.Env ?? []).map((entry) => String(entry).split('=')[0]);
   const secretVariables = variableNames.filter((name) => FORBIDDEN_ENVIRONMENT.includes(name));
@@ -392,6 +412,12 @@ export function findHardeningViolations({ spaceId, owner, container, network, to
   });
   const violate = (check, message) => violations.push({ check, message });
 
+  // OpenCode takes this variable as configuration, so it passes only as the host writes it, once.
+  const startConfigs = (container?.Config?.Env ?? []).filter((entry) => String(entry).startsWith(`${START_CONFIG_VARIABLE}=`));
+  if (startConfigs.length > 1 || startConfigs.some((entry) => !isStartConfig(String(entry).slice(START_CONFIG_VARIABLE.length + 1)))) {
+    violate('environment', `${START_CONFIG_VARIABLE} holds more than the providers' window addresses`);
+  }
+
   // The space stays on one network, its inner one. The gatekeeper is the other member of it.
   const attached = Object.keys(container?.NetworkSettings?.Networks ?? {});
   if (attached.length !== 1 || attached[0] !== networkName) {
@@ -443,6 +469,7 @@ export function findGatekeeperHardeningViolations({ spaceId, owner, container, o
       message: `The gatekeeper has ${mounts.length} mount(s) and must have none: ${mounts.map((mount) => mount.Destination).join(', ')}`,
     }]),
     allowedEnvironment: GATEKEEPER_ENVIRONMENT_NAMES,
+    allowedExtraHosts: [HOST_NAME_ENTRY],
   });
   const violate = (check, message) => violations.push({ check, message });
 

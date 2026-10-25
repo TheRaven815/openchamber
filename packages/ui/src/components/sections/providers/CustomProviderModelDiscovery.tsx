@@ -76,7 +76,7 @@ export const CustomProviderModelDiscovery: React.FC<Props> = ({ models, existing
         <div className="relative">
           <Icon
             name="search"
-            className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
+            className="pointer-events-none absolute inset-s-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
             aria-hidden
           />
           <Input
@@ -91,13 +91,13 @@ export const CustomProviderModelDiscovery: React.FC<Props> = ({ models, existing
             }}
             placeholder={t('settings.agents.modelSelector.searchPlaceholder')}
             aria-label={t('settings.agents.modelSelector.searchPlaceholder')}
-            className="h-8 rounded-md pl-8"
+            className="h-8 rounded-md ps-8"
           />
         </div>
       ) : null}
 
       <ScrollableOverlay
-        outerClassName="max-h-[min(18rem,45dvh)] rounded-md border border-border/60"
+        outerClassName="oc-tile-inset max-h-[min(18rem,45dvh)] rounded-md"
         className="px-2 py-1"
         disableHorizontal
         preventOverscroll

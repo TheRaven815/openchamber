@@ -2,25 +2,13 @@ import React from 'react';
 import { Button } from '@/components/ui/button';
 import { Icon } from "@/components/icon/Icon";
 import { useI18n } from '@/lib/i18n';
+import { sanitizeBranchNameInput } from './branchName';
 
 interface WorktreeBranchDisplayProps {
   currentBranch: string | null | undefined;
   onRename?: (oldName: string, newName: string) => Promise<void>;
   showEditButton?: boolean;
 }
-
-const sanitizeBranchNameInput = (value: string): string => {
-  return value
-    .trim()
-    .replace(/\s+/g, '-')
-    .replace(/[^A-Za-z0-9._/-]/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/\/{2,}/g, '/')
-    .replace(/\/-+/g, '/')
-    .replace(/-+\//g, '/')
-    .replace(/^[-/]+/, '')
-    .replace(/[-/]+$/, '');
-};
 
 export const WorktreeBranchDisplay: React.FC<WorktreeBranchDisplayProps> = ({
   currentBranch,
@@ -42,9 +30,10 @@ export const WorktreeBranchDisplay: React.FC<WorktreeBranchDisplayProps> = ({
   };
 
   const handleSaveEdit = async () => {
-    if (!currentBranch || !onRename || !editBranchName.trim()) return;
+    if (!currentBranch || !onRename) return;
     
     const sanitizedName = sanitizeBranchNameInput(editBranchName);
+    if (!sanitizedName) return;
     if (sanitizedName === currentBranch) {
       setIsEditing(false);
       return;
@@ -78,7 +67,7 @@ export const WorktreeBranchDisplay: React.FC<WorktreeBranchDisplayProps> = ({
 
   if (isEditing) {
     return (
-      <div className="flex items-center gap-2 rounded-md bg-primary/12 px-2 py-1 h-8">
+      <div className="flex items-center gap-2 rounded-md bg-primary/12 px-2 py-1 h-7">
         <form
           className="flex w-full items-center gap-2"
           onSubmit={(e) => {
@@ -98,7 +87,7 @@ export const WorktreeBranchDisplay: React.FC<WorktreeBranchDisplayProps> = ({
           />
           <button
             type="submit"
-            disabled={isRenaming}
+            disabled={isRenaming || !sanitizeBranchNameInput(editBranchName)}
             aria-label={isRenaming ? t('gitView.branch.renameSaving') : t('gitView.branch.renameSave')}
             title={isRenaming ? t('gitView.branch.renameSaving') : t('gitView.branch.renameSave')}
             className="shrink-0 text-muted-foreground hover:text-foreground disabled:opacity-50"
@@ -125,7 +114,7 @@ export const WorktreeBranchDisplay: React.FC<WorktreeBranchDisplayProps> = ({
   }
 
   return (
-    <div className="flex w-full min-w-0 items-center gap-1.5 px-2 py-1 h-8">
+    <div className="flex w-full min-w-0 items-center gap-1.5 px-2 py-1 h-7">
       <Icon name="git-branch" className="size-4 text-primary shrink-0" />
       <div className="inline-flex min-w-0 max-w-full items-center gap-1">
         <span className="truncate typography-ui-label font-normal text-foreground">

@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import simpleGit from 'simple-git';
 import { createSerialRefresh } from './serial-refresh.js';
 import { stripAppImageLauncherEnv } from '../inherited-env.js';
@@ -10,8 +11,10 @@ import { createRequire } from 'module';
 import crypto from 'node:crypto';
 import { fingerprintRemoteUrl } from '../source-control/url-redaction.js';
 import { readWorktreeDirectorySetting } from '../opencode/shared.js';
+import { readProjectStartCommand } from '../opencode/project-start-command.js';
 import { normalizeGitOutputPath } from './output-path.js';
-import { unsupportedRepositoryRootReason } from './repository-root.js';
+import { overlayEnvironment } from '../environment/variables.js';
+import { primaryWorktreeRootFromGitDir, unsupportedRepositoryRootReason } from './repository-root.js';
 import { randomUUID } from 'crypto';
 
 const fsp = fs.promises;
@@ -373,10 +376,49 @@ const resolveSshAuthSock = async () => {
   return null;
 };
 
-const buildGitEnv = async () => {
+// Variables the user gave OpenChamber for the directory's project
+// (lib/environment). Unset in tests and tools that use this module alone.
+let gitEnvironment = null;
+
+export const configureGitEnvironment = (runtime) => {
+  gitEnvironment = runtime;
+};
+
+// Names simple-git refuses in a command's environment unless the matching
+// unsafe option is on (EDITOR, PAGER, GIT_SSH_COMMAND, GIT_ASKPASS, ...; see
+// toSimpleGitEnv). One of them from a project environment would make every
+// Git command fail, so the overlay leaves them out for Git only.
+const SIMPLE_GIT_REFUSED_ENV_NAMES = new Set([
+  'editor', 'git_askpass', 'git_config', 'git_config_global', 'git_config_system', 'git_config_count',
+  'git_editor', 'git_exec_path', 'git_external_diff', 'git_pager', 'git_proxy_command', 'git_template_dir',
+  'git_sequence_editor', 'git_ssh', 'git_ssh_command', 'pager', 'prefix', 'ssh_askpass',
+]);
+const isRefusedBySimpleGit = (name) => {
+  const lower = name.toLowerCase();
+  return SIMPLE_GIT_REFUSED_ENV_NAMES.has(lower) || lower.startsWith('git_config_key_') || lower.startsWith('git_config_value_');
+};
+// OpenChamber names the repository each command works on; a project variable
+// must not quietly point Git at another one.
+const REPOSITORY_LOCATION_ENV_NAMES = new Set([
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_COMMON_DIR', 'GIT_NAMESPACE',
+]);
+const isKeptOutOfGitOverlay = (name) => isRefusedBySimpleGit(name) || REPOSITORY_LOCATION_ENV_NAMES.has(name.toUpperCase());
+
+const directoryEnvironmentForGit = async (directory) => {
+  if (!gitEnvironment || !directory) return null;
+  const variables = await gitEnvironment.forDirectory(normalizeDirectoryPath(directory));
+  if (!variables) return null;
+  return Object.fromEntries(Object.entries(variables).filter(([name]) => !isKeptOutOfGitOverlay(name)));
+};
+
+const buildGitEnv = async (directory) => {
   // Git runs the user's hooks, so they must not see what the AppImage launcher
   // added to LD_LIBRARY_PATH and friends (#4177).
-  const env = stripAppImageLauncherEnv({ ...process.env });
+  const inherited = stripAppImageLauncherEnv({ ...process.env });
+  // Hooks and credential helpers run with the project's tools on PATH.
+  const variables = await directoryEnvironmentForGit(directory);
+  const env = variables ? overlayEnvironment(inherited, variables) : inherited;
   if (process.platform === 'win32') {
     // Node already passes an argument array. MSYS globbing corrupts Git refs
     // such as HEAD^{commit} and branch@{upstream} before Git sees them.
@@ -391,7 +433,7 @@ const buildGitEnv = async () => {
   // The server has no terminal a user could answer. Without this, Git asks
   // for a username or password on its (hidden, on Windows) console and waits
   // forever; credential helpers and GUI prompts still run before this point.
-  if (env.GIT_TERMINAL_PROMPT === undefined) {
+  if (env.GIT_TERMINAL_PROMPT === undefined || variables?.GIT_TERMINAL_PROMPT !== undefined) {
     env.GIT_TERMINAL_PROMPT = '0';
   }
   return env;
@@ -421,8 +463,15 @@ const toSimpleGitEnv = (env) => {
 // Transport configuration is owned by repository bindings and the credential
 // broker, so no caller needs simple-git's unsafe SSH-command or
 // credential-helper escapes any more.
-const createGit = async (directory, { stallTimeoutMs = 0 } = {}) => {
-  const env = await buildGitEnv();
+const createGit = async (directory, { stallTimeoutMs = 0, optionalLocks = true } = {}) => {
+  const env = await buildGitEnv(directory);
+  // `git status` holds `.git/index.lock` while it refreshes the index, and a
+  // `git commit` the user runs in a terminal at that moment fails with
+  // "index.lock: File exists" (#2229). Read-only callers opt out of that
+  // refresh; commands that write the index still take the lock.
+  if (!optionalLocks) {
+    env.GIT_OPTIONAL_LOCKS = '0';
+  }
   const spawnOptions = { windowsHide: true };
   // simple-git's block timeout kills the process once it has produced no
   // output for this long. Opt-in per caller: a background read must never hold
@@ -544,13 +593,16 @@ const isInsideOrSameDirectory = (root, target) => {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 };
 
-const resolveGitRepositoryRoot = async (directoryPath, git) => {
-  const topLevel = await git.raw(['rev-parse', '--show-toplevel']);
+const toRepositoryRoot = (directoryPath, topLevel) => {
   const normalizedTopLevel = normalizeGitOutputPath(topLevel.trim());
   return path.isAbsolute(normalizedTopLevel)
     ? path.resolve(normalizedTopLevel)
     : path.resolve(directoryPath, normalizedTopLevel);
 };
+
+const resolveGitRepositoryRoot = async (directoryPath, git) => (
+  toRepositoryRoot(directoryPath, await git.raw(['rev-parse', '--show-toplevel']))
+);
 
 const createRepositoryGitContext = async (directory, gitOptions = {}) => {
   const directoryPath = normalizeDirectoryPath(directory);
@@ -838,6 +890,14 @@ const parseWorktreePorcelain = (raw) => {
       continue;
     }
 
+    // A bare repository lists itself as a worktree with a `bare` attribute
+    // and no HEAD or branch; without a working tree it is not a checkout a
+    // session can run in.
+    if (line === 'bare') {
+      current.bare = true;
+      continue;
+    }
+
     // git marks a worktree whose directory is gone (deleted outside git) as
     // prunable; it stays registered until `git worktree prune`. The sidebar
     // needs that distinction: the directory is missing, but the sessions that
@@ -1107,7 +1167,7 @@ const runGitCommand = async (cwd, args, { env: envOverride, timeoutMs = 0 } = {}
   try {
     const { stdout, stderr } = await execFileAsync(getGitBinary(), args, {
       cwd,
-      env: envOverride || await buildGitEnv(),
+      env: envOverride || await buildGitEnv(cwd),
       windowsHide: true,
       maxBuffer: 20 * 1024 * 1024,
       // Only short probes pass a timeout; commands that legitimately run long
@@ -1149,8 +1209,11 @@ const resolveGitCommitFilePath = async (repoRoot, hash, candidates) => {
 // simple-git 3.36 refuses GIT_EDITOR unless allowUnsafeEditor is enabled, and
 // once an instance has an explicit env it also rejects inherited PAGER or
 // GIT_ASKPASS values. Run editor-free continuation commands directly instead.
+// The full git environment must survive the override: git execs the no-op
+// editor through PATH, and an env of only GIT_EDITOR makes that spawn search
+// the execvp fallback (/bin:/usr/bin), where NixOS has no `true`.
 const runGitCommandWithoutEditor = async (cwd, args) => {
-  const result = await runGitCommand(cwd, args, { env: { GIT_EDITOR: 'true' } });
+  const result = await runGitCommand(cwd, args, { env: { ...(await buildGitEnv(cwd)), GIT_EDITOR: 'true' } });
   if (!result.success) {
     throw new Error(result.message || 'Git command failed');
   }
@@ -1212,7 +1275,7 @@ const WORKTREE_POPULATE_CONFIG_ARGS = [
 
 const buildWorktreePopulateCommand = async (directory) => {
   const env = {
-    ...(await buildGitEnv()),
+    ...(await buildGitEnv(directory)),
     GIT_ALLOW_PROTOCOL: '',
     GIT_LFS_SKIP_SMUDGE: '1',
     GIT_NO_LAZY_FETCH: '1',
@@ -1350,7 +1413,7 @@ export const inspectContributorCheckoutActions = async (directory, provenance) =
   const head = String((await runGitCommandOrThrow(directory, ['rev-parse', 'HEAD'], 'Failed to inspect worktree HEAD')).stdout || '').trim().toLowerCase();
   if (head !== provenance.sourceSha) throw Object.assign(new Error('Contributor worktree HEAD changed'), { code: 'STALE_CONFIG', status: 409 });
   const hook = await inspectPostCheckoutHook(directory);
-  const projectCommand = await loadProjectStartCommand(provenance.projectId);
+  const projectCommand = await readProjectStartCommand((await resolvePrimaryWorktreeRoot(directory)).root);
   const setupCommand = String(provenance.setupCommand || '').trim();
   const actions = [];
   if (hook) actions.push(hook);
@@ -1368,19 +1431,7 @@ export const inspectContributorCheckoutActions = async (directory, provenance) =
   return Object.freeze({ state: 'awaiting-trust', actions: Object.freeze(actions), digest });
 };
 
-const derivePrimaryWorktreeRootFromGitDir = (gitDir) => {
-  const normalized = normalizePath(gitDir);
-  if (!normalized) return null;
-  if (normalized.endsWith('/.git')) {
-    return normalized.slice(0, -'/.git'.length) || null;
-  }
-  const marker = '/.git/worktrees/';
-  const markerIndex = normalized.indexOf(marker);
-  if (markerIndex > 0) {
-    return normalized.slice(0, markerIndex) || null;
-  }
-  return null;
-};
+const derivePrimaryWorktreeRootFromGitDir = (gitDir) => primaryWorktreeRootFromGitDir(normalizePath(gitDir));
 
 export async function resolvePrimaryWorktreeRoot(directory) {
   const result = await runGitCommand(directory, ['rev-parse', '--absolute-git-dir', '--git-common-dir']);
@@ -1437,12 +1488,15 @@ export async function resolveRepositoryGitPaths(directory) {
  * `git remote get-url [--push]` reports them: the first URL of several, and a
  * remote with no URL read as a URL equal to its name, as Git does. Lines may
  * end in CRLF (Git for Windows); a kept `\r` would match no line and read
- * every remote as URL-less.
+ * every remote as URL-less. Anything after the URL-kind marker — Git 2.54+
+ * appends the partial-clone filter there as `[blob:none]` — is decoration
+ * about the remote, never part of the URL, and is ignored whether or not its
+ * shape is recognized.
  */
 export function parseRemoteListing(names, listing) {
   const urls = new Map();
   for (const line of String(listing || '').split(/\r?\n/)) {
-    const match = line.match(/^([^\t]+)\t(.*) \((fetch|push)\)$/);
+    const match = line.match(/^([^\t]+)\t(.*) \((fetch|push)\)/);
     if (!match) continue;
     const entry = urls.get(match[1]) ?? {};
     if (entry[match[3]] === undefined) entry[match[3]] = match[2];
@@ -1482,14 +1536,20 @@ export async function getRepositoryRemoteUrls(directory) {
 }
 
 export async function resolveWorktreeTopLevel(directory) {
-  const result = await runGitCommand(directory, ['rev-parse', '--show-toplevel']);
+  const result = await runGitCommand(directory, ['rev-parse', '--show-toplevel', '--show-prefix']);
   if (!result.success) {
+    // No `prefix`: a failed read must not look like "at the repository root".
     return { root: directory };
   }
-  const root = normalizePath(normalizeGitOutputPath(String(result.stdout || '').trim()));
-  return { root: root || directory };
+  // Two lines: the checkout root, then where `directory` sits inside it
+  // ("ai/", or an empty line at the root). Git resolves symlinks for both, so
+  // the prefix stays right for a directory reached through one.
+  const [rootLine = '', prefixLine = ''] = String(result.stdout || '').split('\n');
+  const root = normalizePath(normalizeGitOutputPath(rootLine.trim()));
+  return { root: root || directory, prefix: prefixLine.trim().replace(/\/+$/, '') };
 }
 
+/** @public */
 export async function getCommitSummaries(directory, shas) {
   const commits = Array.isArray(shas)
     ? shas.map((sha) => String(sha || '').trim()).filter(Boolean)
@@ -1601,6 +1661,7 @@ const ensureLocalIntegrateBranch = async (repoRoot, candidate) => {
   return raw;
 };
 
+/** @public */
 export async function computeIntegratePlan(input = {}) {
   const repoRoot = normalizeIntegratePath(input.repoRoot, 'repoRoot');
   const sourceBranch = normalizeIntegrateBranch(input.sourceBranch, 'sourceBranch');
@@ -1654,14 +1715,15 @@ const maybeFastForwardIntegrateUpstream = async (tmpDir) => {
   }
 };
 
+/** @public */
 export async function getIntegrateConflictDetails(tmpDir) {
   const target = normalizeIntegratePath(tmpDir, 'tempWorktreePath');
   const [status, unmerged, diff, meta, patch] = await Promise.all([
     runGitCommand(target, ['status', '--porcelain']),
     runGitCommand(target, ['diff', '--name-only', '--diff-filter=U']),
-    runGitCommand(target, ['diff']),
+    runGitCommand(target, ['diff', '--no-ext-diff']),
     runGitCommand(target, ['show', '--no-patch', '--pretty=fuller', 'CHERRY_PICK_HEAD']),
-    runGitCommand(target, ['show', 'CHERRY_PICK_HEAD']),
+    runGitCommand(target, ['show', '--no-ext-diff', 'CHERRY_PICK_HEAD']),
   ]);
 
   return {
@@ -1673,6 +1735,7 @@ export async function getIntegrateConflictDetails(tmpDir) {
   };
 }
 
+/** @public */
 export async function isCherryPickInProgress(tmpDir) {
   const target = normalizeIntegratePath(tmpDir, 'tempWorktreePath');
   const head = await runGitCommand(target, ['rev-parse', '--verify', '--quiet', 'CHERRY_PICK_HEAD']);
@@ -1724,6 +1787,7 @@ const normalizeIntegrateState = (state = {}) => ({
   currentCommit: normalizeIntegrateSha(state.currentCommit),
 });
 
+/** @public */
 export async function integrateWorktreeCommits(inputPlan = {}) {
   const plan = await normalizeIntegratePlan(inputPlan);
   if (plan.commits.length === 0) {
@@ -1787,6 +1851,7 @@ export async function integrateWorktreeCommits(inputPlan = {}) {
   }
 }
 
+/** @public */
 export async function abortIntegrate(stateInput = {}) {
   const state = normalizeIntegrateState(stateInput);
   await runGitCommand(state.tempWorktreePath, ['cherry-pick', '--abort']).catch(() => undefined);
@@ -1794,6 +1859,7 @@ export async function abortIntegrate(stateInput = {}) {
   return { success: true };
 }
 
+/** @public */
 export async function continueIntegrate(stateInput = {}) {
   const state = normalizeIntegrateState(stateInput);
   const cont = await runGitCommand(state.tempWorktreePath, ['cherry-pick', '--continue']);
@@ -1878,12 +1944,13 @@ const resolveWorktreeProjectContext = async (directory, options = {}) => {
     throw new Error('Directory is required');
   }
 
-  const topResult = await runGitCommandOrThrow(
-    directoryPath,
-    ['rev-parse', '--show-toplevel'],
-    'Failed to resolve git top-level directory'
-  );
-  const sandbox = path.resolve(directoryPath, normalizeGitOutputPath(topResult.stdout.trim()));
+  const topResult = await runGitCommand(directoryPath, ['rev-parse', '--show-toplevel']);
+  // A bare repository has no work tree, so `--show-toplevel` fails there; the
+  // bare directory itself still answers the object-level commands worktree
+  // creation runs against it.
+  const sandbox = topResult.success
+    ? path.resolve(directoryPath, normalizeGitOutputPath(topResult.stdout.trim()))
+    : directoryPath;
 
   const commonResult = await runGitCommandOrThrow(
     sandbox,
@@ -1891,7 +1958,10 @@ const resolveWorktreeProjectContext = async (directory, options = {}) => {
     'Failed to resolve git common directory'
   );
   const commonDir = path.resolve(sandbox, normalizeGitOutputPath(commonResult.stdout.trim()));
-  const primaryWorktree = path.dirname(commonDir);
+  // `<root>/.git` resolves to the primary checkout; any other layout (a bare
+  // repository, a separate git dir) has no primary worktree, and the sandbox
+  // directory is the closest thing to one.
+  const primaryWorktree = derivePrimaryWorktreeRootFromGitDir(commonDir) || sandbox;
   const projectID = await ensureOpenCodeProjectId(primaryWorktree);
   // OpenCode's `worktree.directory` is read from the canonical checkout so a
   // linked worktree still sees the project's saved configuration. When unset,
@@ -1917,6 +1987,7 @@ const resolveWorktreeProjectContext = async (directory, options = {}) => {
 
   return {
     projectID,
+    requestedDirectory: directoryPath,
     sandbox,
     primaryWorktree,
     worktreeRoot,
@@ -1995,9 +2066,9 @@ const resolveBranchForExistingMode = async (primaryWorktree, existingBranch, pre
     throw new Error(`Branch not found: ${requested}`);
   }
 
-  const remoteExists = await runGitCommand(primaryWorktree, ['show-ref', '--verify', '--quiet', remoteRef.fullRef]);
-  if (!remoteExists.success) {
-    throw new Error(`Remote branch is not available locally: ${requested}. Fetch it explicitly and retry.`);
+  const remoteCheck = await ensureLocalRemoteBranchRef(primaryWorktree, remoteRef.remote, remoteRef.branch);
+  if (!remoteCheck.found) {
+    throw new Error(`Remote branch not found: ${requested}`);
   }
 
   const localBranch = cleanBranchName(preferredBranchName || remoteRef.branch || requested);
@@ -2036,7 +2107,7 @@ const runWorktreeStartCommand = async (directory, command) => {
   if (process.platform === 'win32') {
     const result = await execFileAsync('cmd', ['/c', text], {
       cwd: directory,
-      env: await buildGitEnv(),
+      env: await buildGitEnv(directory),
       windowsHide: true,
       maxBuffer: 20 * 1024 * 1024,
     }).then(({ stdout, stderr }) => ({ success: true, stdout, stderr })).catch((error) => ({
@@ -2050,7 +2121,7 @@ const runWorktreeStartCommand = async (directory, command) => {
 
   const result = await execFileAsync('bash', ['-lc', text], {
     cwd: directory,
-    env: await buildGitEnv(),
+    env: await buildGitEnv(directory),
     maxBuffer: 20 * 1024 * 1024,
   }).then(({ stdout, stderr }) => ({ success: true, stdout, stderr })).catch((error) => ({
     success: false,
@@ -2059,18 +2130,6 @@ const runWorktreeStartCommand = async (directory, command) => {
     message: parseGitErrorText(error),
   }));
   return result;
-};
-
-const loadProjectStartCommand = async (projectID) => {
-  const storagePath = path.join(getOpenCodeDataPath(), 'storage', 'project', `${projectID}.json`);
-  try {
-    const raw = await fsp.readFile(storagePath, 'utf8');
-    const parsed = JSON.parse(raw);
-    const start = typeof parsed?.commands?.start === 'string' ? parsed.commands.start.trim() : '';
-    return start || '';
-  } catch {
-    return '';
-  }
 };
 
 // OpenCode owns its own project/sandbox registry. It records a worktree as a
@@ -2112,8 +2171,10 @@ const cleanupFailedFastWorktreeCreate = async (context, candidate) => {
   }
 };
 
-const runWorktreeStartScripts = async (directory, projectID, startCommand) => {
-  const projectStart = await loadProjectStartCommand(projectID);
+// `projectDirectory` is the directory the worktree was requested from: the user
+// already works there, so OpenCode answers without starting another location.
+const runWorktreeStartScripts = async (directory, projectDirectory, startCommand) => {
+  const projectStart = await readProjectStartCommand(projectDirectory);
   if (projectStart) {
     const projectResult = await runWorktreeStartCommand(directory, projectStart);
     if (!projectResult.success) {
@@ -2135,7 +2196,7 @@ const runWorktreeStartScripts = async (directory, projectID, startCommand) => {
 const queueWorktreeBootstrap = (args) => {
   const {
     directory,
-    projectID,
+    projectDirectory,
     primaryWorktree,
     localBranch,
     setUpstream,
@@ -2190,7 +2251,7 @@ const queueWorktreeBootstrap = (args) => {
         bootstrapStore,
       );
       if (!contributorFork) {
-        await runWorktreeStartScripts(directory, projectID, startCommand).catch((error) => {
+        await runWorktreeStartScripts(directory, projectDirectory, startCommand).catch((error) => {
           console.warn('Worktree start script task failed:', error instanceof Error ? error.message : String(error));
         });
       }
@@ -2394,6 +2455,16 @@ const resolveExistingWorktreeSource = async (primaryWorktree, input = {}, intent
   };
 };
 
+// The branch list offers remote branches that were never fetched (it asks
+// each remote with `ls-remote`), so a worktree from one of them fetches that
+// single branch first. A failed fetch reports the branch as missing.
+const ensureLocalRemoteBranchRef = async (primaryWorktree, remoteName, branchName) => {
+  const localCheck = await checkLocalRemoteBranchExists(primaryWorktree, remoteName, branchName);
+  if (localCheck.found || !localCheck.success) return localCheck;
+  await fetchRemoteBranchRef(primaryWorktree, remoteName, branchName).catch(() => undefined);
+  return checkLocalRemoteBranchExists(primaryWorktree, remoteName, branchName);
+};
+
 const checkLocalRemoteBranchExists = async (primaryWorktree, remoteName, branchName) => {
   const remote = String(remoteName || '').trim();
   const branch = String(branchName || '').trim();
@@ -2453,27 +2524,36 @@ const applyUpstreamConfiguration = async (args) => {
 
 const warnedUnsupportedRoots = new Set();
 
-export async function isGitRepository(directory) {
-  const directoryPath = normalizeDirectoryPath(directory);
+// Whether `directoryPath` is in a supported repository, and where its working
+// tree starts. One process answers both: in the desktop app every Git process
+// is forked from the Electron main process, and a status read asks this first.
+// `repoRoot` is null inside a bare repository or a .git directory, where Git
+// prints the git dir and then fails on `--show-toplevel`; those still count
+// as repositories.
+const probeRepository = async (directoryPath) => {
+  const notRepository = { isRepository: false, repoRoot: null };
   if (!directoryPath || !fs.existsSync(directoryPath)) {
-    return false;
+    return notRepository;
   }
 
-  const result = await runGitCommand(directoryPath, ['rev-parse', '--git-dir'], { timeoutMs: GIT_PROBE_TIMEOUT_MS });
-  if (!result.success) return false;
+  const result = await runGitCommand(directoryPath, ['rev-parse', '--git-dir', '--show-toplevel'], { timeoutMs: GIT_PROBE_TIMEOUT_MS });
+  const [gitDir = '', topLevel = ''] = result.stdout.split(/\r?\n/).map((line) => line.trim());
+  if (!gitDir) return notRepository;
+  if (!result.success) return { isRepository: true, repoRoot: null };
 
-  // `--show-toplevel` has no answer inside a bare repository or a .git
-  // directory; those keep the previous answer rather than being rejected.
-  const topLevel = await runGitCommand(directoryPath, ['rev-parse', '--show-toplevel'], { timeoutMs: GIT_PROBE_TIMEOUT_MS });
-  if (!topLevel.success) return true;
-  const repoRoot = topLevel.stdout.trim();
-  const reason = unsupportedRepositoryRootReason(repoRoot);
-  if (!reason) return true;
-  if (!warnedUnsupportedRoots.has(repoRoot)) {
-    warnedUnsupportedRoots.add(repoRoot);
-    console.warn(`[git] Ignoring repository rooted at ${repoRoot} (${reason}): Git features are disabled for ${directoryPath}`);
+  const reason = unsupportedRepositoryRootReason(topLevel);
+  if (!reason) {
+    return { isRepository: true, repoRoot: topLevel ? toRepositoryRoot(directoryPath, topLevel) : null };
   }
-  return false;
+  if (!warnedUnsupportedRoots.has(topLevel)) {
+    warnedUnsupportedRoots.add(topLevel);
+    console.warn(`[git] Ignoring repository rooted at ${topLevel} (${reason}): Git features are disabled for ${directoryPath}`);
+  }
+  return notRepository;
+};
+
+export async function isGitRepository(directory) {
+  return (await probeRepository(normalizeDirectoryPath(directory))).isRepository;
 }
 
 export async function getGlobalIdentity() {
@@ -2709,7 +2789,7 @@ const killProcessTree = (child) => {
 // huge directory is never listed in full. `paths` is complete when
 // `truncated` is false.
 const listUntrackedFilesBounded = async (repoRoot, dirPath, limit) => {
-  const env = await buildGitEnv();
+  const env = await buildGitEnv(repoRoot);
   return new Promise((resolve, reject) => {
     const child = spawn(getGitBinary(), ['ls-files', '--others', '--exclude-standard', '-z', '--', dirPath], {
       cwd: repoRoot,
@@ -2853,6 +2933,34 @@ export async function getTrackingBranch(directory) {
   return tracking || null;
 }
 
+/**
+ * Short name of the checked-out branch, or '' when HEAD is detached or the
+ * directory is not a repository. Other failures throw. Reads one ref on every
+ * message a session sends.
+ */
+export async function getCheckedOutBranch(directory) {
+  const normalizedDirectory = normalizeDirectoryPath(directory);
+  if (!normalizedDirectory) {
+    throw new Error('directory is required to read the checked-out branch');
+  }
+  const head = await runGitCommand(normalizedDirectory, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+  if (head.success) return head.stdout.trim();
+  if ((head.exitCode === 1 && !head.stderr.trim()) || isNotGitRepositoryError(head.message)) return '';
+  throw new Error(head.message || 'Failed to read the checked-out branch');
+}
+
+/** Paths with no uncommitted change, including paths git cannot resolve. */
+export async function getPathsWithoutChanges(directory, paths) {
+  const unchanged = [];
+  for (const filePath of paths) {
+    const status = await runGitCommand(directory, [
+      '--literal-pathspecs', 'status', '--porcelain', '--untracked-files=all', '--', filePath,
+    ]);
+    if (!status.success || !status.stdout.trim()) unchanged.push(filePath);
+  }
+  return unchanged;
+}
+
 // Whether `sha` is reachable from the checked-out HEAD. An object git has never
 // fetched fails the same way an unrelated commit does: not an ancestor.
 export async function isAncestorOfHead(directory, sha) {
@@ -2865,35 +2973,74 @@ export async function isAncestorOfHead(directory, sha) {
   return result.success;
 }
 
+const PATCH_EQUIVALENCE_TIMEOUT_MS = 5_000;
+
+// Whether a commit has an equivalent patch reachable from the checked-out HEAD.
+// Missing objects and ambiguous prefixes cannot prove it.
+export async function isPatchEquivalentOfHead(directory, sha) {
+  const normalizedDirectory = normalizeDirectoryPath(directory);
+  const normalizedSha = String(sha ?? '').trim();
+  if (!normalizedDirectory || !/^[0-9a-f]{7,64}$/i.test(normalizedSha)) {
+    return false;
+  }
+
+  const cherry = await runGitCommand(
+    normalizedDirectory,
+    ['cherry', 'HEAD', normalizedSha, `${normalizedSha}^`],
+    { timeoutMs: PATCH_EQUIVALENCE_TIMEOUT_MS },
+  );
+  if (!cherry.success) {
+    return false;
+  }
+
+  const expectedPrefix = normalizedSha.toLowerCase();
+  return cherry.stdout.split(/\r?\n/).some((line) => {
+    const match = line.match(/^-\s+([0-9a-f]{40,64})$/i);
+    return Boolean(match?.[1]) && match[1].toLowerCase().startsWith(expectedPrefix);
+  });
+}
+
 async function readStatus(normalizedDirectory, lightMode) {
   try {
     // Prefer an explicit non-repo check before simple-git status so a missing
     // repository never depends on process.cwd() or an opaque GitError shape.
-    if (!(await isGitRepository(normalizedDirectory))) {
+    // The same probe names the repository root, so the read does not ask again.
+    const repository = await probeRepository(normalizedDirectory);
+    if (!repository.isRepository) {
       throw new Error('fatal: not a git repository (or any of the parent directories): .git');
     }
 
-    const { directoryPath, repoRoot, git } = await createRepositoryGitContext(normalizedDirectory, {
-      stallTimeoutMs: GIT_STATUS_STALL_TIMEOUT_MS,
-    });
+    const gitOptions = { stallTimeoutMs: GIT_STATUS_STALL_TIMEOUT_MS, optionalLocks: false };
+    const { directoryPath, repoRoot, git } = repository.repoRoot
+      ? { directoryPath: normalizedDirectory, repoRoot: repository.repoRoot, git: await createGit(repository.repoRoot, gitOptions) }
+      : await createRepositoryGitContext(normalizedDirectory, gitOptions);
 
     // `-unormal` lists a directory with no tracked files as one `dir/` entry
     // and stops walking it at its first file. `-uall` would walk every file
     // in it: on a forgotten build or dependency directory that is a scan of
     // tens of thousands of files and hundreds of megabytes per status read.
     // Directories are expanded to their files afterwards, up to a bound.
-    const status = await git.status(['-unormal']);
+    // HEAD is probed alongside: Git reports an unborn branch (a fresh
+    // `git init`, nothing committed) as an ordinary empty one, and clients
+    // must tell the two apart (`unborn` below).
+    const [status, headProbe] = await Promise.all([
+      git.status(['-unormal']),
+      runGitCommand(repoRoot, ['rev-parse', '--verify', '--quiet', 'HEAD'], { timeoutMs: GIT_PROBE_TIMEOUT_MS }),
+    ]);
     status.files = await expandUntrackedDirectories(repoRoot, status.files);
 
     // Light mode: skip numstat + new-file line counting for faster response.
     // Staged (`--cached`: HEAD -> index) and working (`--numstat`: index -> worktree)
     // stay in separate maps. A partially staged file has an entry in both, and the
-    // UI shows each row's own scope instead of a combined total.
+    // UI shows each row's own scope instead of a combined total. The working
+    // side uses `diff-files`: `git diff` rewrites a stale index under
+    // `index.lock` even with GIT_OPTIONAL_LOCKS=0. `-M` keeps the rename
+    // detection `git diff` does by default.
     const [stagedStatsRaw, workingStatsRaw] = lightMode
       ? ['', '']
       : await Promise.all([
-          git.raw(['diff', '--cached', '--numstat']).catch(() => ''),
-          git.raw(['diff', '--numstat']).catch(() => ''),
+          git.raw(['diff', '--cached', '--numstat', '-z']).catch(() => ''),
+          git.raw(['diff-files', '-M', '--numstat', '-z']).catch(() => ''),
         ]);
 
     const stagedDiffStats = {};
@@ -2901,29 +3048,31 @@ async function readStatus(normalizedDirectory, lightMode) {
 
     const accumulateStats = (raw, target) => {
       if (!raw) return;
-      raw
-        .split('\n')
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .forEach((line) => {
-          const parts = line.split('\t');
-          if (parts.length < 3) {
-            return;
-          }
-          const [insertionsRaw, deletionsRaw, ...pathParts] = parts;
-          const path = pathParts.join('\t');
-          if (!path) {
-            return;
-          }
-          const insertions = insertionsRaw === '-' ? 0 : parseInt(insertionsRaw, 10) || 0;
-          const deletions = deletionsRaw === '-' ? 0 : parseInt(deletionsRaw, 10) || 0;
+      // NUL-terminated records (`--numstat -z`) keep path bytes verbatim, so a
+      // key equals `status.files[].path` for names Git would otherwise quote
+      // (non-ASCII, quotes, control characters). A rename or copy record has an
+      // empty path field with the old and the new path as their own tokens; the
+      // counts belong to the destination path, the one status reports. Same
+      // record shape as the commit-file parser in getCommitFiles below.
+      const tokens = raw.split('\0');
+      for (let index = 0; index < tokens.length; index += 1) {
+        const match = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(tokens[index]);
+        if (!match) continue;
+        let path = match[3];
+        if (!path) {
+          path = tokens[index + 2];
+          index += 2;
+        }
+        if (!path) continue;
+        const insertions = match[1] === '-' ? 0 : parseInt(match[1], 10) || 0;
+        const deletions = match[2] === '-' ? 0 : parseInt(match[2], 10) || 0;
 
-          const existing = target[path] || { insertions: 0, deletions: 0 };
-          target[path] = {
-            insertions: existing.insertions + insertions,
-            deletions: existing.deletions + deletions,
-          };
-        });
+        const existing = target[path] || { insertions: 0, deletions: 0 };
+        target[path] = {
+          insertions: existing.insertions + insertions,
+          deletions: existing.deletions + deletions,
+        };
+      }
     };
 
     accumulateStats(stagedStatsRaw, stagedDiffStats);
@@ -3030,6 +3179,9 @@ async function readStatus(normalizedDirectory, lightMode) {
       candidates.push('origin/main', 'origin/master', 'main', 'master');
 
       for (const ref of candidates) {
+        // A branch compared with itself always reads 0 commits ahead, which
+        // would let a never-pushed `main` pass as having nothing unpublished.
+        if (ref === status.current) continue;
         const exists = await git
           .raw(['rev-parse', '--verify', ref])
           .then((value) => String(value || '').trim())
@@ -3043,6 +3195,9 @@ async function readStatus(normalizedDirectory, lightMode) {
     let tracking = status.tracking || null;
     let ahead = status.ahead;
     let behind = status.behind;
+    // The ref `ahead` was counted against when there is no upstream; null when
+    // that count was not made, so a bare 0 never reads as "nothing unpublished".
+    let aheadBase = null;
     let upstreamComparison;
 
     // When no upstream is configured (common for new worktree branches), Git doesn't report ahead/behind.
@@ -3051,14 +3206,17 @@ async function readStatus(normalizedDirectory, lightMode) {
     if (!lightMode && !tracking && status.current) {
       const baseRef = await selectBaseRefForUnpublished();
       if (baseRef) {
+        // Commits already on a remote are published even without an upstream:
+        // a contributor's PR head arrives as a fork remote-tracking branch.
         const countRaw = await git
-          .raw(['rev-list', '--count', `${baseRef}..HEAD`])
+          .raw(['rev-list', '--count', 'HEAD', '--not', baseRef, '--remotes'])
           .then((value) => String(value || '').trim())
           .catch(() => '');
         const count = parseInt(countRaw, 10);
         if (Number.isFinite(count)) {
           ahead = count;
           behind = 0;
+          aheadBase = baseRef;
         }
       }
     }
@@ -3072,23 +3230,25 @@ async function readStatus(normalizedDirectory, lightMode) {
       upstreamComparison = await getRemoteBranchComparison(git, 'upstream', status.current);
     }
 
-    // Check for in-progress operations
+    // Check for in-progress operations. One `--git-path` call locates every
+    // marker, and the markers themselves are plain files: MERGE_HEAD is always
+    // a file in the git dir, whatever the ref storage.
     let mergeInProgress = null;
     let rebaseInProgress = null;
+    const [mergeHeadPath = '', mergeMsgPath = '', rebaseMergePath = '', rebaseApplyPath = ''] = await git
+      .raw(['rev-parse', '--git-path', 'MERGE_HEAD', '--git-path', 'MERGE_MSG', '--git-path', 'rebase-merge', '--git-path', 'rebase-apply'])
+      .then((value) => String(value || '').split(/\r?\n/).slice(0, 4).map((line) => (
+        line.trim() ? path.resolve(repoRoot, normalizeGitOutputPath(line.trim())) : ''
+      )))
+      .catch(() => []);
+    const pathExists = (target) => (target ? fsp.stat(target).then(() => true).catch(() => false) : false);
 
     try {
-      // Check MERGE_HEAD for merge in progress
-      const mergeHeadExists = await git
-        .raw(['rev-parse', '--verify', '--quiet', 'MERGE_HEAD'])
-        .then(() => true)
-        .catch(() => false);
-      
-      if (mergeHeadExists) {
+      if (await pathExists(mergeHeadPath)) {
         const mergeHead = await git.raw(['rev-parse', 'MERGE_HEAD']).catch(() => '');
         const headSha = mergeHead.trim().slice(0, 7);
         // Only set mergeInProgress if we actually have a valid head SHA
         if (headSha) {
-          const mergeMsgPath = await resolveGitInternalPath(repoRoot, git, 'MERGE_MSG').catch(() => '');
           const mergeMsg = mergeMsgPath ? await fsp.readFile(mergeMsgPath, 'utf8').catch(() => '') : '';
           mergeInProgress = {
             head: headSha,
@@ -3102,10 +3262,8 @@ async function readStatus(normalizedDirectory, lightMode) {
 
     try {
       // Check for rebase in progress (.git/rebase-merge or .git/rebase-apply)
-      const rebaseMergePath = await resolveGitInternalPath(repoRoot, git, 'rebase-merge').catch(() => '');
-      const rebaseApplyPath = await resolveGitInternalPath(repoRoot, git, 'rebase-apply').catch(() => '');
-      const rebaseMergeExists = rebaseMergePath ? await fsp.stat(rebaseMergePath).then(() => true).catch(() => false) : false;
-      const rebaseApplyExists = rebaseApplyPath ? await fsp.stat(rebaseApplyPath).then(() => true).catch(() => false) : false;
+      const rebaseMergeExists = await pathExists(rebaseMergePath);
+      const rebaseApplyExists = await pathExists(rebaseApplyPath);
       
       if (rebaseMergeExists || rebaseApplyExists) {
         const rebasePath = rebaseMergeExists ? rebaseMergePath : rebaseApplyPath;
@@ -3130,8 +3288,13 @@ async function readStatus(normalizedDirectory, lightMode) {
     return {
       current: status.current,
       tracking,
+      // Exit 1 from `rev-parse --verify --quiet HEAD` means HEAD names a branch
+      // with no commit yet. Any other failure (timeout, corrupt repository) is
+      // not that answer, and stays false so the repository reads as established.
+      unborn: headProbe.exitCode === 1,
       ahead,
       behind,
+      aheadBase,
       upstreamComparison,
       files: status.files.map((f) => ({
         path: f.path,
@@ -3155,7 +3318,7 @@ async function readStatus(normalizedDirectory, lightMode) {
 }
 
 const getNoIndexDiff = async (repoRoot, repoPath, contextLines) => {
-  const args = ['diff', '--no-color', '--full-index'];
+  const args = ['diff', '--no-color', '--full-index', '--no-ext-diff'];
   if (Number.isFinite(contextLines)) {
     args.push(`-U${Math.max(0, contextLines)}`);
   }
@@ -3190,9 +3353,46 @@ export async function getPathDiff(directory, { path: filePath, staged = false, c
   return { diff, submodule: await readSubmoduleState(context.repoRoot, fileContext) };
 }
 
+const GIT_PATH_ERROR_CODES = new Set(['path_not_found', 'nested_repository', 'untracked_directory']);
+
+/**
+ * `getPathDiff` for many paths of one side, resolving the repository once and
+ * running a bounded number of reads at a time. Returns one entry per input
+ * path, in order: `{ path, diff, submodule }`, or `{ path, error, code }` where
+ * `code` is a path error code when the path no longer resolves. One failed
+ * path never fails the others.
+ */
+export async function getPathDiffs(directory, { paths: filePaths = [], staged = false, contextLines = 3, concurrency = 8 } = {}) {
+  const paths = Array.isArray(filePaths) ? filePaths : [];
+  if (paths.length === 0) return [];
+
+  const context = await createRepositoryGitContext(directory);
+  const results = new Array(paths.length);
+  let cursor = 0;
+
+  const worker = async () => {
+    while (cursor < paths.length) {
+      const index = cursor++;
+      const filePath = paths[index];
+      try {
+        const fileContext = await resolveGitFileContext(context.directoryPath, context.directoryGit, filePath, context.repoRoot);
+        const diff = await readDiff(context, fileContext, { staged, contextLines });
+        const submodule = fileContext.isSubmodule ? await readSubmoduleState(context.repoRoot, fileContext) : null;
+        results[index] = { path: filePath, diff, submodule };
+      } catch (error) {
+        const code = GIT_PATH_ERROR_CODES.has(error?.code) ? error.code : null;
+        results[index] = { path: filePath, error: error?.message || 'Failed to get git diff', code };
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, paths.length) }, worker));
+  return results;
+}
+
 async function readDiff({ repoRoot, git }, fileContext, { staged, contextLines }) {
   try {
-    const args = ['diff', '--no-color', '--full-index'];
+    const args = ['diff', '--no-color', '--full-index', '--no-ext-diff'];
 
     if (typeof contextLines === 'number' && !Number.isNaN(contextLines)) {
       args.push(`-U${Math.max(0, contextLines)}`);
@@ -3328,6 +3528,7 @@ async function assertRangeRefsResolve(git, refs) {
 // A private index lets git include untracked paths in the same tree comparison
 // as tracked files, including a staged deletion recreated at the same path.
 // Intent-to-add records only their existence; diff reads current file contents.
+// Resolves to the diff output and the merge base it was taken against.
 async function runWorkingTreeRangeDiff(context, baseRef, headRef, args, paths = []) {
   const { git, repoRoot } = context;
   const readHead = async () => {
@@ -3343,11 +3544,11 @@ async function runWorkingTreeRangeDiff(context, baseRef, headRef, args, paths = 
   }
   const mergeBase = (await git.raw(['merge-base', baseRef, headCommit])).trim();
   const readDiff = async (comparisonGit) => {
-    const diff = await comparisonGit.raw([...args, mergeBase, '--', ...paths]);
+    const output = await comparisonGit.raw([...args, mergeBase, '--', ...paths]);
     if (await readHead() !== startingHead) {
       throw new Error('The checked-out branch changed during comparison. Refresh and try again.');
     }
-    return diff;
+    return { output, mergeBase };
   };
   const untracked = await git.raw(['ls-files', '--others', '--exclude-standard', '-z', '--', ...paths]);
   if (!untracked) return readDiff(git);
@@ -3379,7 +3580,7 @@ export async function getRangeDiff(directory, { base, head, path: filePath, cont
 
   await assertRangeRefsResolve(git, [baseRef, headRef]);
 
-  const args = ['diff', '--no-color'];
+  const args = ['diff', '--no-color', '--no-ext-diff'];
   if (typeof contextLines === 'number' && !Number.isNaN(contextLines)) {
     args.push(`-U${Math.max(0, contextLines)}`);
   }
@@ -3407,7 +3608,7 @@ export async function getRangeDiff(directory, { base, head, path: filePath, cont
     }
   }
   if (includeWorkingTree) {
-    return runWorkingTreeRangeDiff({ git, repoRoot }, baseRef, headRef, args, paths);
+    return (await runWorkingTreeRangeDiff({ git, repoRoot }, baseRef, headRef, args, paths)).output;
   }
   args.push(`${baseRef}...${headRef}`, '--', ...paths);
   const diff = await git.raw(args);
@@ -3464,10 +3665,33 @@ async function isOwnRemoteCopy(git, source, branchName) {
   return fullName.slice('refs/remotes/'.length).split('/').slice(1).join('/') === branchName;
 }
 
+// The parent a branch was made on, as `gh` records it (`gh pr create` reads it
+// as the default base). Kept in the repository's config, it outlives a rebase,
+// which voids the reflog's creation record.
+const branchParentKey = (branch) => `branch.${branch}.gh-merge-base`;
+
+/** The local branch `ref` names, or null for a remote ref, a commit or `HEAD`. */
+async function localBranchNameOf(directory, ref) {
+  const result = await runGitCommand(directory, ['rev-parse', '--symbolic-full-name', ref]);
+  const fullName = String(result.stdout || '').trim();
+  return result.success && fullName.startsWith('refs/heads/') ? fullName.slice('refs/heads/'.length) : null;
+}
+
 /**
- * Resolve the branch the given branch was created from, from its reflog.
- * Returns { base: null } when git has no authoritative record (clone, detached
- * start, reflog expired) — callers must not fall back to main/master.
+ * Records `parent` as the branch `branch` was made on. A failed write leaves
+ * the reflog to answer, so it never fails the creation it follows.
+ */
+async function recordBranchParent(directory, branch, parent) {
+  if (!parent || parent === branch) return;
+  await runGitCommand(directory, ['config', branchParentKey(branch), parent]);
+}
+
+/**
+ * Resolve the branch the given branch was made on: the parent recorded when it
+ * was created (`branch.<name>.gh-merge-base`), else the creation source in its
+ * reflog. Returns { base: null } when git has no authoritative record (clone,
+ * detached start, reflog expired or rebased) — callers must not fall back to
+ * main/master.
  */
 export async function getBranchBase(directory, branch) {
   const branchName = String(branch || '').trim();
@@ -3476,6 +3700,24 @@ export async function getBranchBase(directory, branch) {
   }
 
   const { git } = await createRepositoryGitContext(directory);
+
+  const recordedParent = await git
+    .raw(['config', '--get', branchParentKey(branchName)])
+    .then((value) => String(value || '').trim())
+    .catch(() => '');
+  if (recordedParent && recordedParent !== branchName) {
+    // The parent is often only a remote branch here (a branch made on a
+    // pull request's head); a bare name its remote copy answers to still
+    // names it, and callers qualify it to that copy.
+    const remotes = await git.raw(['remote']).then((value) => String(value || '').split('\n').map((name) => name.trim()).filter(Boolean)).catch(() => []);
+    for (const ref of [`refs/heads/${recordedParent}`, ...remotes.map((remote) => `refs/remotes/${remote}/${recordedParent}`)]) {
+      const resolves = await git
+        .raw(['rev-parse', '--verify', '--quiet', ref])
+        .then((value) => Boolean(String(value || '').trim()))
+        .catch(() => false);
+      if (resolves) return { base: recordedParent };
+    }
+  }
 
   let reflog = '';
   try {
@@ -3521,9 +3763,10 @@ export async function getRangeFiles(directory, { base, head, includeWorkingTree 
   // surface as C entries instead of plain additions; rename detection is on
   // by default.
   const args = ['diff', '--name-status', '-z', '-C'];
-  const raw = includeWorkingTree
+  const workingTree = includeWorkingTree
     ? await runWorkingTreeRangeDiff({ git, repoRoot }, baseRef, headRef, args)
-    : await git.raw([...args, `${baseRef}...${headRef}`, '--']);
+    : null;
+  const raw = workingTree ? workingTree.output : await git.raw([...args, `${baseRef}...${headRef}`, '--']);
   // -z format: STATUS\0PATH\0[ORIG\0] repeated. For rename/copy entries
   // (`R100`, `C75`) the first path token is the ORIGINAL path and the second
   // is the DESTINATION — the diff (and the UI) must address the destination.
@@ -3539,7 +3782,27 @@ export async function getRangeFiles(directory, { base, head, includeWorkingTree 
       files.push({ path, status: status.charAt(0) });
     }
   }
-  return files;
+  if (!workingTree) return files;
+  return Promise.all(files.map(async (file) => ({
+    ...file,
+    revision: `${workingTree.mergeBase}:${await readWorkingFileSignature(path.join(repoRoot, file.path))}`,
+  })));
+}
+
+/**
+ * What a working-tree range patch of one file depends on besides the merge
+ * base: the file as it is on disk. Its stat changes with every write, so the
+ * Changes view re-reads a patch only when the file was written, and a status
+ * refresh that changed nothing re-reads nothing. A write that keeps the size
+ * and line counts still moves the timestamps. Missing reads as `missing`.
+ */
+async function readWorkingFileSignature(absolutePath) {
+  try {
+    const stat = await fsp.lstat(absolutePath, { bigint: true });
+    return `${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}:${stat.mode}:${stat.ino}`;
+  } catch {
+    return 'missing';
+  }
 }
 
 const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico', 'bmp', 'avif'];
@@ -3919,7 +4182,7 @@ export async function applyHunk(directory, filePath, options = {}) {
   });
 }
 
-export async function collectDiffs(directory, files = []) {
+async function collectDiffs(directory, files = []) {
   const results = [];
   for (const filePath of files) {
     try {
@@ -3934,6 +4197,7 @@ export async function collectDiffs(directory, files = []) {
   return results;
 }
 
+/** @public */
 export async function listStashes(directory) {
   const { git } = await createRepositoryGitContext(directory);
   const output = await git.raw(['stash', 'list', '--format=%gd%x1f%gs%x1f%cr%x1f%H']);
@@ -3948,6 +4212,7 @@ export async function listStashes(directory) {
     .filter((entry) => entry.ref);
 }
 
+/** @public */
 export async function countStashFiles(directory, refs = []) {
   const { git } = await createRepositoryGitContext(directory);
   const uniqueRefs = Array.from(new Set((Array.isArray(refs) ? refs : []).map((ref) => String(ref || '').trim()).filter(Boolean)));
@@ -3971,12 +4236,17 @@ export async function countStashFiles(directory, refs = []) {
   await Promise.all(Array.from({ length: Math.min(concurrency, uniqueRefs.length) }, () => worker()));
   return counts;
 }
+/** @public */
 export async function stashPush(directory, options = {}) {
   const { git } = await createRepositoryGitContext(directory);
   const message = typeof options.message === 'string' && options.message.trim()
     ? options.message.trim()
     : `OpenChamber stash ${new Date().toISOString()}`;
-  const output = await git.raw(['stash', 'push', '--include-untracked', '-m', message]);
+  // Named paths are taken literally, so a name like `*.ts` matches only itself.
+  const paths = Array.isArray(options.paths) ? options.paths : [];
+  const output = await git.raw(paths.length > 0
+    ? ['--literal-pathspecs', 'stash', 'push', '--include-untracked', '-m', message, '--', ...paths]
+    : ['stash', 'push', '--include-untracked', '-m', message]);
   return {
     success: true,
     created: !/no local changes/i.test(String(output || '')),
@@ -3985,6 +4255,7 @@ export async function stashPush(directory, options = {}) {
   };
 }
 
+/** @public */
 export async function stashApply(directory, options = {}) {
   const { git } = await createRepositoryGitContext(directory);
   const ref = typeof options.ref === 'string' && options.ref.trim() ? options.ref.trim() : 'stash@{0}';
@@ -3997,6 +4268,7 @@ export async function stashApply(directory, options = {}) {
   return { success: true, ref };
 }
 
+/** @public */
 export async function stashDrop(directory, options = {}) {
   const { git } = await createRepositoryGitContext(directory);
   const ref = typeof options.ref === 'string' && options.ref.trim() ? options.ref.trim() : 'stash@{0}';
@@ -4004,6 +4276,7 @@ export async function stashDrop(directory, options = {}) {
   return { success: true, ref };
 }
 
+/** @public */
 export async function stashPop(directory, options = {}) {
   const ref = typeof options.ref === 'string' && options.ref.trim() ? options.ref.trim() : 'stash@{0}';
   await stashApply(directory, { ref });
@@ -4011,7 +4284,7 @@ export async function stashPop(directory, options = {}) {
   return { success: true, ref };
 }
 
-export async function stageFile(directory, filePath) {
+async function stageFile(directory, filePath) {
   await stageFiles(directory, [filePath]);
 }
 
@@ -4059,7 +4332,7 @@ export async function stageFiles(directory, paths) {
   });
 }
 
-export async function unstageFile(directory, filePath) {
+async function unstageFile(directory, filePath) {
   await unstageFiles(directory, [filePath]);
 }
 
@@ -4223,6 +4496,27 @@ export async function commit(directory, message, options = {}) {
 }
 
 /**
+ * On a detached HEAD, `git branch` prints `(HEAD detached at v2.1.3)` and
+ * simple-git lists it as a branch named after the tag or commit. Picking that
+ * name in the branch selector checks out the same tag again, so the user can
+ * never get back onto a branch through it. Git prints the detached line first,
+ * so dropping the first occurrence of the name keeps a real branch that shares
+ * it, and the details map already holds that branch's later entry.
+ */
+const withoutDetachedHeadEntry = (summary) => {
+  if (!summary.detached) {
+    return { all: summary.all, branches: summary.branches };
+  }
+  const index = summary.all.indexOf(summary.current);
+  const all = summary.all.filter((_, entryIndex) => entryIndex !== index);
+  const branches = { ...summary.branches };
+  if (!all.includes(summary.current)) {
+    delete branches[summary.current];
+  }
+  return { all, branches };
+};
+
+/**
  * `remote: 'local'` answers from local refs alone, as `git branch -a` does: the
  * callers that only need the checked-out branch and its upstream (publishing,
  * worktree creation) must not wait on every remote's network round trip.
@@ -4232,8 +4526,7 @@ export async function getBranches(directory, { remote = 'live' } = {}) {
 
   try {
     const result = await git.branch();
-
-    const allBranches = result.all;
+    const { all: allBranches, branches } = withoutDetachedHeadEntry(result);
     const remoteBranches = allBranches.filter(branch => branch.startsWith('remotes/'));
     // Read-only ref discovery, not a transfer: it never writes refs and never
     // takes the planned-operation path, so a branch pushed from elsewhere is
@@ -4249,7 +4542,7 @@ export async function getBranches(directory, { remote = 'live' } = {}) {
         ...activeRemoteBranches,
       ],
       current: result.current,
-      branches: result.branches,
+      branches,
       defaultBranches,
     };
   } catch (error) {
@@ -4395,6 +4688,7 @@ async function filterActiveRemoteBranches(git, directory, remoteBranches) {
   }
 }
 
+/** @public */
 export async function createBranch(directory, branchName, options = {}) {
   const { git } = await createRepositoryGitContext(directory);
 
@@ -4581,26 +4875,52 @@ export async function resetToCommit(directory, hash, mode, force = false) {
   }
 }
 
+// `git worktree list` answers from any directory of a repository, but the
+// repository root resolution behind it (`--show-toplevel`) has no answer in a
+// bare repository: "this operation must be run in a work tree". A bare
+// checkout used as the project directory would otherwise read as a failure
+// and show no worktrees at all, so fall back to listing from the directory
+// itself when it is still a git directory.
+const resolveWorktreeListingDirectory = async (directoryPath) => {
+  try {
+    const directoryGit = await createGit(directoryPath);
+    return await resolveGitRepositoryRoot(directoryPath, directoryGit);
+  } catch (error) {
+    const probe = await runGitCommand(directoryPath, ['rev-parse', '--git-dir']);
+    if (probe.success) {
+      return directoryPath;
+    }
+    throw error;
+  }
+};
+
 export async function getWorktrees(directory) {
   const directoryPath = normalizeDirectoryPath(directory);
   if (!directoryPath || !fs.existsSync(directoryPath)) {
     return [];
   }
   try {
-    const directoryGit = await createGit(directoryPath);
-    const repoRoot = await resolveGitRepositoryRoot(directoryPath, directoryGit);
+    const listingDirectory = await resolveWorktreeListingDirectory(directoryPath);
     const result = await runGitCommandOrThrow(
-      repoRoot,
+      listingDirectory,
       ['worktree', 'list', '--porcelain'],
       'Failed to list git worktrees'
     );
-    return parseWorktreePorcelain(result.stdout).map((entry) => ({
-      head: entry.head || '',
-      name: path.basename(entry.worktree || ''),
-      branch: entry.branch || '',
-      path: entry.worktree,
-      prunable: entry.prunable === true,
-    }));
+    const titles = await readBranchTitles(listingDirectory);
+    return parseWorktreePorcelain(result.stdout)
+      .filter((entry) => entry.bare !== true)
+      .map((entry) => {
+        const title = entry.branch ? titles.get(entry.branch) : undefined;
+        return {
+          head: entry.head || '',
+          name: path.basename(entry.worktree || ''),
+          branch: entry.branch || '',
+          path: entry.worktree,
+          prunable: entry.prunable === true,
+          // Absent until the task is named; JSON leaves an undefined key out.
+          title: title || undefined,
+        };
+      });
   } catch (error) {
     // Worktrees are an optional feature. When the caller passes a directory
     // that is not inside any git repository (for example, the managed
@@ -4613,6 +4933,199 @@ export async function getWorktrees(directory) {
     if (isNotGitRepositoryError(error)) return [];
     throw error;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Task titles
+//
+// A worktree's task title is its branch's description (`branch.<name>.description`,
+// what `git branch --edit-description` writes): it lives in the repository's own
+// config, so every client of this server reads the same title, `git branch -m`
+// carries it along, and deleting the branch takes it away. The title the agent
+// set last is kept beside it (`branch.<name>.openchamberAgentTitle`), which is how
+// a title the user gave, here or with git, is told apart and never overwritten.
+// ---------------------------------------------------------------------------
+
+const TASK_TITLE_MAX_LENGTH = 120;
+const BRANCH_TITLE_KEY_PATTERN = '^branch\\..*\\.description$';
+
+/** The first line of a description, trimmed and capped: what a sidebar row shows. */
+const toTaskTitle = (description) => {
+  const firstLine = String(description || '').split(/\r?\n/).find((line) => line.trim()) || '';
+  return firstLine.trim().slice(0, TASK_TITLE_MAX_LENGTH);
+};
+
+/**
+ * Every branch's title in one read. `-z` separates entries with NUL and the key
+ * from its value with a newline, so a description spanning lines parses whole.
+ * No description anywhere exits with status 1, which is an empty answer; any
+ * other failure leaves the listing without titles rather than failing it.
+ */
+const readBranchTitles = async (repositoryDirectory) => {
+  const titles = new Map();
+  const result = await runGitCommand(repositoryDirectory, ['config', '-z', '--get-regexp', BRANCH_TITLE_KEY_PATTERN]);
+  if (!result.success) return titles;
+  for (const record of String(result.stdout || '').split('\0')) {
+    const newline = record.indexOf('\n');
+    if (newline <= 0) continue;
+    // The key matched BRANCH_TITLE_KEY_PATTERN: `branch.<name>.description`.
+    const branch = record.slice('branch.'.length, newline - '.description'.length);
+    const title = toTaskTitle(record.slice(newline + 1));
+    if (branch && title) titles.set(branch, title);
+  }
+  return titles;
+};
+
+const readGitConfigValue = async (directory, key) => {
+  const result = await runGitCommand(directory, ['config', '--get', key]);
+  return result.success ? String(result.stdout || '').replace(/\r?\n$/, '') : '';
+};
+
+const writeGitConfigValue = async (directory, key, value) => {
+  if (value) {
+    await runGitCommandOrThrow(directory, ['config', key, value], `Failed to write ${key}`);
+    return;
+  }
+  const result = await runGitCommand(directory, ['config', '--unset', key]);
+  // Status 5: the key was not set, which is what unsetting asks for.
+  if (!result.success && result.exitCode !== 5) throw new Error(`Failed to clear ${key}`);
+};
+
+/**
+ * Set the task title of the worktree at `directory`. `by: 'user'` always
+ * writes (an empty title clears it) and forgets the agent's copy, so the title
+ * is the user's from then on. `by: 'agent'` writes only while the branch has no
+ * description or still has the one the agent set; otherwise the current title
+ * is returned with `applied: false`. Clients re-list the worktrees on the
+ * topology event published after a write.
+ */
+export async function setWorktreeTaskTitle(directory, input = {}) {
+  const directoryPath = normalizeDirectoryPath(directory);
+  if (!directoryPath || !fs.existsSync(directoryPath)) {
+    const error = new Error('The worktree folder does not exist');
+    error.status = 404;
+    throw error;
+  }
+  const by = input?.by === 'agent' ? 'agent' : 'user';
+  const title = toTaskTitle(input?.title);
+  if (by === 'agent' && !title) {
+    const error = new Error('title is required');
+    error.status = 400;
+    throw error;
+  }
+  const head = await runGitCommandOrThrow(directoryPath, ['symbolic-ref', '--quiet', '--short', 'HEAD'], 'The worktree is not on a branch')
+    .catch((cause) => {
+      const error = new Error('The worktree is not on a branch, so it has no task title');
+      error.status = 409;
+      error.cause = cause;
+      throw error;
+    });
+  const branch = String(head.stdout || '').trim();
+  return applyBranchTaskTitle(directoryPath, branch, by, title);
+}
+
+/**
+ * Writes `title` as `branch`'s task title by the rules of
+ * `setWorktreeTaskTitle`. Branch config is shared by every checkout of the
+ * repository, so `directory` may be any of them, and the branch need not be
+ * checked out yet.
+ */
+const applyBranchTaskTitle = async (directory, branch, by, title) => {
+  const descriptionKey = `branch.${branch}.description`;
+  const agentTitleKey = `branch.${branch}.openchamberAgentTitle`;
+  const current = toTaskTitle(await readGitConfigValue(directory, descriptionKey));
+  if (by === 'agent') {
+    const agentTitle = toTaskTitle(await readGitConfigValue(directory, agentTitleKey));
+    if (current && current !== agentTitle) return { applied: false, title: current, branch, by: 'user' };
+    if (current === title) return { applied: true, title, branch, by: 'agent' };
+    await writeGitConfigValue(directory, descriptionKey, title);
+    await writeGitConfigValue(directory, agentTitleKey, title);
+  } else {
+    if (current === title && !(await readGitConfigValue(directory, agentTitleKey))) {
+      return { applied: true, title, branch, by: 'user' };
+    }
+    await writeGitConfigValue(directory, descriptionKey, title);
+    await writeGitConfigValue(directory, agentTitleKey, '');
+  }
+  void publishWorktreeTopologyChange(directory);
+  return { applied: true, title, branch, by };
+};
+
+/**
+ * A new worktree's first task title, from the pull request or issue it was
+ * made for. It is written as the agent's: a stand-in the agent replaces with a
+ * short name once it knows the task, and the user's own name still wins.
+ * Best effort: a failure leaves the worktree without a title.
+ */
+/**
+ * Records that `branch` got a name OpenChamber generated (Quick worktree's
+ * `agile-chipmunk`), not one the user chose: `branch.<name>.openchamberGeneratedName`
+ * holds the generated name itself, so once the branch is renamed the record,
+ * which `git branch -m` carries along, no longer matches and stops applying.
+ * Best effort.
+ */
+export async function markGeneratedBranchName(directory, branch) {
+  const branchName = String(branch || '').trim();
+  const directoryPath = normalizeDirectoryPath(directory);
+  if (!branchName || !directoryPath) return;
+  await writeGitConfigValue(directoryPath, `branch.${branchName}.openchamberGeneratedName`, branchName).catch((error) => {
+    console.warn('Failed to mark a generated branch name:', error instanceof Error ? error.message : String(error));
+  });
+}
+
+/**
+ * The branch of the worktree at `directory` when renaming it is safe and
+ * wanted: OpenChamber generated its name, and it was never pushed (no
+ * upstream, no branch of that name on a remote), so no pull request or remote
+ * follows it. Null otherwise, or when that cannot be read.
+ */
+export async function readRenameableGeneratedBranch(directory, checkedOutBranch = null) {
+  const directoryPath = normalizeDirectoryPath(directory);
+  if (!directoryPath) return null;
+  // A caller that already read the branch saves a git run: most callers ask
+  // on every message, and most branches carry no record, so one read ends it.
+  let branch = String(checkedOutBranch || '').trim();
+  if (!branch) {
+    const head = await runGitCommand(directoryPath, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+    branch = head.success ? String(head.stdout || '').trim() : '';
+  }
+  if (!branch) return null;
+  if ((await readGitConfigValue(directoryPath, `branch.${branch}.openchamberGeneratedName`)).trim() !== branch) return null;
+  if ((await readGitConfigValue(directoryPath, `branch.${branch}.remote`)).trim()) return null;
+  const remote = await runGitCommand(directoryPath, ['for-each-ref', '--format=%(refname)', `refs/remotes/*/${branch}`]);
+  if (!remote.success || String(remote.stdout || '').trim()) return null;
+  return branch;
+}
+
+/**
+ * Renames the worktree's branch to `newName` when OpenChamber generated its
+ * name and it was never pushed (`readRenameableGeneratedBranch`), for
+ * `work.name`. Answers `{ from, to }`, or null when the branch is not such a
+ * placeholder, which then stays as it is. A name git does not accept, the
+ * placeholder itself, or one already taken fails with a status.
+ */
+export async function renameGeneratedWorktreeBranch(directory, newName) {
+  const directoryPath = normalizeDirectoryPath(directory);
+  const current = directoryPath ? await readRenameableGeneratedBranch(directoryPath) : null;
+  if (!current) return null;
+  const name = String(newName || '').trim();
+  const fail = (message, status) => Object.assign(new Error(message), { status });
+  if (!name || name === current) throw fail(`Name the branch after the task, not \`${current}\``, 400);
+  const valid = await runGitCommand(directoryPath, ['check-ref-format', '--branch', name]);
+  if (!valid.success) throw fail(`\`${name}\` is not a valid branch name`, 400);
+  await renameBranch(directoryPath, current, name).catch((error) => {
+    throw fail(error instanceof Error ? error.message : String(error), error?.statusCode ?? 500);
+  });
+  return { from: current, to: name };
+}
+
+export async function seedBranchTaskTitle(directory, branch, rawTitle) {
+  const title = toTaskTitle(rawTitle);
+  const branchName = String(branch || '').trim();
+  if (!title || !branchName) return;
+  await applyBranchTaskTitle(normalizeDirectoryPath(directory), branchName, 'agent', title).catch((error) => {
+    console.warn('Failed to seed the worktree task title:', error instanceof Error ? error.message : String(error));
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -4679,8 +5192,9 @@ const resolveWorktreeRepositoryKey = async (directoryPath) => {
 
 /**
  * Cheap identity of the registered linked-worktree set: the `worktrees`
- * directory's mtime plus its entry names. Adding, removing, or pruning a
- * worktree changes at least one of them; `git worktree move` rewrites files
+ * directory's mtime, its entry names and each entry's HEAD. Adding, removing,
+ * or pruning a worktree changes at least one of them, and so does renaming or
+ * switching a checkout's branch; `git worktree move` rewrites other files
  * inside an entry and is not detected.
  */
 const readWorktreeTopologyFingerprint = (repositoryKey) => {
@@ -4688,7 +5202,17 @@ const readWorktreeTopologyFingerprint = (repositoryKey) => {
   try {
     const stat = fs.statSync(worktreesDir);
     const names = fs.readdirSync(worktreesDir).sort();
-    return `${stat.mtimeMs}:${names.join('\0')}`;
+    // Each checkout's HEAD names its branch, so renaming a checked-out branch
+    // (`git branch -m`, as an agent does for a generated name) changes the
+    // fingerprint too and the sidebar shows the new name.
+    const heads = names.map((name) => {
+      try {
+        return fs.readFileSync(path.join(worktreesDir, name, 'HEAD'), 'utf8').trim();
+      } catch {
+        return '';
+      }
+    });
+    return `${stat.mtimeMs}:${names.join('\0')}:${heads.join('\0')}`;
   } catch {
     return 'none';
   }
@@ -4854,7 +5378,7 @@ export async function validateWorktreeCreate(directory, input = {}) {
             });
           }
         } else if (parsedRemoteRef) {
-          const remoteCheck = await checkLocalRemoteBranchExists(
+          const remoteCheck = await ensureLocalRemoteBranchRef(
             context.primaryWorktree,
             parsedRemoteRef.remote,
             parsedRemoteRef.branch
@@ -4862,7 +5386,7 @@ export async function validateWorktreeCreate(directory, input = {}) {
           if (!remoteCheck.found) {
             errors.push({
               code: 'start_ref_not_found',
-              message: `Remote branch is not available locally: ${parsedRemoteRef.remoteRef}`,
+              message: `Remote branch not found: ${parsedRemoteRef.remoteRef}`,
             });
           }
         } else {
@@ -4994,6 +5518,40 @@ export async function previewWorktreeCreate(directory, input = {}) {
   };
 }
 
+const readLocalBranchTip = async (primaryWorktree, branch) => {
+  const result = await runGitCommand(primaryWorktree, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}^{commit}`]);
+  return result.success ? String(result.stdout || '').trim() : '';
+};
+
+/**
+ * A change request's local branch can be left over from an earlier worktree
+ * of it that was removed. That branch is reused and moved to the change
+ * request head. When it diverged from the head (the head was force-pushed),
+ * its old tip is first kept in `<branch>-backup-<sha>`, so no commit becomes
+ * unreachable. Returns null when there is no such branch or it is checked out
+ * elsewhere, which the ordinary creation checks report.
+ */
+const prepareChangeRequestLocalBranch = async (primaryWorktree, input = {}) => {
+  const expectedRevision = String(input?.expectedRevision || '').trim();
+  if (input?.changeRequestTransfer !== true || !expectedRevision) return null;
+  const remoteRef = await resolveRemoteBranchRef(primaryWorktree, String(input?.existingBranch || '').trim());
+  const branch = cleanBranchName(String(input?.branchName || '').trim() || remoteRef?.branch || '');
+  if (!remoteRef || !branch) return null;
+  const tip = await readLocalBranchTip(primaryWorktree, branch);
+  if (!tip || await findBranchInUse(primaryWorktree, branch)) return null;
+  if (await isAncestorRef(primaryWorktree, tip, expectedRevision)) return { branch, tip, backupBranch: null };
+
+  const backupBranch = `${branch}-backup-${tip.slice(0, 7)}`;
+  const backupTip = await readLocalBranchTip(primaryWorktree, backupBranch);
+  if (backupTip && backupTip !== tip) {
+    throw new Error(`Branch ${branch} has commits the change request no longer has, and ${backupBranch} already exists`);
+  }
+  if (!backupTip) {
+    await runGitCommandOrThrow(primaryWorktree, ['branch', '--no-track', backupBranch, tip], `Failed to keep ${branch} as ${backupBranch}`);
+  }
+  return { branch, tip, backupBranch };
+};
+
 async function attachGitWorktreeToCandidateWithoutRemoteRollback(context, candidate, input = {}, serverOptions = {}) {
   const mode = input?.mode === 'existing' ? 'existing' : 'new';
   const startRef = normalizeStartRef(input?.startRef);
@@ -5014,6 +5572,10 @@ async function attachGitWorktreeToCandidateWithoutRemoteRollback(context, candid
     });
   }
   let createdLocalBranch = false;
+  // The branch a new branch starts from, when it starts from a remote one.
+  let parsedStartBranch = null;
+  // A leftover change request branch this attempt moves; a failed attempt puts it back.
+  let movedLocalBranch = null;
   const worktreeAddArgs = ['worktree', 'add', '--no-checkout'];
 
   if (mode === 'existing') {
@@ -5026,13 +5588,25 @@ async function attachGitWorktreeToCandidateWithoutRemoteRollback(context, candid
       throw new Error(`Branch is already checked out in ${inUse.worktree}`);
     }
 
-    if (resolved.createLocalBranch) {
+    const reusedBranch = serverOptions.changeRequestLocalBranch;
+    if (resolved.createLocalBranch && reusedBranch?.branch === localBranch) {
+      if (await readLocalBranchTip(context.primaryWorktree, localBranch) !== reusedBranch.tip) {
+        throw new Error(`Branch ${localBranch} changed during worktree creation`);
+      }
+      worktreeAddArgs.push('-B', localBranch);
+      movedLocalBranch = reusedBranch;
+    } else if (resolved.createLocalBranch) {
       worktreeAddArgs.push('-b', localBranch);
       createdLocalBranch = true;
     }
     worktreeAddArgs.push(candidate.directory, expectedRevision && resolved.createLocalBranch
       ? expectedRevision
       : resolved.checkoutRef);
+    if (movedLocalBranch && contributorFork) {
+      // The leftover branch may still track something; contributor worktrees never do.
+      await runGitCommand(context.primaryWorktree, ['config', '--unset-all', `branch.${localBranch}.remote`]);
+      await runGitCommand(context.primaryWorktree, ['config', '--unset-all', `branch.${localBranch}.merge`]);
+    }
 
     if (resolved.upstream) {
       inferredUpstream = {
@@ -5067,6 +5641,7 @@ async function attachGitWorktreeToCandidateWithoutRemoteRollback(context, candid
 
     const parsedRemoteStartRef = await resolveRemoteBranchRef(context.primaryWorktree, startRef);
     if (parsedRemoteStartRef) {
+      parsedStartBranch = parsedRemoteStartRef.branch;
       worktreeAddArgs.splice(2, 0, '--no-track');
       inferredUpstream = {
         remote: parsedRemoteStartRef.remote,
@@ -5085,16 +5660,28 @@ async function attachGitWorktreeToCandidateWithoutRemoteRollback(context, candid
 
   await runGitCommandOrThrow(context.primaryWorktree, worktreeAddArgs, 'Failed to create git worktree');
   await publishWorktreeTopologyChange(context.primaryWorktree);
+  // A new branch's parent is the branch it starts from, a lower layer of a
+  // stack included; its pull request and comparisons default to it.
+  if (mode === 'new' && startRef && startRef !== 'HEAD') {
+    const parent = parsedStartBranch ?? await localBranchNameOf(context.primaryWorktree, startRef);
+    await recordBranchParent(context.primaryWorktree, localBranch, parent);
+  }
+
+  // Undoes what this attempt did to the local branch, once its worktree is removed.
+  const releaseLocalBranch = async () => {
+    if (createdLocalBranch) return (await runGitCommand(context.primaryWorktree, ['branch', '-D', localBranch])).success;
+    if (movedLocalBranch) {
+      return (await runGitCommand(context.primaryWorktree, ['branch', '-f', localBranch, movedLocalBranch.tip])).success;
+    }
+    return true;
+  };
 
   if (expectedRevision) {
     const createdHead = await runGitCommand(candidate.directory, ['rev-parse', '--verify', 'HEAD']);
     if (!createdHead.success || String(createdHead.stdout || '').trim() !== expectedRevision) {
       const removed = await runGitCommand(context.primaryWorktree, ['worktree', 'remove', '--force', candidate.directory]);
-      if (createdLocalBranch && removed.success) {
-        const branchRemoved = await runGitCommand(context.primaryWorktree, ['branch', '-D', localBranch]);
-        if (!branchRemoved.success) {
-          throw new Error('Created worktree revision does not match the requested change request head, and the new local branch could not be removed safely');
-        }
+      if (removed.success && !(await releaseLocalBranch())) {
+        throw new Error('Created worktree revision does not match the requested change request head, and the local branch could not be restored safely');
       }
       if (!removed.success) {
         throw new Error('Created worktree revision does not match the requested change request head, and the worktree could not be removed safely');
@@ -5124,9 +5711,7 @@ async function attachGitWorktreeToCandidateWithoutRemoteRollback(context, candid
       });
     } catch (error) {
       const removed = await runGitCommand(context.primaryWorktree, ['worktree', 'remove', '--force', candidate.directory]);
-      if (createdLocalBranch && removed.success) {
-        await runGitCommand(context.primaryWorktree, ['branch', '-D', localBranch]);
-      }
+      if (removed.success) await releaseLocalBranch();
       throw error;
     }
   }
@@ -5157,7 +5742,7 @@ async function attachGitWorktreeToCandidateWithoutRemoteRollback(context, candid
   if (bootstrapStatus.status === WORKTREE_BOOTSTRAP_PENDING) {
     queueWorktreeBootstrap({
       directory: candidate.directory,
-      projectID: context.projectID,
+      projectDirectory: context.requestedDirectory,
       primaryWorktree: context.primaryWorktree,
       localBranch,
       setUpstream: shouldSetUpstream,
@@ -5365,6 +5950,14 @@ export async function createWorktree(directory, input = {}, serverOptions = {}) 
   }
   const prepared = await prepareWorktreeCreateSource(context, input);
   const preparedInput = prepared.input;
+  const changeRequestLocalBranch = mode === 'existing'
+    ? await prepareChangeRequestLocalBranch(context.primaryWorktree, preparedInput)
+    : null;
+  const attachOptions = changeRequestLocalBranch ? { ...serverOptions, changeRequestLocalBranch } : serverOptions;
+  // Tells the user where a diverged leftover branch's commits went.
+  const withBranchBackup = (result) => (changeRequestLocalBranch?.backupBranch
+    ? { ...result, branchBackup: changeRequestLocalBranch.backupBranch }
+    : result);
 
   await fsp.mkdir(context.worktreeRoot, { recursive: true });
 
@@ -5401,7 +5994,7 @@ export async function createWorktree(directory, input = {}, serverOptions = {}) 
       : candidate.branch;
 
     const task = bootstrapStatus.status === WORKTREE_BOOTSTRAP_PENDING
-      ? attachGitWorktreeToCandidate(context, candidate, preparedInput, serverOptions).catch(async (error) => {
+      ? attachGitWorktreeToCandidate(context, candidate, preparedInput, attachOptions).catch(async (error) => {
       await setWorktreeBootstrapState(
         candidate.directory,
         WORKTREE_BOOTSTRAP_FAILED,
@@ -5429,10 +6022,10 @@ export async function createWorktree(directory, input = {}, serverOptions = {}) 
       result.sourceFetchFailed = true;
       if (prepared.sourceFetchReason) result.sourceFetchReason = prepared.sourceFetchReason;
     }
-    return result;
+    return withBranchBackup(result);
   }
 
-  const result = await attachGitWorktreeToCandidate(context, candidate, preparedInput, serverOptions);
+  const result = withBranchBackup(await attachGitWorktreeToCandidate(context, candidate, preparedInput, attachOptions));
   if (!prepared.sourceFetchFailed) return result;
   return prepared.sourceFetchReason
     ? { ...result, sourceFetchFailed: true, sourceFetchReason: prepared.sourceFetchReason }
@@ -5550,6 +6143,51 @@ const disposeWorktreeInstanceBestEffort = async (disposeInstance, worktreeDirect
     );
   }
 };
+
+// Any directory-scoped OpenCode request for a folder of a worktree that is
+// being removed starts that folder's location again, local MCP servers
+// included, and on Windows their working directory keeps the folder from being
+// deleted. The OpenCode proxy holds such requests until the removal settles.
+const worktreeRemovalsInProgress = new Set();
+
+// A requested folder need not exist; its nearest existing parent is resolved,
+// so a worktree reached through a symlink (/var is /private/var on macOS)
+// still matches.
+const canonicalPathOfExistingAncestor = async (input) => {
+  const absolutePath = path.resolve(input);
+  for (let current = absolutePath; ; current = path.dirname(current)) {
+    const realPath = await fsp.realpath(current).catch(() => null);
+    if (realPath !== null || path.dirname(current) === current) {
+      const normalized = path.normalize(path.join(realPath ?? current, path.relative(current, absolutePath)));
+      return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+    }
+  }
+};
+
+const trackWorktreeRemoval = (canonicalDirectory) => {
+  let settle;
+  const removal = { root: canonicalDirectory, settled: new Promise((resolve) => { settle = resolve; }) };
+  worktreeRemovalsInProgress.add(removal);
+  return () => {
+    worktreeRemovalsInProgress.delete(removal);
+    settle();
+  };
+};
+
+/**
+ * Resolves once no removal of a worktree holding `directory` is in progress;
+ * at once when none is.
+ */
+export async function waitForWorktreeRemoval(directory) {
+  if (worktreeRemovalsInProgress.size === 0) return;
+  const key = toBootstrapStateKey(directory);
+  if (!key) return;
+  const target = await canonicalPathOfExistingAncestor(key);
+  const pending = [...worktreeRemovalsInProgress]
+    .filter((removal) => isInsideOrSameDirectory(removal.root, target))
+    .map((removal) => removal.settled);
+  await Promise.all(pending);
+}
 
 // Windows refuses to delete a folder another process still holds (a session's
 // shell, a file watcher, an editor); those handles are usually released
@@ -5737,7 +6375,10 @@ const replaceWorktreeGitDirectoryLink = async (primaryWorktree, worktreePath) =>
 
 // Resolves true when git removed the worktree, false when git dropped the
 // registration but left the folder behind (the caller removes it as an orphan).
-const removeGitWorktreeWhenFree = async (primaryWorktree, worktreePath, targetCanonical) => {
+// A busy folder is released again before the next attempt, git's or the
+// orphan removal's: a request that reached OpenCode after the first release
+// has started the folder again.
+const removeGitWorktreeWhenFree = async (primaryWorktree, worktreePath, targetCanonical, releaseInstance) => {
   for (let attempt = 0; ; attempt += 1) {
     const result = await runGitCommand(primaryWorktree, ['worktree', 'remove', '--force', worktreePath]);
     if (result.success) return true;
@@ -5750,9 +6391,13 @@ const removeGitWorktreeWhenFree = async (primaryWorktree, worktreePath, targetCa
       }
       return false;
     })();
-    if (!stillRegistered) return false;
+    if (!stillRegistered) {
+      await releaseInstance();
+      return false;
+    }
     const delay = WORKTREE_BUSY_RETRY_DELAYS_MS[attempt];
     if (delay === undefined) throw new Error(WORKTREE_BUSY_MESSAGE);
+    await releaseInstance();
     await wait(delay);
   }
 };
@@ -5822,24 +6467,30 @@ export async function removeWorktree(directory, input = {}, { bootstrapStore } =
   }
 
   await clearWorktreeBootstrapState(matchedEntry.worktree, bootstrapStore);
+  const settleRemoval = trackWorktreeRemoval(targetCanonical);
   // The directory is a registered linked worktree and still exists here, which
   // is the only point where its OpenCode instance can be released by path.
-  await disposeWorktreeInstanceBestEffort(input?.disposeInstance, matchedEntry.worktree);
-
-  const restoreGitDirectoryLink = await replaceWorktreeGitDirectoryLink(context.primaryWorktree, matchedEntry.worktree);
+  const releaseInstance = () => disposeWorktreeInstanceBestEffort(input?.disposeInstance, matchedEntry.worktree);
   try {
-    const removedByGit = await removeGitWorktreeWhenFree(context.primaryWorktree, matchedEntry.worktree, targetCanonical);
-    if (!removedByGit) {
-      // Git deleted its registration but not the still-locked folder.
-      await removeManagedOrphan({ registered: true });
+    await releaseInstance();
+
+    const restoreGitDirectoryLink = await replaceWorktreeGitDirectoryLink(context.primaryWorktree, matchedEntry.worktree);
+    try {
+      const removedByGit = await removeGitWorktreeWhenFree(context.primaryWorktree, matchedEntry.worktree, targetCanonical, releaseInstance);
+      if (!removedByGit) {
+        // Git deleted its registration but not the still-locked folder.
+        await removeManagedOrphan({ registered: true });
+      }
+    } catch (error) {
+      if (restoreGitDirectoryLink) {
+        await restoreGitDirectoryLink().catch((restoreError) => {
+          console.warn('Failed to restore worktree .git symlink after removal failed:', restoreError);
+        });
+      }
+      throw error;
     }
-  } catch (error) {
-    if (restoreGitDirectoryLink) {
-      await restoreGitDirectoryLink().catch((restoreError) => {
-        console.warn('Failed to restore worktree .git symlink after removal failed:', restoreError);
-      });
-    }
-    throw error;
+  } finally {
+    settleRemoval();
   }
   await publishWorktreeTopologyChange(context.primaryWorktree);
 
@@ -5878,43 +6529,292 @@ const SNAPSHOT_IDENTITY_ENV = {
 
 /**
  * Records the complete state of a worktree (committed, staged, unstaged and
- * untracked-but-not-ignored files) as a commit under `ref`. A throwaway index
- * is used, so the worktree's real index, HEAD, branch and files are untouched.
+ * untracked-but-not-ignored files) as a commit on top of HEAD and points `ref`
+ * at it; `oldValue` '' makes git refuse a ref that already exists. A throwaway
+ * index is used, so the worktree's real index, HEAD, branch and files are
+ * untouched.
  */
+/** The tree of the worktree's current state (every change git does not ignore) on top of HEAD. */
+const readWorktreeStateTree = async (worktreeDirectory) => {
+  const head = (await runGitCommandOrThrow(worktreeDirectory, ['rev-parse', '--verify', 'HEAD'], 'Worktree has no HEAD commit')).stdout.trim();
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'openchamber-snapshot-'));
+  const env = { ...(await buildGitEnv(worktreeDirectory)), GIT_INDEX_FILE: path.join(tempDir, 'index') };
+  try {
+    for (const args of [['read-tree', head], ['add', '-A']]) {
+      const result = await runGitCommand(worktreeDirectory, args, { env });
+      if (!result.success) throw new Error(result.message || 'Failed to read the worktree state');
+    }
+    const tree = await runGitCommand(worktreeDirectory, ['write-tree'], { env });
+    if (!tree.success) throw new Error(tree.message || 'Failed to read the worktree state');
+    return { head, tree: tree.stdout.trim() };
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+  }
+};
+
+const writeWorktreeSnapshot = async (worktreeDirectory, { ref, message, oldValue }) => {
+  const { head, tree } = await readWorktreeStateTree(worktreeDirectory);
+  const env = { ...(await buildGitEnv(worktreeDirectory)), ...SNAPSHOT_IDENTITY_ENV };
+  const commit = await runGitCommand(worktreeDirectory, ['commit-tree', tree, '-p', head, '-m', message], { env });
+  if (!commit.success) throw new Error(commit.message || 'Failed to write snapshot commit');
+  const commitSha = commit.stdout.trim();
+  await runGitCommandOrThrow(worktreeDirectory, ['update-ref', ref, commitSha, ...(oldValue === undefined ? [] : [oldValue])], 'Failed to store snapshot ref');
+  return { ref, commit: commitSha, head };
+};
+
+/** A run's snapshot of its worktree, under `refs/openchamber/runs/`. */
 export async function snapshotWorktree(directory, input = {}) {
   const worktreeDirectory = normalizeDirectoryPath(directory);
   if (!worktreeDirectory) {
     throw new Error('Worktree directory is required');
   }
   const ref = assertRunSnapshotRef(input?.ref);
-  const head = (await runGitCommandOrThrow(worktreeDirectory, ['rev-parse', '--verify', 'HEAD'], 'Worktree has no HEAD commit')).stdout.trim();
+  return writeWorktreeSnapshot(worktreeDirectory, { ref, message: 'OpenChamber run snapshot' });
+}
 
-  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'openchamber-snapshot-'));
-  const indexEnv = { GIT_INDEX_FILE: path.join(tempDir, 'index') };
+// Archived worktrees. The archive is the ref: `refs/openchamber/archive/<id>`
+// points at a snapshot commit of the worktree (every change git does not
+// ignore), whose parent is the commit the branch stood on and whose message
+// carries what restoring needs. Nothing else records an archive, so every
+// client of the repository sees the same list, and a ref keeps the snapshot
+// safe from gc until the archive is deleted.
+const WORKTREE_ARCHIVE_REF_PREFIX = 'refs/openchamber/archive/';
+const WORKTREE_ARCHIVE_SUBJECT = 'OpenChamber worktree archive';
+const WORKTREE_ARCHIVE_ID_PATTERN = /^[A-Za-z0-9_-]{1,80}$/;
+
+const worktreeArchiveIdSchema = z.string().trim().regex(WORKTREE_ARCHIVE_ID_PATTERN);
+
+const assertWorktreeArchiveId = (id) => {
+  const parsed = worktreeArchiveIdSchema.safeParse(id);
+  if (!parsed.success) throw new Error('Invalid worktree archive id');
+  return parsed.data;
+};
+
+const sessionIdListSchema = z.array(z.unknown()).catch([])
+  .transform((entries) => entries.flatMap((entry) => {
+    const parsed = z.string().min(1).safeParse(entry);
+    return parsed.success ? [parsed.data] : [];
+  }));
+
+const worktreeArchiveRecordSchema = z.object({
+  path: z.string().min(1),
+  branch: z.string().catch(''),
+  title: z.string().catch(''),
+  archivedAt: z.number().finite().catch(0),
+  sessionIds: sessionIdListSchema,
+});
+
+/** The archive record in a snapshot commit's message, or null when it is not one. */
+const parseWorktreeArchiveMessage = (message) => {
+  const text = String(message || '');
+  if (!text.startsWith(WORKTREE_ARCHIVE_SUBJECT)) return null;
   try {
-    const run = async (args, message, env = indexEnv) => {
-      // `env` replaces the whole environment, so start from the Git one.
-      const result = await runGitCommand(worktreeDirectory, args, { env: { ...(await buildGitEnv()), ...env } });
-      if (!result.success) {
-        throw new Error(result.message || message);
-      }
-      return result.stdout.trim();
-    };
-    await run(['read-tree', head], 'Failed to prepare snapshot index');
-    await run(['add', '-A'], 'Failed to collect worktree changes');
-    const tree = await run(['write-tree'], 'Failed to write snapshot tree');
-    const commit = await run(
-      ['commit-tree', tree, '-p', head, '-m', 'OpenChamber run snapshot'],
-      'Failed to write snapshot commit',
-      { ...indexEnv, ...SNAPSHOT_IDENTITY_ENV },
-    );
-    await run(['update-ref', ref, commit], 'Failed to store snapshot ref', {});
-    return { ref, commit, head };
+    return worktreeArchiveRecordSchema.safeParse(JSON.parse(text.slice(WORKTREE_ARCHIVE_SUBJECT.length).trim())).data ?? null;
+  } catch {
+    return null;
+  }
+};
+
+const readWorktreeArchives = async (primaryWorktree) => {
+  const listing = await runGitCommandOrThrow(primaryWorktree, [
+    'for-each-ref',
+    '--format=%(refname)%00%(objectname)%00%(parent)%00%(contents)%1e',
+    WORKTREE_ARCHIVE_REF_PREFIX,
+  ], 'Failed to list worktree archives');
+  const branches = await runGitCommand(primaryWorktree, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/']);
+  const localBranches = new Set(branches.success ? String(branches.stdout || '').split('\n').map((line) => line.trim()).filter(Boolean) : []);
+  return String(listing.stdout || '').split('\x1e').flatMap((chunk) => {
+    const [ref = '', commit = '', head = '', message = ''] = chunk.replace(/^\n/, '').split('\0');
+    if (!ref.startsWith(WORKTREE_ARCHIVE_REF_PREFIX)) return [];
+    const record = parseWorktreeArchiveMessage(message);
+    if (!record) return [];
+    const id = ref.slice(WORKTREE_ARCHIVE_REF_PREFIX.length);
+    return [{ id, ref, commit, head: head.split(' ')[0] || '', ...record, branchExists: Boolean(record.branch) && localBranches.has(record.branch) }];
+  }).sort((a, b) => b.archivedAt - a.archivedAt);
+};
+
+const readWorktreeArchive = async (primaryWorktree, id) => {
+  const archiveId = assertWorktreeArchiveId(id);
+  const archive = (await readWorktreeArchives(primaryWorktree)).find((entry) => entry.id === archiveId);
+  if (!archive) throw Object.assign(new Error('Worktree archive not found'), { code: 'WORKTREE_ARCHIVE_NOT_FOUND' });
+  return archive;
+};
+
+/** The repository's archived worktrees, newest first. `directory` is any of its checkouts. */
+export async function listWorktreeArchives(directory) {
+  const context = await resolveWorktreeProjectContext(directory, { tolerateWorktreeRootConfigError: true });
+  return readWorktreeArchives(context.primaryWorktree);
+}
+
+// Worktrees being archived, by canonical path: a second archive of the same
+// worktree (Done racing the merged-PR cleanup) would snapshot a folder git is
+// deleting.
+const worktreeArchivesInFlight = new Set();
+
+const worktreeArchiveError = (message, code) => Object.assign(new Error(message), { code });
+
+/**
+ * Archives the linked worktree `input.directory` of the repository at
+ * `directory`: its state is recorded under `refs/openchamber/archive/<id>`
+ * with the sessions the caller archived for it, then the worktree is removed
+ * the way `removeWorktree` removes it, keeping its branch. A removal that fails
+ * deletes the archive again, so a worktree is never both on disk and archived.
+ */
+export async function archiveWorktree(directory, input = {}, options = {}) {
+  const id = assertWorktreeArchiveId(input?.id);
+  const worktreeDirectory = normalizeDirectoryPath(input?.directory);
+  if (!worktreeDirectory) throw new Error('Worktree directory is required');
+  const context = await resolveWorktreeProjectContext(directory, { tolerateWorktreeRootConfigError: true });
+  const targetCanonical = await canonicalPath(worktreeDirectory);
+  if (targetCanonical === await canonicalPath(context.primaryWorktree)) {
+    throw new Error('Cannot archive the primary workspace');
+  }
+  if (worktreeArchivesInFlight.has(targetCanonical)) {
+    throw worktreeArchiveError('This worktree is already being archived', 'WORKTREE_ARCHIVE_IN_PROGRESS');
+  }
+  worktreeArchivesInFlight.add(targetCanonical);
+  try {
+    return await archiveRegisteredWorktree({ directory, id, worktreeDirectory, targetCanonical, context, input, options });
   } finally {
-    await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+    worktreeArchivesInFlight.delete(targetCanonical);
   }
 }
 
+const isRegisteredWorktree = async (primaryWorktree, targetCanonical) => {
+  const entries = await listWorktreeEntries(primaryWorktree);
+  const registered = await Promise.all(entries.map(async (entry) => (entry?.worktree ? canonicalPath(entry.worktree) : null)));
+  return registered.includes(targetCanonical);
+};
+
+const archiveRegisteredWorktree = async ({ directory, id, worktreeDirectory, targetCanonical, context, input, options }) => {
+  // Only a checkout git registers here: the removal below would otherwise
+  // treat the folder as a leftover and delete it without a trace in git.
+  if (!(await isRegisteredWorktree(context.primaryWorktree, targetCanonical))) throw new Error('Not a worktree of this repository');
+  // A new worktree's files land in the background: a snapshot taken before
+  // they do records every missing file as deleted.
+  await waitForActiveWorktreeBootstrap(worktreeDirectory);
+  const bootstrap = worktreeBootstrapState.get(await toCanonicalBootstrapStateKey(worktreeDirectory));
+  if (bootstrap?.status === WORKTREE_BOOTSTRAP_FAILED) {
+    throw new Error('The worktree did not finish setting up, so it cannot be archived. Delete it instead.');
+  }
+
+  const head = await runGitCommand(worktreeDirectory, ['symbolic-ref', '--quiet', '--short', 'HEAD']);
+  const branch = head.success ? String(head.stdout || '').trim() : '';
+  // The task title; without one, the name the sidebar showed for the work.
+  const title = (branch ? toTaskTitle(await readGitConfigValue(worktreeDirectory, `branch.${branch}.description`)) : '')
+    || toTaskTitle(z.string().catch('').parse(input?.title));
+  const record = {
+    path: worktreeDirectory,
+    branch,
+    title,
+    archivedAt: Date.now(),
+    sessionIds: sessionIdListSchema.parse(input?.sessionIds),
+  };
+  const ref = `${WORKTREE_ARCHIVE_REF_PREFIX}${id}`;
+  const snapshot = await writeWorktreeSnapshot(worktreeDirectory, {
+    ref,
+    message: `${WORKTREE_ARCHIVE_SUBJECT}\n\n${JSON.stringify(record)}`,
+    oldValue: '',
+  });
+  try {
+    await removeWorktree(directory, {
+      directory: worktreeDirectory,
+      deleteLocalBranch: false,
+      disposeInstance: input?.disposeInstance,
+    }, options);
+  } catch (error) {
+    // `git worktree remove --force` deletes files before it gives up on a
+    // busy one, so the archive goes only when the worktree is provably whole:
+    // still registered, on disk, and in the very state the snapshot holds.
+    const snapshotTree = (await runGitCommand(context.primaryWorktree, ['rev-parse', `${snapshot.commit}^{tree}`])).stdout?.trim();
+    const intact = await checkPathExists(worktreeDirectory)
+      && await isRegisteredWorktree(context.primaryWorktree, targetCanonical)
+      && (await readWorktreeStateTree(worktreeDirectory).catch(() => null))?.tree === snapshotTree;
+    if (intact) {
+      await runGitCommand(context.primaryWorktree, ['update-ref', '-d', ref, snapshot.commit]);
+      throw error;
+    }
+    throw worktreeArchiveError(
+      `The worktree folder could not be removed completely (${error instanceof Error ? error.message : String(error)}). It is archived; restore it once nothing holds the folder.`,
+      'WORKTREE_ARCHIVE_PARTIAL',
+    );
+  }
+  return { id, ref, commit: snapshot.commit, head: snapshot.head, ...record, branchExists: Boolean(branch) };
+};
+
+/**
+ * Puts an archive's changes back into the worktree at `directory`, which the
+ * caller created on the archive's branch (or, when that branch is gone, on the
+ * archive's head commit). The changes are applied on top of whatever the
+ * branch holds now and left uncommitted, then the archive is deleted. A
+ * conflict leaves git's conflict state, which holds both sides. When git
+ * refuses to apply anything, the archive is kept and the call fails.
+ */
+export async function restoreWorktreeArchive(directory, input = {}) {
+  const worktreeDirectory = normalizeDirectoryPath(directory);
+  if (!worktreeDirectory) throw new Error('Worktree directory is required');
+  const context = await resolveWorktreeProjectContext(worktreeDirectory, { tolerateWorktreeRootConfigError: true });
+  const archive = await readWorktreeArchive(context.primaryWorktree, input?.id);
+  // A new worktree's files and setup commands land in the background after
+  // creation answers; changes applied meanwhile would race the checkout.
+  await waitForActiveWorktreeBootstrap(worktreeDirectory);
+  const bootstrap = worktreeBootstrapState.get(await toCanonicalBootstrapStateKey(worktreeDirectory));
+  if (bootstrap?.status === WORKTREE_BOOTSTRAP_FAILED) {
+    throw new Error('The worktree did not finish setting up, so its archived changes were not applied. The archive is kept.');
+  }
+
+  const trees = await runGitCommandOrThrow(worktreeDirectory, ['rev-parse', `${archive.commit}^{tree}`, `${archive.head}^{tree}`], 'Failed to read the worktree archive');
+  const [snapshotTree, headTree] = String(trees.stdout || '').trim().split('\n');
+  let conflicts = false;
+  if (snapshotTree !== headTree) {
+    const env = { ...(await buildGitEnv(worktreeDirectory)), ...SNAPSHOT_IDENTITY_ENV };
+    const applied = await runGitCommand(worktreeDirectory, ['cherry-pick', '--no-commit', archive.commit], { env });
+    if (applied.success) {
+      // The changes were uncommitted when archived; staging them was only the
+      // means of applying them.
+      await runGitCommandOrThrow(worktreeDirectory, ['reset', '--quiet'], 'Failed to unstage the restored changes');
+    } else {
+      // A conflict leaves unmerged entries; a refusal (files the setup
+      // commands wrote would be overwritten) applies nothing at all.
+      const unmerged = await runGitCommand(worktreeDirectory, ['ls-files', '--unmerged']);
+      if (!unmerged.success || !String(unmerged.stdout || '').trim()) {
+        throw worktreeArchiveError(
+          `The archived changes could not be applied (${applied.message || 'git refused'}). The archive is kept.`,
+          'WORKTREE_ARCHIVE_NOT_APPLIED',
+        );
+      }
+      conflicts = true;
+    }
+  }
+  // Once applied, conflicts included, the checkout holds the changes (git's
+  // conflict state carries both sides), so the archive goes: kept, it would
+  // still claim the sessions that are back at work.
+  await runGitCommand(context.primaryWorktree, ['update-ref', '-d', archive.ref, archive.commit]);
+  await publishWorktreeTopologyChange(context.primaryWorktree);
+  return { id: archive.id, conflicts };
+}
+
+/**
+ * Deletes an archive for good: its ref, and with `deleteBranch` its local
+ * branch too, unless a checkout uses that branch again.
+ */
+export async function deleteWorktreeArchive(directory, input = {}) {
+  const context = await resolveWorktreeProjectContext(directory, { tolerateWorktreeRootConfigError: true });
+  const archive = await readWorktreeArchive(context.primaryWorktree, input?.id);
+  await runGitCommandOrThrow(context.primaryWorktree, ['update-ref', '-d', archive.ref, archive.commit], 'Failed to delete the worktree archive');
+  let branchDeleted = false;
+  if (input?.deleteBranch === true && archive.branchExists) {
+    const checkedOut = (await listWorktreeEntries(context.primaryWorktree))
+      .some((entry) => cleanBranchName(String(entry.branchRef || entry.branch || '').trim()) === archive.branch);
+    if (!checkedOut) {
+      const removed = await runGitCommand(context.primaryWorktree, ['branch', '-D', archive.branch]);
+      branchDeleted = removed.success;
+    }
+  }
+  return { id: archive.id, branchDeleted };
+}
+
+/** @public */
 export async function deleteBranch(directory, branch, options = {}) {
   const { git } = await createRepositoryGitContext(directory);
 
@@ -6047,7 +6947,9 @@ export async function getLog(directory, options = {}) {
     // branch. A single requested ref means its reachable history instead.
     const baseLog = options.to && !resolvedFrom
       ? await git.log([`--max-count=${maxCount}`, options.to, ...(filePath ? ['--', filePath] : [])])
-      : await git.log({ maxCount, from: resolvedFrom, to: options.to, file: filePath });
+      // `from..to`, the commits `to` adds; simple-git defaults to `from...to`,
+      // which also lists what `from` gained since the two diverged.
+      : await git.log({ maxCount, from: resolvedFrom, to: options.to, file: filePath, symmetric: false });
 
     const logArgs = [
       'log',
@@ -6137,6 +7039,7 @@ export async function getLog(directory, options = {}) {
   }
 }
 
+/** @public */
 export async function isLinkedWorktree(directory) {
   const git = await createGit(directory);
   try {
@@ -6151,6 +7054,7 @@ export async function isLinkedWorktree(directory) {
   }
 }
 
+/** @public */
 export async function validateWorktreeDirectory(directory, worktreeRoot) {
   const directoryPath = normalizeDirectoryPath(directory);
   const rootPath = normalizeDirectoryPath(worktreeRoot);
@@ -6187,6 +7091,7 @@ export async function validateWorktreeDirectory(directory, worktreeRoot) {
   };
 }
 
+/** @public */
 export async function canonicalizeWorktreeState(directory) {
   const directoryPath = normalizeDirectoryPath(directory);
 
@@ -6348,6 +7253,7 @@ export async function getCommitFiles(directory, commitHash) {
   return { files };
 }
 
+/** @public */
 export async function renameBranch(directory, oldName, newName) {
   const { git, repoRoot } = await createRepositoryGitContext(directory);
 
@@ -6364,8 +7270,29 @@ export async function renameBranch(directory, oldName, newName) {
       .then((value) => String(value || '').trim())
       .catch(() => '');
 
-    // Use git branch -m command to rename the branch
+    // git refuses a taken name with a bare "already exists"; say where the
+    // name is in use so a worktree rename that collides is understandable.
+    const worktrees = await listWorktreeEntries(repoRoot).catch(() => []);
+    const takenBy = worktrees.find((entry) => entry.branch === normalizedNewName);
+    if (takenBy) {
+      const error = new Error(`Branch ${normalizedNewName} is already checked out in ${takenBy.worktree}`);
+      error.statusCode = 409;
+      throw error;
+    }
+    const existing = await runGitCommand(repoRoot, ['show-ref', '--verify', '--quiet', `refs/heads/${normalizedNewName}`]);
+    if (existing.success) {
+      const error = new Error(`A branch named ${normalizedNewName} already exists`);
+      error.statusCode = 409;
+      throw error;
+    }
+
     await git.raw(['branch', '-m', oldName, newName]);
+
+    // A worktree's branch lives in a file the topology watcher does not see,
+    // so tell the sidebar directly when the renamed branch is checked out.
+    if (worktrees.some((entry) => entry.branch === normalizedOldName)) {
+      await publishWorktreeTopologyChange(repoRoot);
+    }
 
     if (previousRemote && previousMerge && normalizedNewName) {
       const previousMergeBranch = cleanBranchName(previousMerge);
@@ -6390,7 +7317,7 @@ export async function renameBranch(directory, oldName, newName) {
 
     return { success: true, branch: newName };
   } catch (error) {
-    console.error('Failed to rename branch:', error);
+    if (error.statusCode !== 409) console.error('Failed to rename branch:', error);
     throw error;
   }
 }
@@ -6471,6 +7398,7 @@ export async function rebase(directory, options = {}) {
   }
 }
 
+/** @public */
 export async function abortRebase(directory) {
   const { git } = await createRepositoryGitContext(directory);
 
@@ -6519,6 +7447,7 @@ export async function merge(directory, options = {}) {
   }
 }
 
+/** @public */
 export async function abortMerge(directory) {
   const { git } = await createRepositoryGitContext(directory);
 
@@ -6641,7 +7570,7 @@ export async function getConflictDetails(directory) {
       .filter(Boolean);
 
     // Get current diff
-    const diff = await git.raw(['diff']).catch(() => '');
+    const diff = await git.raw(['diff', '--no-ext-diff']).catch(() => '');
 
     // simple-git resolves a quiet `rev-parse --verify` miss with empty output instead of rejecting.
     let operation = 'merge';
@@ -6676,6 +7605,7 @@ export async function getConflictDetails(directory) {
   }
 }
 
+/** @public */
 export async function getCommitFileDiff(directory, hash, filePath, isBinary) {
   if (!directory || !hash || !filePath) {
     throw new Error('directory, hash, and path are required for getCommitFileDiff');

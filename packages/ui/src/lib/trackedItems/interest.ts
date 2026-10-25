@@ -19,6 +19,10 @@ import { trackedItemKey, trackedItemRecordsSchema, type TrackedItem, type Tracke
  */
 
 const FLUSH_DELAY_MS = 150;
+// The server refuses a larger set outright, which would stop every surface's
+// updates; the surfaces declared first (the sidebar, mounted with the app)
+// keep theirs, since a declaration keeps its place when its set changes.
+const MAX_ITEMS = 300;
 // A failed send is retried once the server may be back; a change or a new
 // connection sends sooner.
 const RETRY_DELAY_MS = 30_000;
@@ -66,7 +70,12 @@ export function createTrackedItemsInterest({
 
   const union = () => {
     const items = new Map<string, TrackedItem>();
-    for (const declared of declarations.values()) for (const item of declared) items.set(trackedItemKey(item), item);
+    for (const declared of declarations.values()) {
+      for (const item of declared) {
+        if (items.size >= MAX_ITEMS) return items;
+        items.set(trackedItemKey(item), item);
+      }
+    }
     return items;
   };
 
@@ -169,11 +178,12 @@ export function useTrackedItems(items: readonly TrackedItem[]): void {
   const signature = items.map(trackedItemKey).sort().join('\n');
   const itemsRef = React.useRef(items);
   itemsRef.current = items;
+  // One declaration for the component's life: a changed set replaces it in
+  // place, so the surfaces that mounted first keep their place under the cap.
+  const [token] = React.useState(() => Symbol('tracked-items'));
+  React.useEffect(() => () => trackedItemsInterest.release(token), [token]);
   React.useEffect(() => {
     trackedItemsInterest.start();
-    if (!signature) return undefined;
-    const token = Symbol('tracked-items');
-    trackedItemsInterest.declare(token, itemsRef.current);
-    return () => trackedItemsInterest.release(token);
-  }, [signature]);
+    trackedItemsInterest.declare(token, signature ? itemsRef.current : []);
+  }, [signature, token]);
 }

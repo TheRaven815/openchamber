@@ -121,6 +121,7 @@ function buildTunnelStartReplayCommand({
   profileName,
   configPath,
   hostname,
+  httpsPort,
   connectTtlMs,
   sessionTtlMs,
   qr,
@@ -147,6 +148,9 @@ function buildTunnelStartReplayCommand({
   }
   if (typeof hostname === 'string' && hostname.trim().length > 0) {
     parts.push('--hostname', shellQuote(hostname));
+  }
+  if (Number.isInteger(httpsPort)) {
+    parts.push('--https-port', String(httpsPort));
   }
   const connectTtl = formatDurationForCli(connectTtlMs);
   if (connectTtl) {

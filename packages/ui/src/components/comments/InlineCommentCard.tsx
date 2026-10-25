@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Icon } from '@/components/icon/Icon';
 import { useI18n } from '@/lib/i18n';
+import { isWholeFileComment } from './wholeFileComment';
 
 interface InlineCommentCardProps {
   draft: InlineCommentDraft;
@@ -56,8 +57,9 @@ export function InlineCommentCard({
         </span>
         <span className="text-xs text-muted-foreground">•</span>
         <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
-          {t('inlineComment.range.lines', { start: draft.startLine, end: draft.endLine })}
-          {draft.side ? ` (${draft.side})` : ''}
+          {isWholeFileComment(draft)
+            ? t('inlineComment.range.wholeFile')
+            : <>{t('inlineComment.range.lines', { start: draft.startLine, end: draft.endLine })}{draft.side ? ` (${draft.side})` : ''}</>}
         </span>
         <button
           type="button"
@@ -96,12 +98,12 @@ export function InlineCommentCard({
               >
                 {isOpen ? (
                   <>
-                    <Icon name="arrow-up-s" className="mr-1 size-3" />
+                    <Icon name="arrow-up-s" className="me-1 size-3" />
                     {t('inlineComment.actions.showLess')}
                   </>
                 ) : (
                   <>
-                    <Icon name="arrow-down-s" className="mr-1 size-3" />
+                    <Icon name="arrow-down-s" className="me-1 size-3" />
                     {t('inlineComment.actions.showMore')}
                   </>
                 )}

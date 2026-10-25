@@ -90,11 +90,15 @@ export function useMessageTTS(readingKey?: string): UseMessageTTSReturn {
     const openaiCompatibleUrl = useConfigStore((state) => state.openaiCompatibleUrl);
     const openaiCompatibleTtsModel = useConfigStore((state) => state.openaiCompatibleTtsModel);
     const showMessageTTSButtons = useConfigStore((state) => state.showMessageTTSButtons);
+    const autoReadAloudEnabled = useConfigStore((state) => state.autoReadAloudEnabled);
     const ttsInputMode = useConfigStore((state) => state.ttsInputMode);
 
     const isServerProvider = voiceProvider === 'openai' || voiceProvider === 'openai-compatible';
-    const shouldCheckOpenAIAvailability = showMessageTTSButtons && isServerProvider;
-    const shouldCheckSayAvailability = showMessageTTSButtons && voiceProvider === 'say';
+    // Auto-read can be on while the per-message buttons are hidden; both
+    // paths still need the selected provider's availability.
+    const voicePlaybackEnabled = showMessageTTSButtons || autoReadAloudEnabled;
+    const shouldCheckOpenAIAvailability = voicePlaybackEnabled && isServerProvider;
+    const shouldCheckSayAvailability = voicePlaybackEnabled && voiceProvider === 'say';
 
     const { speak: speakServerTTS, stop: stopServerTTS, isAvailable: isServerTTSAvailable } = useServerTTS({
         enabled: shouldCheckOpenAIAvailability,

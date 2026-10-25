@@ -13,6 +13,7 @@
 import fsPromises from 'node:fs/promises';
 
 import {
+  parseLsofCwds,
   parseLsofListeners,
   parseNetstatListeners,
   parseProcNetTcpListeners,
@@ -68,6 +69,24 @@ const readProcListeners = async (readFile) => {
   return [...byPort.values()].sort((left, right) => left.port - right.port);
 };
 
+/**
+ * Adds the folder each listener's process runs in, which tells a project's dev
+ * server apart from the OS services and app helpers listening beside it. One
+ * batched call for every pid; when it fails the listeners stay as they were,
+ * without a folder, since the ports themselves are still known.
+ */
+const withProcessDirectories = async (spawn, listeners) => {
+  const pids = [...new Set(listeners.map((entry) => entry.pid).filter((pid) => Number.isInteger(pid)))];
+  if (pids.length === 0) return listeners;
+  const output = await runCommand(spawn, 'lsof', ['-a', '-d', 'cwd', '-p', pids.join(','), '-F', 'pn'], SCAN_TIMEOUT_MS);
+  if (output === null) return listeners;
+  const cwdByPid = parseLsofCwds(output);
+  return listeners.map((entry) => {
+    const directory = entry.pid === null ? undefined : cwdByPid.get(entry.pid);
+    return directory ? { ...entry, directory } : entry;
+  });
+};
+
 export const createDevServerScanner = ({ spawn, platform, readFile = fsPromises.readFile }) => {
   let cache = null;
 
@@ -80,7 +99,9 @@ export const createDevServerScanner = ({ spawn, platform, readFile = fsPromises.
     }
 
     const output = await runCommand(spawn, 'lsof', ['-iTCP', '-sTCP:LISTEN', '-P', '-n', '-F', 'pcn'], SCAN_TIMEOUT_MS);
-    if (output !== null) return { ok: true, listeners: parseLsofListeners(output) };
+    if (output !== null) {
+      return { ok: true, listeners: await withProcessDirectories(spawn, parseLsofListeners(output)) };
+    }
 
     const procListeners = await readProcListeners(readFile);
     if (procListeners !== null) return { ok: true, listeners: procListeners };
@@ -91,7 +112,10 @@ export const createDevServerScanner = ({ spawn, platform, readFile = fsPromises.
   return {
     /**
      * @param {{ ownPorts?: number[] }} options
-     * @returns {Promise<{ ok: true, servers: Array<{ port: number, pid: number|null, command: string, url: string }> } | { ok: false, reason: string }>}
+     * `directory` is the folder the listening process runs in, present only
+     * where `lsof` could tell: not on Windows and not from `/proc/net/tcp`.
+     *
+     * @returns {Promise<{ ok: true, servers: Array<{ port: number, pid: number|null, command: string, url: string, directory?: string }> } | { ok: false, reason: string }>}
      */
     async discover({ ownPorts = [] } = {}) {
       const now = Date.now();

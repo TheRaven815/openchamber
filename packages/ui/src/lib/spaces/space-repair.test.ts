@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
 import { useGlobalSessionsStore } from '@/stores/useGlobalSessionsStore';
-import { isSpaceActionUnavailable, isSpaceApplicable, runSpaceAction, spaceConditionOf, spaceMenuActionsOf } from './space-repair';
+import { isSpaceActionUnavailable, isSpaceApplicable, runSpaceAction, spaceConditionOf, spaceLineSaysState, spaceMenuActionsOf } from './space-repair';
 import { getSharedTrustConfirmationSnapshot, settleSharedTrustConfirmation } from '@/lib/sharedTrustConfirmation';
 import type { SpaceEntry } from './spaces-api';
 import { useSpacesStore, type SpaceMark } from './spaces-store';
@@ -13,6 +13,7 @@ const originalLoadSessions = useGlobalSessionsStore.getState().loadSessions;
 const entry = (change: Partial<SpaceEntry> = {}): SpaceEntry => ({
   id: ID,
   name: 'Fix login',
+  placeId: 'docker', machine: null,
   projectDirectory: '/home/me/app',
   projectFolder: { path: '/home/me/app', found: true },
   directory: `/spaces/${ID}/app`,
@@ -24,6 +25,7 @@ const entry = (change: Partial<SpaceEntry> = {}): SpaceEntry => ({
   grants: [],
   access: null,
   needsAccess: [],
+  accessFailures: [],
   damage: null,
   setup: null,
   ...change,
@@ -55,6 +57,9 @@ describe('the state of a space', () => {
 
   test('names what the host lists, the lost gatekeeper before a stop, a stop before a repairable damage', () => {
     expect(spaceConditionOf(entry({ state: 'missing' }), undefined, undefined)).toEqual({ kind: 'container_gone' });
+    // The machine is off: nothing to do; the machine left Settings: a delete forgets the record.
+    expect(spaceConditionOf(entry({ state: 'unreachable', machine: 'box', failure: { code: 'place_unreachable', message: 'box did not answer' } }), undefined, undefined)).toEqual({ kind: 'unreachable', machine: 'box', gone: false });
+    expect(spaceConditionOf(entry({ state: 'unreachable', machine: null, failure: { code: 'place_not_found', message: '' } }), undefined, undefined)).toEqual({ kind: 'unreachable', machine: null, gone: true });
     expect(spaceConditionOf(entry({ state: 'exited', damage: 'gatekeeper_gone' }), undefined, undefined)).toEqual({ kind: 'gatekeeper_gone' });
     expect(spaceConditionOf(entry({ state: 'exited' }), undefined, undefined)).toEqual({ kind: 'stopped' });
     expect(spaceConditionOf(entry({ state: 'exited', stoppedIdle: true }), mark('stale'), undefined)).toEqual({ kind: 'stopped_idle' });
@@ -63,6 +68,20 @@ describe('the state of a space', () => {
     expect(spaceConditionOf(entry(), mark('stale'), undefined)).toEqual({ kind: 'not_answering' });
     expect(spaceConditionOf(entry(), mark('unknown'), undefined)).toEqual({ kind: 'not_answering' });
     expect(spaceConditionOf(entry(), mark('partial'), undefined)).toBeNull();
+  });
+
+  test('the group line speaks for every state but a running space whose list came back in part', () => {
+    // The stale mark beside the name shows only where this is false.
+    expect(spaceLineSaysState(entry({ state: 'exited', stoppedIdle: true }), mark('stale'), undefined)).toBe(true);
+    expect(spaceLineSaysState(entry({ state: 'unreachable', machine: 'box', failure: { code: 'place_unreachable', message: '' } }), mark('stale'), undefined)).toBe(true);
+    expect(spaceLineSaysState(entry({ state: 'preparing', step: 'creating' }), mark('unknown'), undefined)).toBe(true);
+    expect(spaceLineSaysState(entry({ state: 'failed' }), mark('unknown'), undefined)).toBe(true);
+    expect(spaceLineSaysState(entry(), mark('stale'), undefined)).toBe(true);
+    expect(spaceLineSaysState(entry(), mark('complete'), { kind: 'running', action: 'restart' })).toBe(true);
+    expect(spaceLineSaysState(entry(), mark('stale'), { kind: 'failed', action: 'restart', failure: { code: 'space_unreachable', message: 'no' } })).toBe(true);
+    expect(spaceLineSaysState(entry(), mark('partial'), undefined)).toBe(false);
+    expect(spaceLineSaysState(entry(), mark('complete'), undefined)).toBe(false);
+    expect(spaceLineSaysState(undefined, mark('stale'), undefined)).toBe(false);
   });
 
   test('an action under way or failed in this window comes first', () => {
@@ -88,6 +107,8 @@ describe('the actions of a space', () => {
     expect(spaceMenuActionsOf(entry({ state: 'exited' }))).toEqual(['start', 'remove']);
     expect(spaceMenuActionsOf(entry({ state: 'exited', damage: 'gatekeeper_gone' }))).toEqual(['remove']);
     expect(spaceMenuActionsOf(entry({ state: 'missing' }))).toEqual(['remove']);
+    expect(spaceMenuActionsOf(entry({ state: 'unreachable', failure: { code: 'place_unreachable', message: '' } }))).toEqual([]);
+    expect(spaceMenuActionsOf(entry({ state: 'unreachable', failure: { code: 'place_not_found', message: '' } }))).toEqual(['remove']);
     expect(spaceMenuActionsOf(entry({ state: 'preparing' }))).toEqual([]);
     expect(spaceMenuActionsOf(undefined)).toEqual([]);
   });
@@ -118,13 +139,23 @@ describe('the actions of a space', () => {
       useGlobalSessionsStore.setState({ loadSessions: originalLoadSessions });
     });
 
-    test('restarts, reads the list again, and marks the space reachable once the server inside is ready', async () => {
+    test('restarts, marks the space reachable once the server inside is ready, and stays "restarting" until both lists are read again', async () => {
       useSpacesStore.getState().applyMarks([mark('stale')]);
+      // The session list's own load, held: its mark is what the host sets stale during a restart.
+      let releaseList: () => void = () => undefined;
+      const listHeld = new Promise<void>((resolve) => { releaseList = resolve; });
+      useGlobalSessionsStore.setState({ loadSessions: () => listHeld.then(() => ({ activeSessions: [], archivedSessions: [] })) });
       host((path) => (path.endsWith('/restart') ? new Response(JSON.stringify(entry()), { status: 200 }) : listAnswer([entry()])));
       const run = runSpaceAction(ID, 'restart');
       expect(useSpacesStore.getState().actions.get(ID)).toEqual({ kind: 'running', action: 'restart' });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      // The list read brings the project's own providers with it, for the composer's rule.
+      expect(requests).toEqual([`POST /api/openchamber/spaces/${ID}/restart`, 'GET /api/openchamber/spaces', 'GET /api/openchamber/spaces/custom-providers']);
+      // The restart went through and the journey list came back; the line still says "restarting".
+      expect(useSpacesStore.getState().journey?.get(ID)?.state).toBe('running');
+      expect(useSpacesStore.getState().actions.get(ID)).toEqual({ kind: 'running', action: 'restart' });
+      releaseList();
       await run;
-      expect(requests).toEqual([`POST /api/openchamber/spaces/${ID}/restart`, 'GET /api/openchamber/spaces']);
       expect(useSpacesStore.getState().actions.has(ID)).toBe(false);
       expect(useSpacesStore.getState().spaces.get(ID)?.state).toBe('complete');
     });

@@ -68,9 +68,9 @@ jobs:
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -82,7 +82,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Cache bundled OpenCode CLI artifact
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: packages/electron/.cache/opencode-cli
           key: opencode-cli-${{ runner.os }}-${{ matrix.arch }}-${{ steps.opencode_cli_version.outputs.version }}
@@ -122,6 +122,7 @@ jobs:
           bun run build:web-assets
           bun run prepare:opencode-cli
           bun run verify:opencode-cli
+          bun run prepare:ripgrep
           bun run bundle:main
           # npmRebuild=false in package.json, so electron-builder won't
           # recompile native deps on its own. Rebuild against the target
@@ -173,7 +174,7 @@ jobs:
           done
 
       - name: Upload macOS installable artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: desktop-release-smoke-macos-${{ matrix.arch }}
           path: |
@@ -212,9 +213,9 @@ jobs:
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -227,7 +228,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Cache bundled OpenCode CLI artifact
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: packages/electron/.cache/opencode-cli
           key: opencode-cli-${{ runner.os }}-${{ matrix.arch }}-${{ steps.opencode_cli_version.outputs.version }}
@@ -241,9 +242,13 @@ jobs:
       - name: Prepare bundled OpenCode CLI
         working-directory: packages/electron
         shell: bash
+        env:
+          # Windows arm64 builds on an x64 runner; OpenCode and ripgrep need the target arch.
+          OPENCHAMBER_TARGET_ARCH: ${{ matrix.arch }}
         run: |
           bun run prepare:opencode-cli
           bun run verify:opencode-cli
+          bun run prepare:ripgrep
 
       - name: Bundle main process
         working-directory: packages/electron
@@ -263,12 +268,15 @@ jobs:
       - name: Build Windows app
         working-directory: packages/electron
         shell: bash
+        env:
+          # verify:opencode-cli:packaged checks the CLI against the target arch.
+          OPENCHAMBER_TARGET_ARCH: ${{ matrix.arch }}
         run: |
           node ./scripts/package.mjs --win --${{ matrix.arch }} --publish=never
           bun run verify:opencode-cli:packaged
 
       - name: Upload Windows installable artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: desktop-release-smoke-windows-${{ matrix.arch }}
           path: |
@@ -289,11 +297,15 @@ jobs:
             arch: x64
             host_arch: x86_64
             artifact_arch: x86_64
+            deb_arch: amd64
+            rpm_arch: x86_64
             manifest: latest-linux.yml
           - runner: blacksmith-4vcpu-ubuntu-2404-arm
             arch: arm64
             host_arch: aarch64
             artifact_arch: arm64
+            deb_arch: arm64
+            rpm_arch: aarch64
             manifest: latest-linux-arm64.yml
     runs-on: ${{ matrix.runner }}
     steps:
@@ -307,9 +319,9 @@ jobs:
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Verify native Linux architecture
         env:
@@ -323,6 +335,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Install rpmbuild for the .rpm package
+        run: sudo apt-get update && sudo apt-get install -y rpm
+
       - name: Get build versions
         id: versions
         shell: bash
@@ -331,7 +346,7 @@ jobs:
           echo "app=$(node -p "require('./packages/electron/package.json').version")" >> "$GITHUB_OUTPUT"
 
       - name: Cache bundled OpenCode CLI artifact
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: packages/electron/.cache/opencode-cli
           key: opencode-cli-${{ runner.os }}-${{ matrix.arch }}-${{ steps.versions.outputs.opencode_cli }}
@@ -344,7 +359,7 @@ jobs:
           bun run test:architecture
           bun run test:updater
 
-      - name: Build and package Linux AppImage
+      - name: Build and package Linux AppImage, .deb and .rpm
         working-directory: packages/electron
         env:
           OPENCHAMBER_TARGET_ARCH: ${{ matrix.arch }}
@@ -353,6 +368,7 @@ jobs:
           bun run build:web-assets
           bun run prepare:opencode-cli
           bun run verify:opencode-cli
+          bun run prepare:ripgrep
           bun run bundle:main
           bun run rebuild:native
           node ./scripts/package.mjs --linux --${{ matrix.arch }} --publish=never
@@ -364,18 +380,24 @@ jobs:
         env:
           VERSION: ${{ steps.versions.outputs.app }}
           ARTIFACT_ARCH: ${{ matrix.artifact_arch }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+          RPM_ARCH: ${{ matrix.rpm_arch }}
           MANIFEST: ${{ matrix.manifest }}
         run: |
           set -euo pipefail
-          APPIMAGE="dist/OpenChamber-${VERSION}-linux-${ARTIFACT_ARCH}.AppImage"
-          node ./scripts/verify-update-manifest.mjs "dist/${MANIFEST}" "$APPIMAGE" "$VERSION"
+          node ./scripts/verify-update-manifest.mjs "dist/${MANIFEST}" "$VERSION" \
+            "dist/OpenChamber-${VERSION}-linux-${ARTIFACT_ARCH}.AppImage" \
+            "dist/OpenChamber-${VERSION}-linux-${DEB_ARCH}.deb" \
+            "dist/OpenChamber-${VERSION}-linux-${RPM_ARCH}.rpm"
 
       - name: Upload Linux installable artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: desktop-release-smoke-linux-${{ matrix.arch }}
           path: |
             packages/electron/dist/OpenChamber-${{ steps.versions.outputs.app }}-linux-${{ matrix.artifact_arch }}.AppImage
+            packages/electron/dist/OpenChamber-${{ steps.versions.outputs.app }}-linux-${{ matrix.deb_arch }}.deb
+            packages/electron/dist/OpenChamber-${{ steps.versions.outputs.app }}-linux-${{ matrix.rpm_arch }}.rpm
             packages/electron/dist/${{ matrix.manifest }}
           if-no-files-found: error
           retention-days: ${{ fromJSON(inputs.retention_days) }}

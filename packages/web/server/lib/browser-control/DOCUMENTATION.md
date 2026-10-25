@@ -15,7 +15,9 @@ itself; it can only ask and wait.
 - `routes.js` is the result callback (`POST /api/browser-control/result`). It
   validates the envelope and hands the outcome to the broker.
 - `../../index.js` supplies `emitRequest`, which writes the request to the
-  OpenChamber SSE clients and returns how many were reached.
+  OpenChamber SSE clients and returns how many were reached. The event carries
+  the same `context` (`directory`, `sessionId`, each `null` when unknown) the
+  extension provider receives, so the in-app browser knows which session asked.
 - `provider.js` sits between the control service and the broker. It reads
   the `browserProvider` setting on every action: `builtin` goes to the broker;
   an extension id goes to that extension's service (`contributes.service.provides`
@@ -47,15 +49,45 @@ itself; it can only ask and wait.
   `request()` (same signature as the broker) and owns their parameter
   validation.
 - The client half is `packages/ui/src/lib/browser/controlClient.ts`. Every
-  mounted browser tab registers its pane under its context-panel tab id. An
-  action with `tabId` runs in that tab; without one it runs in the browser tab
-  the user last had in front of them (`setShownBrowserTab`, set by
-  `ContextPanel`), never in whichever pane registered last, and never switches
-  the user to the tab it acts in. `browser.open` without `tabId` never
-  navigates an existing tab: the registered opener (`ContextPanel`,
-  `useUIStore.openAgentBrowserTab`) makes a new background tab and the answer
-  carries its `tabId`. `browser.snapshot` answers carry `tabs`
-  (`id`, `title`, `url`, `active`). A client without the named tab waits
+  mounted browser tab registers its pane under its context-panel tab id, with
+  its project and the session whose agent opened it (`ownerSessionId` on the
+  tab, null for the user's own). An action with `tabId` runs in that tab,
+  whoever opened it. Without one it runs in the calling session's tab: the
+  shown tab if it is the session's, else the one the session last opened or
+  worked in, else its newest. A session with no tab of its own gets the browser
+  tab the user last had in front of them (`setShownBrowserTab`, set by
+  `ContextPanel` with the project on screen) only when that tab is the user's
+  and in the session's project, and claims it only after a short delay, so a
+  client that holds the session's own tab wins the claim; otherwise the agent
+  is told so, with the tabs it could name. A request with no session keeps the
+  earlier rule within the project on screen: the shown tab, else that
+  project's newest tab. An action
+  never switches the user to the tab it acts in. `browser.open` without `tabId`
+  never navigates an existing tab: the registered opener (`ContextPanel`,
+  `useUIStore.openAgentBrowserTab`) makes a new background tab in the calling
+  session's project, owned by that session, and the answer carries its `tabId`.
+  `browser.close` removes a tab the calling session opened. Closing is panel
+  state rather than a page action, so the panel registers a closer the way it
+  registers the opener; without `tabId` the session closes its own most recent
+  tab, and a tab the user or another session opened is refused, never closed,
+  even when an action without `tabId` would otherwise have used it. A close
+  with no calling session, which the `POST /api/openchamber/control` route can
+  produce, owns no tab and is refused outright: a null session must not match
+  an unowned (the user's) tab. When the named tab is gone, a client with the
+  panel mounted answers "no such tab" after the claim delay rather than leaving
+  the agent to time out.
+  `ContextPanel` keeps agent tabs of every project mounted (or registered as
+  sleeping), so a session keeps working its page while the user looks at
+  another project. The user's own tabs, across every project together, keep
+  their page while among the `liveBrowserTabLimit` most recently used (a
+  General setting, 5 by default, `lib/browser/liveTabs.ts`); the rest sleep, and
+  those of other projects are not offered to agents. `browser.snapshot` answers carry `tabs` (`id`, `title`, `url`,
+  `owner`: `you`, `user`, or `another session`, `active`: the tab an action
+  without `tabId` would use); a session sees its own tabs and the other tabs of
+  its project, never another project's. `ContextPanel` renders loaded tabs
+  sorted by directory and tab id, so neither a project switch nor the store
+  reordering directories moves a live webview, which would reload its page.
+  A client without the named tab waits
   briefly, so the client that has it claims first, then claims and answers
   "no such tab". A tab restored from a previous run has no pane until it is
   shown or used, so `ContextPanel` registers it as sleeping
@@ -64,6 +96,32 @@ itself; it can only ask and wait.
   pane. `browser.capture` never opens the panel or switches its tab: a hidden
   pane is drawn at zero opacity inside the window for the screenshot, because
   Chromium composites a transparent webview but not a hidden or clipped one.
+  A hidden page also gets no animation frames, so `browser.scroll` waits for
+  two frames at most 100 ms (`pageActions.ts`) and then answers anyway.
+  Agent work never takes keyboard focus from the user
+  (`useWebviewFocusGuard` beside `BrowserPane`): a page may take focus only
+  while the user can see it and no agent action is driving it, otherwise focus
+  goes straight back to where it was. Before `browser.click` and
+  `browser.type` the pane asks the desktop shell
+  (`desktop_browser_keep_page_focused`) to emulate focus for that page: the
+  page then behaves as focused, so pickers stay open and its clipboard calls
+  work, while keyboard focus never leaves the user. The emulation stays for
+  the page's lifetime. When it is unavailable, because DevTools holds the
+  page's debugger, the action gives the page real focus for the script alone
+  (`holdPageFocus`) and returns it before waiting out any load the action
+  started. `browser.click` replays a mouse click at the element's center
+  (pointer and mouse down, focus, up, click), since many widgets open on
+  mousedown or focus and ignore the click event alone.
+  `browser.select` changes a native single-value HTML select by exact label or
+  value, dispatches `input` and `change`, and verifies the selected option
+  before returning.
+  `browser.snapshot` exposes native select metadata on the corresponding
+  element: `multiple`, plus an `options` list in DOM order containing each
+  option's `label`, `value`, `selected`, and `disabled` state. Text-content
+  labels collapse whitespace and trim like `browser.select`; an explicit
+  `label` attribute is used verbatim. The list is capped at 32 entries and
+  each label/value at 80 characters; `optionsTruncated: true` reports either
+  cap. A selected option outside the cap is not promoted into the result.
   `tabId` is validated and passed through by
   `../openchamber-control/service.js` for every action, so an extension
   provider receives it untouched (`BrowserTabTarget` in `@openchamber/sdk`).

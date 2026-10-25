@@ -30,6 +30,7 @@ let createdWorktreeResult: GitWorktreeCreateResult = createdWorktree;
 const bootstrapWatcherCalls: string[] = [];
 const bootstrapWatcherOptions: Array<{ onReady?: () => void }> = [];
 const warningToasts: string[] = [];
+const infoToasts: string[] = [];
 const removeCalls: Array<{ directory: string; payload: RemoveGitWorktreePayload }> = [];
 
 const sessionState = {
@@ -48,6 +49,7 @@ mock.module('@/lib/openchamberConfig', () => ({
 mock.module('@/components/ui', () => ({
   toast: {
     warning: (message: string) => warningToasts.push(message),
+    info: (message: string) => infoToasts.push(message),
   },
 }));
 
@@ -164,6 +166,7 @@ describe('worktreeManager list invalidation', () => {
     bootstrapWatcherCalls.length = 0;
     bootstrapWatcherOptions.length = 0;
     warningToasts.length = 0;
+    infoToasts.length = 0;
     removeCalls.length = 0;
     createdWorktreeResult = createdWorktree;
     sessionState.availableWorktreesByProject = new Map();
@@ -192,6 +195,18 @@ describe('worktreeManager list invalidation', () => {
     });
 
     expect(warningToasts).toEqual(['session.newWorktree.toast.fetchSourceAccess']);
+  });
+
+  test('says where a diverged leftover branch was kept', async () => {
+    createdWorktreeResult = { ...createdWorktree, branchBackup: 'feature-backup-1234567' };
+
+    await createWorktree({ id: 'project-branch-backup', path: '/repo' }, {
+      branchName: 'feature',
+      worktreeName: 'feature',
+    });
+
+    expect(infoToasts).toEqual(['session.newWorktree.toast.branchBackup']);
+    expect(warningToasts).toEqual([]);
   });
 
   test('retries an in-flight list when a worktree is created before it resolves', async () => {
@@ -610,6 +625,12 @@ describe('worktreeMapsEqual', () => {
     expect(worktreeMapsEqual(a, b)).toBe(false);
   });
 
+  test('returns false when the task title changes, so a named or renamed task reaches the sidebar', () => {
+    const a = new Map([['/repo', [wt('/r/feat', 'feat')]]]);
+    const b = new Map([['/repo', [wt('/r/feat', 'feat', { title: 'Sidebar works view' })]]]);
+    expect(worktreeMapsEqual(a, b)).toBe(false);
+  });
+
   test('returns false when paths differ', () => {
     const a = new Map([['/repo', [wt('/r/main', 'main')]]]);
     const b = new Map([['/repo', [wt('/r/other', 'main')]]]);
@@ -727,6 +748,34 @@ describe('partitionWorktreesByRegisteredProject', () => {
 
     expect([...result.keys()]).toEqual(['/repo']);
     expect(result.get('/repo')?.map((entry) => entry.path)).toEqual(['/worktrees/loose']);
+  });
+
+  test('omits the checkout that holds a sub-folder project and keeps the other worktrees', () => {
+    const projects = [{ path: '/repo/a' }, { path: '/repo/b' }];
+    const topology = new Map<string, WorktreeMetadata[]>([
+      ['/repo/a', [worktree('/repo'), worktree('/repo/.worktrees/nested'), worktree('/repo-feature')]],
+      ['/repo/b', [worktree('/repo'), worktree('/repo/.worktrees/nested'), worktree('/repo-feature')]],
+    ]);
+
+    const result = partitionWorktreesByRegisteredProject(projects, topology);
+
+    expect([...result.keys()]).toEqual(['/repo/a']);
+    expect(result.get('/repo/a')?.map((entry) => entry.path)).toEqual(['/repo/.worktrees/nested', '/repo-feature']);
+  });
+
+  test('a worktree first listed from the second sub-folder project still goes to the first one', () => {
+    const projects = [{ path: '/repo/a' }, { path: '/repo/b' }];
+    const discovered = new Map<string, WorktreeMetadata[]>([
+      ['/repo/a', [worktree('/repo')]],
+      ['/repo/b', [worktree('/repo')]],
+    ]);
+    expect(partitionWorktreesByRegisteredProject(projects, discovered).size).toBe(0);
+
+    const refreshed = replaceRepositoryWorktrees(discovered, '/repo/b', [worktree('/repo'), worktree('/repo-feature')]);
+    const result = partitionWorktreesByRegisteredProject(projects, refreshed);
+
+    expect([...result.keys()]).toEqual(['/repo/a']);
+    expect(result.get('/repo/a')?.map((entry) => entry.path)).toEqual(['/repo-feature']);
   });
 });
 
@@ -921,6 +970,21 @@ describe('worktreeManager missing worktrees', () => {
     expect(result.map((entry) => [entry.path, entry.worktreeStatus])).toEqual([
       ['/repo-missing/.worktrees/alive', 'ready'],
       ['/repo-missing/.worktrees/gone', 'missing'],
+    ]);
+  });
+
+  test('keeps the contributor fork provenance the server lists', async () => {
+    const provenance = { kind: 'contributor-fork' as const, revision: 1, trust: 'untrusted' as const, push: 'destination-selection-required' as const };
+    listImplementation = async () => [
+      { path: '/repo-fork/.worktrees/own', branch: 'own', head: 'abc', name: 'own' },
+      { path: '/repo-fork/.worktrees/pr', branch: 'pr', head: 'def', name: 'pr', provenance },
+    ];
+
+    const result = await listProjectWorktrees({ id: 'project-fork', path: '/repo-fork' }, { force: true });
+
+    expect(result.map((entry) => [entry.path, entry.provenance ?? null])).toEqual([
+      ['/repo-fork/.worktrees/own', null],
+      ['/repo-fork/.worktrees/pr', provenance],
     ]);
   });
 

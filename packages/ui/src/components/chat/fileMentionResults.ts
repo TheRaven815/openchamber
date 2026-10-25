@@ -1,4 +1,4 @@
-import { scoreByFuzzyQuery } from '@/lib/search/fuzzySearch';
+import { rankBySubsequence } from '@/lib/search/subsequenceSearch';
 import type { ProjectFileSearchHit } from '@/lib/opencode/client';
 
 export type FileMentionHit = ProjectFileSearchHit & { kind: 'file' | 'directory' };
@@ -26,8 +26,8 @@ export const mentionServerQuery = (query: string): string => {
 
 /**
  * Merge directory and file hits into one list ranked by match quality against
- * the full relative path. Multi-token queries require every token to appear
- * somewhere in the path, in any order.
+ * the relative path, letters in order like the server's own file search;
+ * matches in the name rank above matches only across folders. Multi-token queries require every token to match the path, in any order.
  */
 export function rankFileMentionResults(
   files: ProjectFileSearchHit[],
@@ -45,17 +45,8 @@ export function rankFileMentionResults(
     return merged.slice(0, limit);
   }
 
-  const pathOf = (hit: FileMentionHit) => hit.relativePath || hit.name;
-  const candidates = tokens.length === 1
-    ? merged
-    : merged.filter((hit) => {
-        const haystack = pathOf(hit).toLowerCase();
-        return tokens.every((token) => haystack.includes(token));
-      });
-
-  const primary = tokens.reduce((longest, token) => (token.length > longest.length ? token : longest));
-  return scoreByFuzzyQuery(candidates, primary, pathOf, { limit, threshold: 0.4 }).map(
-    (scored) => scored.item,
+  return rankBySubsequence(merged, tokens.join(' '), (hit) => hit.relativePath || hit.name, { limit, paths: true }).map(
+    (ranked) => ranked.item,
   );
 }
 

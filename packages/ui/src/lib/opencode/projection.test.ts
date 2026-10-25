@@ -5,6 +5,8 @@ import { partIds, type ConfigDocument } from "./model"
 import {
   configModelIdentifier,
   deniesAnyProvider,
+  findIntegrationPolicy,
+  isIntegrationDenied,
   mergeConfigDocuments,
   projectAgent,
   projectAssistantContent,
@@ -12,6 +14,7 @@ import {
   projectSession,
   projectToolPart,
   projectUserParts,
+  readIntegrationPolicies,
 } from "./projection"
 
 const sessionInfo: SessionInfo = {
@@ -223,7 +226,7 @@ describe("projectMessage (other roles)", () => {
       { id: "2", type: "system", time: { created: 2 }, text: "sys", description: "d" },
       { id: "3", type: "skill", time: { created: 3 }, skill: "sk", name: "Skill", text: "t" },
       { id: "4", type: "shell", time: { created: 4 }, shellID: "sh", command: "ls", status: "exited", exit: 0 },
-      { id: "5", type: "compaction", time: { created: 5 }, status: "running", reason: "auto", summary: "", recent: "" },
+      { id: "5", type: "compaction", time: { created: 5 }, status: "running", reason: "auto", summary: "" },
       {
         id: "6",
         type: "compaction",
@@ -257,6 +260,16 @@ describe("projectMessage (other roles)", () => {
     expect(projected.every((entry) => entry.parts.length === 0)).toBe(true)
     expect(projected[5].message).toMatchObject({ status: "failed", summary: "", error: { message: "boom" } })
     expect(projected[8].message).toMatchObject({ directory: "/b", previous: "/a" })
+  })
+
+  test("an idle record keeps the error of a failed turn", () => {
+    const failed = projectMessage(
+      { id: "1", type: "idle", time: { created: 1 }, outcome: "failed", error: { type: "provider", message: "quota" } },
+      "ses_1",
+    )
+    expect(failed.message).toMatchObject({ role: "idle", outcome: "failed", error: { type: "provider", message: "quota" } })
+    const succeeded = projectMessage({ id: "2", type: "idle", time: { created: 2 }, outcome: "succeeded" }, "ses_1")
+    expect("error" in succeeded.message).toBe(false)
   })
 })
 
@@ -308,19 +321,69 @@ describe("deniesAnyProvider", () => {
   test("sees a provider.use deny in any layer, even when a later document has its own experimental block", () => {
     const entries = [
       doc("/home/u/.config/opencode/opencode.json", { policies: [{ action: "provider.use", resource: "*", effect: "deny" }] }),
-      doc("/repo/opencode.json", { policies: [{ action: "permission", resource: "shell:*", effect: "deny" }] }),
+      doc("/repo/opencode.json", { policies: [{ action: "tool.use", resource: "shell:*", effect: "deny" }] }),
     ]
     expect(deniesAnyProvider(entries)).toBe(true)
   })
 
-  test("an allow or a permission policy alone is no restriction", () => {
+  test("an allow or a tool policy alone is no restriction", () => {
     expect(deniesAnyProvider([
       doc("/repo/opencode.json", { policies: [
         { action: "provider.use", resource: "anthropic", effect: "allow" },
-        { action: "permission", resource: "shell:*", effect: "deny" },
+        { action: "tool.use", resource: "shell:*", effect: "deny" },
       ] }),
     ])).toBe(false)
     expect(deniesAnyProvider([doc("/repo/opencode.json")])).toBe(false)
+  })
+
+  test("reads top-level policies, where OpenCode 2.0.29 serves them", () => {
+    expect(deniesAnyProvider([
+      { type: "document", path: "/repo/opencode.json", info: { policies: [{ action: "provider.use", resource: "*", effect: "deny" }] } },
+    ])).toBe(true)
+  })
+})
+
+describe("integration policies", () => {
+  const doc = (path: string, experimental?: ConfigDocument["info"]["experimental"]): ConfigEntry =>
+    ({ type: "document", path, info: experimental ? { experimental } : {} })
+
+  test("blocks a server or skill a deny names, with wildcards, and ignores other actions", () => {
+    const policies = readIntegrationPolicies([
+      doc("/repo/opencode.json", { policies: [
+        { action: "integration.use", resource: "mcp:github*", effect: "deny" },
+        { action: "integration.use", resource: "skill:deploy", effect: "deny" },
+        { action: "tool.use", resource: "mcp:linear", effect: "deny" },
+      ] }),
+    ])
+    expect(isIntegrationDenied(policies, "mcp:github-enterprise")).toBe(true)
+    expect(isIntegrationDenied(policies, "skill:deploy")).toBe(true)
+    expect(findIntegrationPolicy(policies, "skill:deploy")).toEqual({ resource: "skill:deploy", effect: "deny", path: "/repo/opencode.json" })
+    expect(isIntegrationDenied(policies, "skill:deploy-docs")).toBe(false)
+    expect(isIntegrationDenied(policies, "mcp:linear")).toBe(false)
+  })
+
+  test("decides like OpenCode: documents reversed, the last matching statement wins", () => {
+    // OpenCode reverses the documents, so the first one (the user's global
+    // config) has the final say over a repository's.
+    const policies = readIntegrationPolicies([
+      doc("/home/u/.config/opencode/opencode.json", { policies: [{ action: "integration.use", resource: "mcp:*", effect: "deny" }] }),
+      doc("/repo/opencode.json", { policies: [{ action: "integration.use", resource: "mcp:docs", effect: "allow" }] }),
+    ])
+    expect(isIntegrationDenied(policies, "mcp:docs")).toBe(true)
+    expect(isIntegrationDenied(readIntegrationPolicies([
+      doc("/repo/opencode.json", { policies: [
+        { action: "integration.use", resource: "mcp:*", effect: "deny" },
+        { action: "integration.use", resource: "mcp:docs", effect: "allow" },
+      ] }),
+    ]), "mcp:docs")).toBe(false)
+    expect(isIntegrationDenied([], "mcp:docs")).toBe(false)
+  })
+
+  test("reads top-level policies, where OpenCode 2.0.29 serves them", () => {
+    const policies = readIntegrationPolicies([
+      { type: "document", path: "/repo/opencode.json", info: { policies: [{ action: "integration.use", resource: "mcp:github", effect: "deny" }] } },
+    ])
+    expect(isIntegrationDenied(policies, "mcp:github")).toBe(true)
   })
 })
 

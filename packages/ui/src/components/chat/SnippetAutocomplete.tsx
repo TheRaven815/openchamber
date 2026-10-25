@@ -123,7 +123,7 @@ export const SnippetAutocomplete = React.forwardRef<SnippetAutocompleteHandle, S
   }), [chooseSnippet, filteredSnippets, onClose, openNewSnippetSettings]);
 
   return (
-    <div ref={containerRef} className="absolute z-[100] min-w-0 w-full max-w-[450px] max-h-60 oc-glass-popover border-2 border-border/60 rounded-xl shadow-none bottom-full mb-2 left-0 flex flex-col" style={mobileMaxHeight !== undefined ? { ...style, maxHeight: mobileMaxHeight } : style}>
+    <div ref={containerRef} className="absolute z-[100] min-w-0 w-full max-w-[450px] max-h-60 oc-glass-popover oc-glass-floating rounded-xl bottom-full mb-2 inset-s-0 flex flex-col" style={mobileMaxHeight !== undefined ? { ...style, maxHeight: mobileMaxHeight } : style}>
       <ScrollableOverlay preventOverscroll outerClassName="flex-1 min-h-0" className="px-0 pb-2">
         <div
           ref={(el) => { itemRefs.current[0] = el; }}
@@ -145,7 +145,7 @@ export const SnippetAutocomplete = React.forwardRef<SnippetAutocompleteHandle, S
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
                 <span className="font-semibold truncate">#{snippet.name}</span>
-                <span className="text-[10px] leading-none uppercase font-bold tracking-tight px-1.5 py-1 rounded border flex-shrink-0 bg-[var(--surface-muted)] text-muted-foreground border-[var(--interactive-border)]/60">{t(`snippets.source.${snippet.source}`)}</span>
+                <span className="text-[0.625rem] leading-none uppercase font-bold tracking-tight px-1.5 py-1 rounded border flex-shrink-0 bg-[var(--surface-muted)] text-muted-foreground border-[var(--interactive-border)]/60">{t(`snippets.source.${snippet.source}`)}</span>
               </div>
               {!isMobile && (
                 <div className="typography-meta text-muted-foreground mt-0.5 truncate">{snippetPreview(snippet)}</div>

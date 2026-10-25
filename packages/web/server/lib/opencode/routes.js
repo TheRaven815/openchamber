@@ -1,4 +1,5 @@
 import { readOpenCodeInfo, isSupportedOpenCodeVersion } from './compatibility.js';
+import { createSharedHealthProbe, parseHealthWaitMs, waitForOpenCodeHealth } from './health-wait.js';
 import express from 'express';
 import { resolveNpmRegistryRequest } from './npm-registry-config.js';
 import fs from 'fs';
@@ -9,7 +10,7 @@ import {
 import { getClaudeCliAuthStatus } from './claude-cli-auth.js';
 import { OPENCODE_CONFIG_DIR, readConfigLayers } from './shared.js';
 import { settingsSurfaceOf } from './settings-files.js';
-import { parseWebSearchSelection } from './config-v2.js';
+import { parseWebSearchSelection, readSectionEntry, toProviderEntity } from './config-v2.js';
 import { getWebSearchSource, setWarmingEnabled, setWebSearchSelection } from './websearch-config.js';
 import {
   CREDENTIAL_LIST_ERROR,
@@ -19,7 +20,11 @@ import {
   isProviderConnectRequest,
 } from '../enterprise-mode.js';
 import { discoverProviderModels } from './model-discovery.js';
+import { readDisabledProviders, setProviderDisabled } from './providers.js';
 import { vcsInitRefusal, vcsInitRefusalBody } from '../git/repository-root.js';
+
+// Version reads use the same short deadline as the health probe of `/api/info`.
+const OPENCODE_INFO_TIMEOUT_MS = 3_000;
 
 export const registerOpenCodeRoutes = (app, dependencies) => {
   const {
@@ -174,6 +179,7 @@ export const registerOpenCodeRoutes = (app, dependencies) => {
         fetch(buildOpenCodeUrl('/api/info', ''), {
           method: 'GET',
           headers: { Accept: 'application/json', ...getOpenCodeAuthHeaders() },
+          signal: AbortSignal.timeout(OPENCODE_INFO_TIMEOUT_MS),
         }),
         fetchLatestOpenCodeVersion(),
       ]);
@@ -211,27 +217,50 @@ export const registerOpenCodeRoutes = (app, dependencies) => {
   // OpenCode 2.0.8 removed `GET /api/health`; `GET /api/info` replaces it and a
   // 200 from it is the readiness signal (there is no `healthy` field any more).
   // OpenChamber's own `{ healthy }` response shape stays as its clients know it.
-  app.get('/api/opencode/health', async (_req, res) => {
+  const probeOpenCodeHealth = async () => {
     try {
       const healthResponse = await fetch(buildOpenCodeUrl('/api/info', ''), {
         method: 'GET',
         headers: { Accept: 'application/json', ...getOpenCodeAuthHeaders() },
+        signal: AbortSignal.timeout(OPENCODE_INFO_TIMEOUT_MS),
       });
       const info = await healthResponse.json().catch(() => null);
       if (!healthResponse.ok) {
-        return res.status(healthResponse.status).json({
+        return {
           healthy: false,
-          error: info?.error || healthResponse.statusText || 'OpenCode health check failed',
-        });
+          status: healthResponse.status,
+          body: { healthy: false, error: info?.error || healthResponse.statusText || 'OpenCode health check failed' },
+        };
       }
       const parsed = await readOpenCodeInfo(Response.json(info));
-      return res.json({ healthy: parsed !== null && isSupportedOpenCodeVersion(parsed.version) });
+      const healthy = parsed !== null && isSupportedOpenCodeVersion(parsed.version);
+      // OpenCode answered: an unsupported version stays unsupported however long a client waits.
+      return { healthy, final: true, status: 200, body: { healthy } };
     } catch (error) {
-      return res.status(503).json({
+      return {
         healthy: false,
-        error: error instanceof Error ? error.message : 'OpenCode health check failed',
-      });
+        status: 503,
+        body: { healthy: false, error: error instanceof Error ? error.message : 'OpenCode health check failed' },
+      };
     }
+  };
+
+  // Concurrent waiters (several windows, tabs or devices starting together)
+  // share one probe per interval.
+  const sharedOpenCodeHealthProbe = createSharedHealthProbe({ probe: probeOpenCodeHealth });
+
+  // `?wait=<ms>` holds an unhealthy answer until OpenCode is ready or the wait
+  // runs out (capped), so a starting client learns of readiness at once.
+  app.get('/api/opencode/health', async (req, res) => {
+    let clientGone = false;
+    res.on('close', () => { clientGone = true; });
+    const result = await waitForOpenCodeHealth({
+      probe: sharedOpenCodeHealthProbe,
+      waitMs: parseHealthWaitMs(req.query?.wait),
+      isAborted: () => clientGone,
+    });
+    if (clientGone) return;
+    return res.status(result.status).json(result.body);
   });
 
   app.get('/api/opencode/version', async (_req, res) => {
@@ -239,6 +268,7 @@ export const registerOpenCodeRoutes = (app, dependencies) => {
       const healthResponse = await fetch(buildOpenCodeUrl('/api/info', ''), {
         method: 'GET',
         headers: { Accept: 'application/json', ...getOpenCodeAuthHeaders() },
+        signal: AbortSignal.timeout(OPENCODE_INFO_TIMEOUT_MS),
       });
       const info = await healthResponse.json().catch(() => null);
       if (!healthResponse.ok) {
@@ -265,6 +295,31 @@ export const registerOpenCodeRoutes = (app, dependencies) => {
       console.error('[API:PUT /api/config/settings] Failed to save settings:', error);
       console.error('[API:PUT /api/config/settings] Error stack:', error.stack);
       res.status(500).json({ error: 'Failed to save settings' });
+    }
+  });
+
+  // Providers turned off in the user's OpenCode config. OpenCode leaves them
+  // out of its provider list, so Settings reads them here to offer them back.
+  app.get('/api/provider/disabled', (_req, res) => {
+    try {
+      return res.json({ providers: readDisabledProviders(null) });
+    } catch (error) {
+      console.error('Failed to read disabled providers:', error);
+      return res.status(500).json({ error: 'Failed to read disabled providers' });
+    }
+  });
+
+  app.put('/api/provider/:providerId/disabled', async (req, res) => {
+    if (typeof req.body?.disabled !== 'boolean') {
+      return res.status(400).json({ error: 'disabled must be true or false' });
+    }
+    try {
+      const providers = setProviderDisabled(req.params.providerId, req.body.disabled, null);
+      return res.json({ providers, ...buildAppliedResponse('Provider updated.') });
+    } catch (error) {
+      if (error?.statusCode === 400) return res.status(400).json({ error: error.message });
+      console.error('Failed to update disabled providers:', error);
+      return res.status(500).json({ error: 'Failed to update disabled providers' });
     }
   });
 
@@ -403,7 +458,19 @@ export const registerOpenCodeRoutes = (app, dependencies) => {
           const { getProviderAuth } = await getAuthLibrary();
           const storedAuth = await getProviderAuth(providerID);
           storedApiKey = storedAuth?.type === 'api' && typeof storedAuth.key === 'string' ? storedAuth.key : null;
-          storedBaseURL = readConfigLayers().mergedConfig?.provider?.[providerID]?.options?.baseURL;
+          const { value: rawProvider } = readSectionEntry(readConfigLayers().mergedConfig, 'providers', providerID);
+          const providerEntity = rawProvider ? toProviderEntity(rawProvider) : null;
+          storedBaseURL = providerEntity?.settings?.baseURL;
+          if (!storedApiKey) {
+            // OpenCode tries each `env` name in order, so pick the first one
+            // that is set; when none is, keep the first so discovery can name
+            // it in the error instead of failing as an anonymous 401. This
+            // reads the server's environment: a variable that exists only in
+            // the managed OpenCode launch environment (Settings user env) is
+            // not visible here.
+            const envName = providerEntity?.env?.find((name) => process.env[name]) ?? providerEntity?.env?.[0];
+            storedApiKey = providerEntity?.settings?.apiKey || (envName ? `{env:${envName}}` : null);
+          }
         } catch {
           storedApiKey = null;
         }

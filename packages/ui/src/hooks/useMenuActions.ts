@@ -1,15 +1,18 @@
 import React from 'react';
 import { toast } from '@/components/ui';
 import { useSessionUIStore } from '@/sync/session-ui-store';
-import { getSyncSessions } from '@/sync/sync-refs';
+import { readOrderedActiveSessions, stepSession } from '@/lib/sessionListOrder';
+import { resolveGlobalSessionDirectory } from '@/stores/useGlobalSessionsStore';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { normalizeContextPanelDirectoryKey, useUIStore } from '@/stores/useUIStore';
+import { getZoneView, resolveZoneActiveTabId, shownContextModes, zoneOfMode } from '@/lib/workspace/zones';
 import { useUpdateStore } from '@/stores/useUpdateStore';
 import { useThemeSystem } from '@/contexts/useThemeSystem';
 import { sessionEvents } from '@/lib/sessionEvents';
 import { createWorktreeSession } from '@/lib/worktreeSessionCreator';
 import { showOpenCodeStatus } from '@/lib/openCodeStatus';
+import { useI18n } from '@/lib/i18n';
 import { addSelectionToChat } from '@/lib/addSelectionToChat';
 import { navigateSessionHistory } from '@/lib/sessionNavigationHistory';
 
@@ -58,13 +61,6 @@ const copyCurrentSelectionFallback = async (): Promise<boolean> => {
 const MENU_ACTION_EVENT = 'openchamber:menu-action';
 const CHECK_FOR_UPDATES_EVENT = 'openchamber:check-for-updates';
 
-type DesktopBridgeGlobal = {
-  listen?: (
-    event: string,
-    handler: (evt: { payload?: unknown }) => void
-  ) => Promise<() => void>;
-};
-
 type MenuAction =
   | 'about'
   | 'settings'
@@ -97,6 +93,7 @@ type MenuAction =
 export const useMenuActions = (
   onToggleMemoryDebug?: () => void
 ) => {
+  const { t } = useI18n();
   const openNewSessionDraft = useSessionUIStore((s) => s.openNewSessionDraft);
   const toggleCommandPalette = useUIStore((s) => s.toggleCommandPalette);
   const setCommandPaletteOpen = useUIStore((s) => s.setCommandPaletteOpen);
@@ -139,20 +136,12 @@ export const useMenuActions = (
   }, []);
 
   const navigateSession = React.useCallback((direction: -1 | 1) => {
-    const sessions = getSyncSessions();
-    if (sessions.length === 0) return;
-
     const currentSessionId = useSessionUIStore.getState().currentSessionId;
-    const currentIndex = sessions.findIndex((session) => session.id === currentSessionId);
-    let nextIndex = direction > 0 ? 0 : sessions.length - 1;
-    if (currentIndex >= 0) {
-      nextIndex = (currentIndex + direction + sessions.length) % sessions.length;
-    }
-    const nextSession = sessions[nextIndex];
+    const nextSession = stepSession(readOrderedActiveSessions(), currentSessionId, direction);
     if (!nextSession) return;
 
     setSessionSwitcherOpen(false);
-    useSessionUIStore.getState().setCurrentSession(nextSession.id);
+    useSessionUIStore.getState().setCurrentSession(nextSession.id, resolveGlobalSessionDirectory(nextSession));
   }, [setSessionSwitcherOpen]);
 
   const navigateProject = React.useCallback((direction: -1 | 1) => {
@@ -216,11 +205,15 @@ export const useMenuActions = (
           if (!directory) break;
           const uiState = useUIStore.getState();
           const directoryKey = normalizeContextPanelDirectoryKey(directory);
+          // The right zone only: it is the panel this menu item always meant.
           const panelState = uiState.contextPanelByDirectory[directoryKey];
+          const rightTabId = panelState
+            ? resolveZoneActiveTabId(panelState.tabs, uiState.contextSurfaceZones, 'right', getZoneView(panelState, 'right').activeTabId)
+            : null;
           if (panelState?.isOpen) {
             uiState.closeContextPanel(directoryKey);
-          } else if (panelState?.activeTabId) {
-            uiState.setActiveContextPanelTab(directoryKey, panelState.activeTabId);
+          } else if (rightTabId) {
+            uiState.setActiveContextPanelTab(directoryKey, rightTabId);
           } else {
             uiState.openContextSurface(directoryKey, 'git');
           }
@@ -254,11 +247,10 @@ export const useMenuActions = (
           const key = normalizeContextPanelDirectoryKey(directory);
           const uiState = useUIStore.getState();
           const panel = uiState.contextPanelByDirectory[key];
-          const activeMode = panel?.isOpen ? panel.tabs.find((tab) => tab.id === panel.activeTabId)?.mode : null;
-          if (activeMode !== 'terminal') {
+          if (!shownContextModes(panel, uiState.contextSurfaceZones).has('terminal')) {
             uiState.openContextSurface(key, 'terminal');
           }
-          uiState.toggleContextPanelExpanded(key);
+          uiState.toggleContextPanelExpanded(key, zoneOfMode(uiState.contextSurfaceZones, 'terminal'));
           break;
         }
 
@@ -327,7 +319,7 @@ export const useMenuActions = (
 
         case 'download-logs': {
           void showOpenCodeStatus().catch(() => {
-            toast.error('Failed to collect OpenCode status');
+            toast.error(t('openCodeStatusDialog.toast.collectFailed'));
           });
           break;
         }
@@ -344,6 +336,7 @@ export const useMenuActions = (
       setCommandPaletteOpen,
       setSettingsDialogOpen,
       setThemeMode,
+      t,
       toggleCommandPalette,
       toggleHelpDialog,
       toggleSidebar,
@@ -369,53 +362,4 @@ export const useMenuActions = (
     };
   }, [handleAction, handleCheckForUpdates]);
 
-  React.useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const desktop = (window as unknown as { __OPENCHAMBER_DESKTOP__?: DesktopBridgeGlobal }).__OPENCHAMBER_DESKTOP__;
-    const listen = desktop?.listen;
-    if (typeof listen !== 'function') return;
-
-    let unlistenMenu: null | (() => void | Promise<void>) = null;
-    let unlistenUpdate: null | (() => void | Promise<void>) = null;
-
-    listen('openchamber:menu-action', (evt) => {
-      const action = evt?.payload;
-      if (typeof action !== 'string') return;
-      handleAction(action as MenuAction);
-    })
-      .then((fn) => {
-        unlistenMenu = fn;
-      })
-      .catch(() => {
-        // ignore
-      });
-
-    listen('openchamber:check-for-updates', () => {
-      window.dispatchEvent(new Event(CHECK_FOR_UPDATES_EVENT));
-    })
-      .then((fn) => {
-        unlistenUpdate = fn;
-      })
-      .catch(() => {
-        // ignore
-      });
-
-    return () => {
-      const cleanup = async () => {
-        try {
-          const a = unlistenMenu?.();
-          if (a instanceof Promise) await a;
-        } catch {
-          // ignore
-        }
-        try {
-          const b = unlistenUpdate?.();
-          if (b instanceof Promise) await b;
-        } catch {
-          // ignore
-        }
-      };
-      void cleanup();
-    };
-  }, [handleAction]);
 };

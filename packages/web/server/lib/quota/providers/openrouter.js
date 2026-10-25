@@ -14,7 +14,7 @@ import {
 
 export const providerId = 'openrouter';
 export const providerName = 'OpenRouter';
-export const aliases = ['openrouter'];
+const aliases = ['openrouter'];
 const OPENROUTER_API_BASE = 'https://openrouter.ai/api/v1';
 const PERIOD_SECONDS = { daily: 86400, weekly: 604800, monthly: 30 * 86400 };
 
@@ -169,7 +169,7 @@ export const fetchQuota = async () => {
         windowSeconds = PERIOD_SECONDS[data.limit_reset];
         resetAt = resolveResetAt(data.limit_reset, nowMs);
       } else {
-        windowKey = 'credits';
+        windowKey = 'key_limit';
         windowSeconds = null;
         resetAt = null;
       }

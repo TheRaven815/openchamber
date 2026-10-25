@@ -147,6 +147,11 @@ function calculateResponseTokenRate(record: SessionMessageRecord): number | null
   const { created, completed } = info.time;
   if (output === null || completed === undefined || nonnegative(created) === null || nonnegative(completed) === null) return null;
 
+  // Stored text carries no timing; a reload stamps it with the step's own
+  // `created` and `completed`. A start at `created` is that stamp, not a
+  // measured first token. Dividing by it counted the initial wait and
+  // reasoning, so the same turn read ~94 tok/s live and ~55 after a reload
+  // (#5465). Unknown hides the row, as for TTFT.
   const intervals: Array<[number, number]> = [];
   for (const part of parts) {
     if (part.type !== 'text') continue;
@@ -154,7 +159,7 @@ function calculateResponseTokenRate(record: SessionMessageRecord): number | null
     const start = part.time?.start;
     const end = part.time?.end;
     if (start === undefined || end === undefined || !Number.isFinite(start) || !Number.isFinite(end)
-      || start < created || end > completed || end <= start) return null;
+      || start <= created || end > completed || end <= start) return null;
     intervals.push([start, end]);
   }
   return tokenRate(output, sumIntervalsDuration(mergeTimeIntervals(intervals)));

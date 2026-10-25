@@ -31,4 +31,19 @@ describe('JsonSummaryView', () => {
         expect(html).toContain('Issues (1)');
         expect(html).toContain('OPE-1 · Example issue');
     });
+
+    test('turns only an open section’s chevron, nested ones included', () => {
+        // A chevron that rotates whenever *any* enclosing section is open points
+        // down on every nested row that is still collapsed. Direction belongs to
+        // the row's own <details>, so a collapsed one stays pointing right.
+        const html = renderToStaticMarkup(
+            <JsonSummaryView data={{ outer: { inner: { deep: 'value' } } }} />,
+        );
+
+        const classes = [...html.matchAll(/class="([^"]*)"/g)]
+            .flatMap((match) => match[1].split(/\s+/));
+        // The outer section opens by default; the nested one does not.
+        expect(classes.filter((name) => name === 'rotate-90')).toHaveLength(1);
+        expect(html).not.toContain('group-open/json-summary');
+    });
 });

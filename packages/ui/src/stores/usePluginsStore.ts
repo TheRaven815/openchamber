@@ -15,7 +15,7 @@ import { runtimeFetch } from '@/lib/runtime-fetch';
 import { getRuntimeKey } from '@/lib/runtime-switch';
 
 export type PluginScope = 'user' | 'project';
-type PluginParsedKind = 'npm' | 'path';
+export type PluginParsedKind = 'npm' | 'path' | 'git';
 
 export interface PluginEntry {
   id: string;
@@ -52,6 +52,8 @@ export type PluginMutationResult = {
   message?: string;
   warning?: string;
   requiresManualRestart?: boolean;
+  /** The server refused the spec: OpenCode cannot load it. Nothing was written. */
+  invalidSpec?: boolean;
 };
 
 export type RegistryResult =
@@ -62,14 +64,16 @@ export type RegistryResult =
   | { kind: 'npm-network'; spec: string; error: string }
   | { kind: 'path-ok'; spec: string; absolutePath: string }
   | { kind: 'path-missing'; spec: string; absolutePath: string }
-  | { kind: 'path-unreadable'; spec: string; absolutePath: string };
+  | { kind: 'path-unreadable'; spec: string; absolutePath: string }
+  /** A Git package spec: OpenCode resolves it itself, so there is nothing to check. */
+  | { kind: 'git-ok'; spec: string };
 
 /**
  * What OpenCode reported for the plugins of one directory and runtime
  * (`scope`, see `getPluginsScopeKey`). `failed` means the read failed: every
  * plugin's status is unknown, never "all fine" and never "all failed".
  */
-export type PluginRuntimeSnapshot =
+type PluginRuntimeSnapshot =
   | { kind: 'idle' }
   | { kind: 'ready'; scope: string; plugins: PluginRuntimeInfo[] }
   | { kind: 'failed'; scope: string };
@@ -79,7 +83,7 @@ export type PluginPackageUpdate =
   | { kind: 'running' }
   | { kind: 'failed'; error: string };
 
-export interface PluginsStore {
+interface PluginsStore {
   entries: PluginEntry[];
   loadedDirectory: string | null | undefined;
   loadedRuntimeKey: string | undefined;
@@ -129,6 +133,7 @@ type PluginMutationPayload = {
   reloadFailed?: boolean;
   warning?: string;
   error?: string;
+  code?: string;
 };
 
 type PluginFileContent = {
@@ -550,6 +555,7 @@ async function runPluginMutation(
     const payload = await readJson<PluginMutationPayload | null>(response).catch(() => null);
 
     if (!response.ok) {
+      if (payload?.code === 'UNLOADABLE_SPEC') return { ok: false, invalidSpec: true };
       throw new Error(payload?.error || 'Failed to update plugin configuration');
     }
 

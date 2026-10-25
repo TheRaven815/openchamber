@@ -1,15 +1,13 @@
+import { isPlainObject, isString } from '../shared/guards.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { withSourceControlFileLockSync } from '../source-control/file-lock.js';
+import { isProviderId } from '../source-control/provider-id.js';
 
 const FILE_NAME = 'git-identities.json';
 const legacyDataDir = () => path.join(os.homedir(), '.config', 'openchamber');
-const isPlainObject = (value) => value === Object(value)
-  && !Array.isArray(value)
-  && Object.getPrototypeOf(value) === Object.prototype;
-const isString = (value) => Object.prototype.toString.call(value) === '[object String]';
 const invalidStore = (cause) => Object.assign(new Error('Git identity profile store is invalid', { cause }), {
   code: 'GIT_IDENTITY_STORE_INVALID',
 });
@@ -34,7 +32,7 @@ const parseIdentityAccount = (value) => {
   if (!isPlainObject(value)
     || Object.keys(value).length !== ACCOUNT_KEYS.length
     || !ACCOUNT_KEYS.every((key) => validProfileText(value[key], { required: true }))
-    || !['github', 'gitlab'].includes(value.provider)) {
+    || !isProviderId(value.provider)) {
     throw new TypeError('Invalid Git identity account');
   }
   return { provider: value.provider, instance: value.instance.trim(), accountId: value.accountId.trim() };
@@ -270,4 +268,6 @@ export const getProfiles = () => defaultStore().getProfiles();
 export const getProfile = (id) => defaultStore().getProfile(id);
 export const createProfile = (profileData) => defaultStore().createProfile(profileData);
 export const updateProfile = (id, updates) => defaultStore().updateProfile(id, updates);
+
+/** @public Read by Git routes through the lazy-loaded Git library. */
 export const deleteProfile = (id) => defaultStore().deleteProfile(id);

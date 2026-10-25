@@ -55,6 +55,7 @@ const PROJECT_MEMORY_MAX_ITEMS = 200;
  */
 const MEMORY_TYPES = new Set(['fact', 'preference', 'reference']);
 
+import { asNonEmptyString, isRecord as isObjectRecord } from '../shared/guards.js';
 import { projectConfigFileStemOf } from '../projects/project-id.js';
 import { findThreatPattern } from './threat-patterns.js';
 
@@ -133,12 +134,6 @@ const findSupersededEntry = (entries, title, body) => {
   return best;
 };
 
-const asNonEmptyString = (value) => {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
-};
-
 const clampLength = (value, maxLength) => {
   if (typeof value !== 'string') return '';
   return value.length > maxLength ? value.slice(0, maxLength) : value;
@@ -150,8 +145,6 @@ const clampLength = (value, maxLength) => {
  * test below answers it, and its message is the truthful one.
  */
 const bodyFitsLimit = (value) => (asNonEmptyString(value)?.length ?? 0) <= MEMORY_BODY_MAX_LENGTH;
-
-const isObjectRecord = (value) => Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 
 const limitForScope = (scope) => (scope === 'global' ? GLOBAL_MEMORY_MAX_ITEMS : PROJECT_MEMORY_MAX_ITEMS);
 
@@ -353,8 +346,8 @@ export const createAgentMemoryRuntime = (deps) => {
         const titles = current.entries.map((entry) => `- ${entry.title}`).join('\n');
         throw new Error(
           `${resolved.scope} memory is full (${current.entries.length}/${limit} entries). `
-          + 'Consolidate before saving anything else: merge overlapping entries by saving one '
-          + 'under an existing title, and delete what is stale or wrong. Then retry this save, '
+          + 'Consolidate before saving anything else: merge overlapping entries by rewriting one '
+          + 'with its memoryId, and delete what is stale or wrong. Then retry this save, '
           + `all in this turn. Current entries:\n${titles}`,
         );
       }
@@ -377,9 +370,9 @@ export const createAgentMemoryRuntime = (deps) => {
   };
 
   /**
-   * A user correction. The agent rewrites by saving the same memory again, so
-   * this exists for the panel: a memory worded badly enough to mislead should
-   * be fixable where it is read, not only deletable.
+   * A rewrite of one entry by id. The panel uses it for user corrections, and
+   * the agent's save uses it when it names the entry it is rewriting, which is
+   * how a tidy-up merges and corrects without guessing at a match.
    */
   const update = async (target, memoryId, patch) => {
     const resolved = resolveTarget(target);
@@ -414,6 +407,9 @@ export const createAgentMemoryRuntime = (deps) => {
         ...(hasType ? { type: patch.type } : {}),
         updatedAt: Date.now(),
       };
+      // Judged on the new text, as a read would judge it.
+      delete updated.flagged;
+      if (findThreatPattern(`${updated.title}\n${updated.body}`)) updated.flagged = true;
       const entries = current.entries.map((entry) => (entry.id === id ? updated : entry));
       await write(resolved, entries);
       return { entry: updated, entries };

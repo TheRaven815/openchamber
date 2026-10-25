@@ -1,6 +1,14 @@
 import React, { act } from 'react';
 import { expect, test } from 'bun:test';
 import { Window } from 'happy-dom';
+import { OpenCode } from '@opencode/client';
+
+// The whole-file comment in each entry's header reads the session's directory
+// from sync; an empty client is enough for an entry with no session.
+const SYNC_SDK = OpenCode.make({
+  baseUrl: 'http://opencode.test',
+  fetch: async () => new Response('[]', { headers: { 'content-type': 'application/json' } }),
+});
 
 const installDom = () => {
   const dom = new Window({ url: 'http://localhost' });
@@ -35,6 +43,7 @@ test('hidden diff entries defer reads, retain completed content and refresh chan
   const { createRoot } = await import('react-dom/client');
   const { I18nProvider } = await import('@/lib/i18n');
   const { RuntimeAPIContext } = await import('@/contexts/runtimeAPIContext');
+  const { SyncProvider } = await import('@/sync/sync-context');
   const { createWebAPIs } = await import('../../../../web/src/api/index');
   const { MultiFileDiffEntry } = await import('./DiffView');
   const base = createWebAPIs();
@@ -49,11 +58,11 @@ test('hidden diff entries defer reads, retain completed content and refresh chan
   let visible = false;
   let insertions = 1;
   const render = () => act(async () => {
-    root.render(<I18nProvider><RuntimeAPIContext.Provider value={apis}>
+    root.render(<SyncProvider sdk={SYNC_SDK} directory="/repo"><I18nProvider><RuntimeAPIContext.Provider value={apis}>
       <MultiFileDiffEntry directory="/repo" file={{ path: 'test.bin', index: ' ', working_dir: 'M', insertions, deletions: 0, isNew: false }}
         visible={visible} layout="inline" wrapLines={false} isSelected={false} isExpanded isMounted
         onSelect={() => {}} onExpandedChange={() => {}} registerSectionRef={() => {}} />
-    </RuntimeAPIContext.Provider></I18nProvider>);
+    </RuntimeAPIContext.Provider></I18nProvider></SyncProvider>);
   });
   try {
     await render();
@@ -87,6 +96,7 @@ test('status paths without file contents render what git records instead of an e
   const { createRoot } = await import('react-dom/client');
   const { I18nProvider } = await import('@/lib/i18n');
   const { RuntimeAPIContext } = await import('@/contexts/runtimeAPIContext');
+  const { SyncProvider } = await import('@/sync/sync-context');
   const { createWebAPIs } = await import('../../../../web/src/api/index');
   const { GitPathUnavailableError } = await import('@/lib/api/git-path-diff');
   const { useGitStore } = await import('@/stores/useGitStore');
@@ -94,14 +104,17 @@ test('status paths without file contents render what git records instead of an e
   const recorded = '1'.repeat(40);
   const moved = '2'.repeat(40);
   const statusRequests: string[] = [];
+  const diffRequests: string[] = [];
   const base = createWebAPIs();
   const apis = { ...base, git: { ...base.git,
     checkIsGitRepository: async () => true,
     getGitStatus: async (directory: string) => {
       statusRequests.push(directory);
-      return { current: 'main', tracking: null, ahead: 0, behind: 0, files: [], isClean: true, diffStats: { staged: {}, working: {} } };
+      const files = directory === '/repo/nested' ? [{ path: 'src/inner.ts', index: ' ', working_dir: 'M' }] : [];
+      return { current: 'main', tracking: null, ahead: 0, behind: 0, files, isClean: files.length === 0, diffStats: { staged: {}, working: { 'src/inner.ts': { insertions: 3, deletions: 1 } } } };
     },
-    getGitDiff: async (_directory: string, options: { path: string }) => {
+    getGitDiff: async (directory: string, options: { path: string }) => {
+      diffRequests.push(`${directory}:${options.path}`);
       if (options.path === 'nested/') throw new GitPathUnavailableError('Path is a separate Git repository: nested/', 'nested_repository');
       if (options.path === 'gone.txt') throw new GitPathUnavailableError('Path not found in working tree, index, or HEAD: gone.txt', 'path_not_found');
       return { diff: '', submodule: { headCommit: recorded, indexCommit: recorded, worktreeCommit: moved, hasTrackedChanges: false, hasUntrackedFiles: true, hasConflict: false } };
@@ -111,11 +124,11 @@ test('status paths without file contents render what git records instead of an e
   document.body.append(container);
   const root = createRoot(container);
   const render = (path: string) => act(async () => {
-    root.render(<I18nProvider><RuntimeAPIContext.Provider value={apis}>
+    root.render(<SyncProvider sdk={SYNC_SDK} directory="/repo"><I18nProvider><RuntimeAPIContext.Provider value={apis}>
       <MultiFileDiffEntry key={path} directory="/repo" file={{ path, index: ' ', working_dir: 'M', insertions: 0, deletions: 0, isNew: false }}
         layout="inline" wrapLines={false} isSelected={false} isExpanded isMounted
         onSelect={() => {}} onExpandedChange={() => {}} registerSectionRef={() => {}} />
-    </RuntimeAPIContext.Provider></I18nProvider>);
+    </RuntimeAPIContext.Provider></I18nProvider></SyncProvider>);
   });
   try {
     useGitStore.getState().setActiveDirectory('/repo');
@@ -124,18 +137,25 @@ test('status paths without file contents render what git records instead of an e
     expect(container.textContent).toContain('Commit 1111111 → 2222222');
     expect(container.textContent).toContain('Has untracked files');
 
+    // A nested repository lists its own changes, read from that repository.
     await render('nested/');
     expect(container.textContent).toContain('Separate Git repository');
+    expect(container.textContent).toContain('Open as project');
+    expect(container.textContent).toContain('src/inner.ts');
+    expect(container.textContent).toContain('+3');
     expect(container.textContent).not.toContain('Failed to load diff');
     expect(container.textContent).not.toContain('Retry');
-    expect(statusRequests).toEqual([]);
+    expect(statusRequests).toEqual(['/repo/nested']);
+    const innerRow = Array.from(container.querySelectorAll('button')).find((button) => button.textContent?.includes('src/inner.ts'));
+    await act(async () => innerRow?.click());
+    expect(diffRequests).toContain('/repo/nested:src/inner.ts');
 
     await render('gone.txt');
     expect(container.textContent).toContain('File no longer exists');
     expect(container.textContent).not.toContain('Failed to load diff');
     // A row that stays listed after the refresh can still be retried.
     expect(container.textContent).toContain('Retry');
-    expect(statusRequests).toEqual(['/repo']);
+    expect(statusRequests).toEqual(['/repo/nested', '/repo']);
   } finally {
     await act(async () => root.unmount());
     restoreDom();

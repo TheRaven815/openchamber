@@ -160,6 +160,13 @@ export type InputState = {
    * narrow layouts); consumed by ChatInput, which owns the command-aware submit.
    */
   pendingPresetSubmit: { text: string; type: "command" | "skill" } | null
+  /**
+   * A first message to send from one new-session draft as soon as its
+   * composer can send (a native Shortcuts request). Bound to the draft's id,
+   * so it never goes out from another draft or a session; a composer that
+   * finds a different draft open drops it.
+   */
+  pendingDraftSubmit: { draftId: number; text: string } | null
   /** Guest rail/dialog attach. ChatInput consumes this into the composer chip. */
   pendingGuestIssue: AttachIssueRequest | null
   pendingBtwComposerRequest: PendingBtwComposerRequest | null
@@ -168,12 +175,17 @@ export type InputState = {
   attachmentDrafts: Map<string, AttachedFile[]>
   selectAttachmentDraft: (target: ChatDraftIdentity | null) => void
   restoreAttachedFiles: (files: AttachedFile[], target: ChatDraftIdentity | null) => void
+  /** Moves one draft's files onto another draft's, as when `/btw` takes over the typed prompt. */
+  moveAttachedFiles: (from: ChatDraftIdentity | null, to: ChatDraftIdentity | null) => void
   activeEditorFile: VSCodeActiveEditorFile | null
 
   setPendingInputText: (text: string | null, mode?: "replace" | "append" | "append-inline", target?: string | null) => void
   consumePendingInputText: (target?: string | null) => { text: string; mode: "replace" | "append" | "append-inline" } | null
   requestPresetSubmit: (text: string, type: "command" | "skill") => void
   consumePendingPresetSubmit: () => { text: string; type: "command" | "skill" } | null
+  requestDraftSubmit: (draftId: number, text: string) => void
+  /** Takes the pending text when it belongs to this draft; any other pending request is dropped. */
+  consumePendingDraftSubmit: (draftId: number | null) => string | null
   setPendingGuestIssue: (issue: AttachIssueRequest | null) => void
   consumePendingGuestIssue: () => AttachIssueRequest | null
   requestBtwComposer: (request: PendingBtwComposerRequest) => void
@@ -206,6 +218,7 @@ export const useInputStore = create<InputState>()((set, get) => ({
   pendingSyntheticParts: null,
   pinnedSyntheticParts: new Map(),
   pendingPresetSubmit: null,
+  pendingDraftSubmit: null,
   pendingGuestIssue: null,
   pendingBtwComposerRequest: null,
   attachedFiles: [],
@@ -234,6 +247,16 @@ export const useInputStore = create<InputState>()((set, get) => ({
     const missing = files.filter((file) => !present.has(file.id))
     if (missing.length) state.setAttachedFiles([...existing, ...missing], target)
   },
+  moveAttachedFiles: (from, to) => {
+    if (!from || !to) return
+    const state = get()
+    const fromKey = getChatDraftIdentityKey(from)
+    if (fromKey === getChatDraftIdentityKey(to)) return
+    const files = fromKey === state.attachmentDraftKey ? state.attachedFiles : state.attachmentDrafts.get(fromKey) ?? []
+    if (!files.length) return
+    state.restoreAttachedFiles(files, to)
+    get().clearAttachedFiles(from)
+  },
   activeEditorFile: null,
 
   setPendingInputText: (text, mode = "replace", target = null) =>
@@ -253,6 +276,15 @@ export const useInputStore = create<InputState>()((set, get) => ({
     if (pendingPresetSubmit === null) return null
     set({ pendingPresetSubmit: null })
     return pendingPresetSubmit
+  },
+
+  requestDraftSubmit: (draftId, text) => set({ pendingDraftSubmit: { draftId, text } }),
+
+  consumePendingDraftSubmit: (draftId) => {
+    const { pendingDraftSubmit } = get()
+    if (pendingDraftSubmit === null) return null
+    set({ pendingDraftSubmit: null })
+    return pendingDraftSubmit.draftId === draftId ? pendingDraftSubmit.text : null
   },
 
   setPendingGuestIssue: (issue) => set({ pendingGuestIssue: issue }),

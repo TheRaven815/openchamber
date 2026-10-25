@@ -1,5 +1,6 @@
+import { z } from 'zod';
 import { hasDesktopInvoke, invokeDesktop } from '@/lib/desktop';
-import { createRelayTunnelClient } from '@/lib/relay/tunnel-client';
+import { createRelayTunnelClient, isRelayLimitReached } from '@/lib/relay/tunnel-client';
 import { parsePairingConnectionPayload, type PairingEndpointCandidate } from '@/lib/connectionPayload';
 
 type DesktopInvoke = (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
@@ -51,6 +52,8 @@ export type DesktopHost = {
   requestHeaders?: Record<string, string>;
   /** When set, this host is reached over the private relay tunnel. */
   relay?: DesktopHostRelay;
+  /** The native SSH manager currently forwards this host's API. Not stored. */
+  sshForwarded?: boolean;
 };
 
 /** Display-only pseudo-URL for a relay host (never fetched). */
@@ -65,7 +68,7 @@ const parseHostRelay = (value: unknown): DesktopHostRelay | null => {
   return { relayUrl, serverId, hostEncPubJwk: jwk as JsonWebKey };
 };
 
-export type DesktopHostsConfig = {
+type DesktopHostsConfig = {
   hosts: DesktopHost[];
   defaultHostId: string | null;
   initialHostChoiceCompleted: boolean;
@@ -73,7 +76,7 @@ export type DesktopHostsConfig = {
 };
 
 /** Backward-compatible input type — callers may omit `initialHostChoiceCompleted`. */
-export type DesktopHostsConfigInput = {
+type DesktopHostsConfigInput = {
   hosts: DesktopHost[];
   defaultHostId: string | null;
   initialHostChoiceCompleted?: boolean;
@@ -88,6 +91,10 @@ const desktopPlatformName = (): string | undefined => {
   if (/Linux/i.test(ua)) return 'linux';
   return undefined;
 };
+
+// Per transport: an unreachable LAN address must not hold the relay leg back
+// for the platform's TCP connect timeout.
+const PAIRING_REDEEM_TIMEOUT_MS = 15_000;
 
 export const importDesktopHostPairing = async (
   link: string,
@@ -130,7 +137,7 @@ export const importDesktopHostPairing = async (
         ...(candidate.grant ? { grant: candidate.grant } : {}),
       });
       try {
-        const token = await readToken(await tunnel.fetch('/api/client-auth/pairing/redeem', redeemInit));
+        const token = await readToken(await tunnel.fetch('/api/client-auth/pairing/redeem', { ...redeemInit, signal: AbortSignal.timeout(PAIRING_REDEEM_TIMEOUT_MS) }));
         if (token) {
           redeemed = {
             relay: { relayUrl: candidate.relayUrl, serverId: candidate.serverId, hostEncPubJwk: candidate.hostEncPubJwk },
@@ -148,7 +155,7 @@ export const importDesktopHostPairing = async (
     const directUrl = normalizeHostUrl(candidate.url);
     if (!directUrl) continue;
     try {
-      const token = await readToken(await fetch(`${directUrl}/api/client-auth/pairing/redeem`, redeemInit));
+      const token = await readToken(await fetch(`${directUrl}/api/client-auth/pairing/redeem`, { ...redeemInit, signal: AbortSignal.timeout(PAIRING_REDEEM_TIMEOUT_MS) }));
       if (token) {
         redeemed = { directUrl, token };
         break;
@@ -197,11 +204,13 @@ export const importDesktopHostPairing = async (
 };
 
 export type HostProbeResult = {
-  status: 'ok' | 'auth' | 'update-recommended' | 'incompatible' | 'wrong-service' | 'unreachable';
+  /** 'relay-limit' comes only from relay probes: the relay refused the tunnel
+   * over its limits (too many devices at once, too many connects a minute). */
+  status: 'ok' | 'auth' | 'update-recommended' | 'incompatible' | 'wrong-service' | 'unreachable' | 'relay-limit';
   latencyMs: number;
 };
 
-export type DesktopHostUrlResolution = {
+type DesktopHostUrlResolution = {
   persistedUrl: string;
   redeemUrl: string | null;
   kind: 'normal-host' | 'tunnel-connect-link';
@@ -323,7 +332,7 @@ const parseHost = (value: unknown): DesktopHost | null => {
   const requestHeaders = sanitizeRequestHeaders(value.requestHeaders);
   const relay = parseHostRelay(value.relay);
   if (!id || !label || !url) return null;
-  return {
+  const host: DesktopHost = {
     id,
     label,
     url,
@@ -332,6 +341,8 @@ const parseHost = (value: unknown): DesktopHost | null => {
     ...(requestHeaders ? { requestHeaders } : {}),
     ...(relay ? { relay } : {}),
   };
+  if (value.sshForwarded === true) host.sshForwarded = true;
+  return host;
 };
 
 export const getDesktopHostApiUrl = (host: DesktopHost): string => {
@@ -392,6 +403,18 @@ export const desktopLocalClientTokenGet = async (): Promise<string> => {
   if (!invoke) return '';
   const raw = await invoke('desktop_local_client_token_get').catch(() => null);
   return typeof raw === 'string' ? raw.trim() : '';
+};
+
+/**
+ * Asks the desktop shell to load the Local UI into this window. True when it
+ * does, which happens when the page belongs to another instance and cannot
+ * switch to Local in place. False on the app's own pages and from a shell
+ * without the command.
+ */
+export const desktopSwitchToLocal = async (): Promise<boolean> => {
+  const invoke = getInvoke();
+  if (!invoke) return false;
+  return (await invoke('desktop_switch_to_local').catch(() => false)) === true;
 };
 
 /**
@@ -506,7 +529,7 @@ export const probeRelayDesktopHost = async (
     keep = options?.keepTunnel === true;
     return { status: 'ok', latencyMs: Math.max(0, Date.now() - startedAt), ...(keep ? { tunnel } : {}) };
   } catch {
-    return { status: 'unreachable', latencyMs: 0 };
+    return { status: isRelayLimitReached(tunnel.getStatus()) ? 'relay-limit' : 'unreachable', latencyMs: 0 };
   } finally {
     if (!keep) tunnel.close();
   }
@@ -534,6 +557,61 @@ export const desktopHostProbe = async (url: string, options?: { clientToken?: st
 
   const latencyMs = readNumber(raw, 'latencyMs') ?? readNumber(raw, 'latency_ms') ?? 0;
   return { status, latencyMs };
+};
+
+const remoteHostUpdateResult = z.discriminatedUnion('status', [
+  z.object({ status: z.literal('started') }),
+  z.object({ status: z.literal('auth') }),
+  z.object({ status: z.literal('failed'), error: z.string().nullable() }),
+]);
+
+type RemoteHostUpdateResult = z.infer<typeof remoteHostUpdateResult>;
+
+/**
+ * Asks a saved remote host to update its own OpenChamber. The desktop shell
+ * reads the host's address and token from its own hosts file, so only a saved
+ * host can be asked. `failed` carries the host's reason when it gave one.
+ */
+export const desktopHostUpdateServer = async (hostId: string): Promise<RemoteHostUpdateResult> => {
+  const invoke = getInvoke();
+  if (!invoke) return { status: 'failed', error: null };
+  const raw = await invoke('desktop_host_update_server', { hostId }).catch(() => null);
+  const parsed = remoteHostUpdateResult.safeParse(raw);
+  return parsed.success ? parsed.data : { status: 'failed', error: null };
+};
+
+const REMOTE_HOST_UPDATE_WAIT_MS = 10 * 60 * 1000;
+const REMOTE_HOST_UPDATE_POLL_MS = 3_000;
+
+/**
+ * Waits until a host that was asked to update answers as a compatible server.
+ * While it installs it still answers as the old version, then drops off while
+ * it restarts; both mean "keep waiting". `auth` counts as back: the server is
+ * up, and connecting will ask to sign in again.
+ */
+export const waitForDesktopHostUpdated = async (
+  hostId: string,
+  {
+    maxWaitMs = REMOTE_HOST_UPDATE_WAIT_MS,
+    intervalMs = REMOTE_HOST_UPDATE_POLL_MS,
+    readHosts = desktopHostsGet,
+    probe = desktopHostProbe,
+  }: {
+    maxWaitMs?: number;
+    intervalMs?: number;
+    readHosts?: typeof desktopHostsGet;
+    probe?: typeof desktopHostProbe;
+  } = {},
+): Promise<'updated' | 'timeout'> => {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, Math.max(0, deadline - Date.now()))));
+    const host = (await readHosts()).hosts.find((entry) => entry.id === hostId);
+    if (!host) return 'timeout';
+    const result = await probe(getDesktopHostApiUrl(host), { clientToken: host.clientToken, requestHeaders: host.requestHeaders });
+    if (result.status === 'ok' || result.status === 'update-recommended' || result.status === 'auth') return 'updated';
+  }
+  return 'timeout';
 };
 
 export const desktopOpenNewWindowAtUrl = async (url: string, options?: { clientToken?: string | null; requestHeaders?: Record<string, string> | null }): Promise<void> => {

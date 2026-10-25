@@ -280,6 +280,27 @@ describe('page-less packages', () => {
     } finally { await fs.rm(dir, { recursive: true, force: true }); }
   });
 
+  test('a source status section publishes its path and interval and loads no frame', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-status-source-'));
+    try {
+      await fs.writeFile(path.join(dir, 'package.json'), JSON.stringify({ version: '1.0.0', openchamber: {
+        apiVersion: 1, contributes: {
+          panel: { id: 'monitor', name: 'Monitor', icon: 'pulse' },
+          statusSection: { source: { path: '/status' }, title: 'Resources' },
+          service: { entry: 'service/main.js', runtime: 'host' },
+        },
+      } }));
+      await fs.mkdir(path.join(dir, 'service'));
+      await fs.writeFile(path.join(dir, 'service/main.js'), 'console.log("service")');
+      const inspected = await inspectGuestPackage(dir);
+      expect(inspected.ok).toBe(true);
+      const row = toPublicGuest(inspected.guest);
+      expect(row).toMatchObject({ statusSource: { path: '/status', interval: 2000 }, statusTitle: 'Resources' });
+      expect(row).not.toHaveProperty('statusEntry');
+      expect(hasGuestFrame(inspected.guest)).toBe(false);
+    } finally { await fs.rm(dir, { recursive: true, force: true }); }
+  });
+
   test('a file-editor-only package validates each editor page, publishes the editors, and counts as a frame', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-file-editor-'));
     try {

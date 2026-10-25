@@ -1,10 +1,11 @@
 import { canReuseManagedOpenCodePreflight } from './opencode-readiness.mjs';
-import { app, BrowserWindow, dialog, ipcMain, Menu, MessageChannelMain, nativeTheme, net as electronNet, Notification, powerMonitor, powerSaveBlocker, protocol, session, shell, webContents } from 'electron';
+import { app, BrowserWindow, clipboard, ClipboardItem, dialog, globalShortcut, ipcMain, Menu, MessageChannelMain, nativeTheme, net as electronNet, Notification, powerMonitor, powerSaveBlocker, protocol, screen, session, shell, webContents } from 'electron';
 import contextMenu from 'electron-context-menu';
 import log from 'electron-log/main.js';
 import dgram from 'node:dgram';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn, spawnSync } from 'node:child_process';
@@ -12,11 +13,16 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import updaterPkg from 'electron-updater';
 import { ElectronSshManager } from './ssh-manager.mjs';
+import { collectLocalFileDiagnostics, collectSshBufferDiagnostics } from '@openchamber/web/server/lib/diagnostics/local-files.js';
 import { replaceFileWithRetry } from './windows-file-replace.mjs';
 import { createTrayController } from './tray.mjs';
+import { applyDevDockIdentity, applyDockBadge } from './dev-dock-identity.mjs';
+import { attachDevWindowTape } from './dev-window-tape.mjs';
 import { resolveManagedOpenCodeCwd } from './opencode-cwd.mjs';
 import { stopEmbeddedServer } from './server-shutdown.mjs';
-import { resolveStartupUrlProbePlan } from './startup-url-selection.mjs';
+import { describeStartupEnvironmentOverrides, resolveStartupUrlProbePlan } from './startup-url-selection.mjs';
+import { clearAppCache } from './app-cache.mjs';
+import { parseExternalUrl } from './external-url-policy.mjs';
 import {
   BACKGROUND_START_ARG,
   DEEP_LINK_PROTOCOL,
@@ -32,11 +38,14 @@ import {
   installStartupMarkSink,
   isDev,
   isMacMenuBarEnabled,
+  macTrafficLightPosition,
   macosMajorVersion,
   readLoginItemSettings,
   readSettingsRoot,
+  readPreferredLocale,
   readThemeSource,
   resolveMainWindowBounds,
+  resolveBrowserPanelPreloadPath,
   resolvePreloadPath,
   resolveSplashBackgroundColor,
   settingsFilePath,
@@ -52,13 +61,32 @@ import {
 } from './early-startup.mjs';
 import { sanitizeRuntimeRequestHeaders } from './runtime-request-headers.mjs';
 import { isSplashColor, redactHostsConfigForRemote } from './remote-page-policy.mjs';
+import { connectDefaultSshInstanceAtStartup, resolveDefaultSshInstanceId } from './startup-ssh.mjs';
+import { normalizeNotificationInput, readTrimmedString, resolveHostEntryForRuntimeKey, runtimeKeyForDeepLinkHost, stampForwardedNotification } from './notification-host-routing.mjs';
 import { isPackagedUiRuntimeRequest } from './packaged-ui-routing.mjs';
+import { RUNTIME_CONFIG_SCRIPT_PATHNAME, claimRuntimeConfigScriptRequest, createRuntimeConfigGate, injectRuntimeConfig } from './packaged-runtime-config.mjs';
+import { settleMainProcessCompileCache } from './compile-cache.mjs';
 import { probeDirectHostWithRetry } from './host-probe-policy.mjs';
 import { probeElectronHostWithDeadline } from './electron-host-probe.mjs';
-import { assertUpdaterCapability } from './updater-capability.mjs';
+import { requestRemoteHostUpdate } from './remote-host-update.mjs';
+import { assertUpdaterCapability, readLinuxPackageType } from './updater-capability.mjs';
+import { relaunchAfterExit } from './linux-relaunch.mjs';
+import { installLinuxPackage } from './linux-package-install.mjs';
 import { checkForDesktopUpdate } from './updater-check.mjs';
 import { resolveUpdaterChannel } from './updater-channel.mjs';
+import { convertShortcutComboToAccelerator, MINI_CHAT_GLOBAL_SHORTCUT_SETTING_KEY, normalizeStoredShortcutCombo, selectMiniChatGlobalShortcutAction } from './mini-chat-global-shortcut.mjs';
+import {
+  computeQuakeBounds,
+  parseQuakeHeightFraction,
+  QUAKE_MODE_ENABLED_KEY,
+  QUAKE_MODE_HEIGHT_KEY,
+  QUAKE_MODE_SHORTCUT_KEY,
+  QUAKE_MODE_UNASSIGNED,
+  readQuakeModeSettings,
+  selectQuakeToggleAction,
+} from './quake-mode.mjs';
 import { createContextMenuLabels, menuLabel, normalizeMenuLocale, roleMenuItem } from './menu-locales.mjs';
+import { createCopyLinkMenuHook } from './context-menu-clipboard.mjs';
 import { resolveUpdaterFeed } from './updater-feed.mjs';
 import {
   buildLinuxInstalledApps,
@@ -71,20 +99,27 @@ import {
   readLinuxAutostartEnabled,
   setLinuxAutostartEnabled,
 } from './linux-autostart.mjs';
+import { reconcileAppImageDesktopEntry } from './linux-desktop-entry.mjs';
 import { unsupportedAppSpecificOpenError, validateLocalPath } from './path-open-utils.mjs';
+import { keepSessionCookies } from './browser-panel-cookies.mjs';
 import {
   browserPanelPermissionAuditDetails,
+  browserPanelWindowOpenTarget,
+  plainChromeUserAgent,
   shouldAllowBrowserPanelCertificateError,
   shouldAllowBrowserPanelPermission,
 } from './browser-panel-security.mjs';
+import { isSpaceId, spaceIdOfPreviewPartition, spacePreviewPartition, spacePreviewProxyConfig } from './space-preview.mjs';
 import { shouldBlockGuestFrameNavigation } from './guest-frame-navigation.mjs';
 import { createRelayDevTunnelBridge } from './relay-dev-tunnel.mjs';
-import { attachRendererRecovery } from './renderer-recovery.mjs';
+import { parsePairingDeepLink } from './pairing-deep-link.mjs';
+import { attachRendererRecovery, takeSafeStart } from './renderer-recovery.mjs';
 import { createLoadFailureWarningFilter } from './load-failure-warnings.mjs';
 import { mintOutsideFileGrant } from '@openchamber/web/server/lib/fs/routes.js';
 import { fetchUpdateNotes } from '@openchamber/web/server/lib/changelog/update-notes.js';
 import { applyConnectAttemptTimeout } from '@openchamber/web/server/lib/network-defaults.js';
 import { isNetworkAccessBlocked } from '@openchamber/web/server/lib/enterprise-mode.js';
+import { assignInjectedEnv } from '@openchamber/web/server/lib/injected-env.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -253,6 +288,9 @@ const state = {
   bootOutcome: null,
   startupResolved: false,
   initScript: null,
+  // { window, url, loaded } while the main window loads the application ahead
+  // of startup resolution (startEarlyMainNavigation).
+  earlyNavigation: null,
   mainWindow: null,
   quitRequested: false,
   quitConfirmed: false,
@@ -269,6 +307,12 @@ const state = {
   pendingUpdate: null,
   unreachableHosts: new Set(),
   windowCounter: 1,
+  // Quake Mode: the main window's normal geometry while it is showing the
+  // top-attached dropdown instead. Restored when Quake hides for good or is
+  // disabled; never persisted (writeWindowState skips Quake bounds).
+  quakeActive: false,
+  quakeNormalBounds: null,
+  quakeNormalMaximized: false,
   focusedWindowIds: new Set(),
   windowGeometryRevisions: new Map(),
   windowGeometryTimers: new Map(),
@@ -385,6 +429,45 @@ const shutdownSshSessions = async () => {
   await state.sshShutdownPromise;
 };
 
+const RENDERER_STORAGE_FLUSH_TIMEOUT_MS = 500;
+
+/**
+ * Quitting ends in app.exit(), which skips Chromium's normal shutdown and the
+ * pages' unload handlers. Pages hold throttled cache writes in memory, and
+ * Chromium holds localStorage writes it has not committed yet; both would be
+ * lost, and the next launch would paint from an older session cache. Ask each
+ * page to write what it holds, then commit storage to disk.
+ */
+const flushRendererStorage = async () => {
+  const pages = BrowserWindow.getAllWindows()
+    .filter((window) => !window.isDestroyed())
+    .map((window) => window.webContents
+      .executeJavaScript("window.dispatchEvent(new Event('openchamber:flush-persisted-state'))", true)
+      .catch(() => undefined));
+  // The browser panel's logins: session cookies get an expiry so they outlive
+  // the quit (browser-panel-cookies.mjs), and Chromium writes cookies to disk
+  // on a timer, so a sign-in shortly before quitting would be lost with the rest.
+  const panelSession = session.fromPartition(BROWSER_PANEL_PARTITION);
+  const panelCookies = keepSessionCookies(panelSession.cookies, {
+    onError: (error) => log.warn('[electron] could not keep a browser panel session cookie:', error?.message || error),
+  })
+    .then(() => panelSession.cookies.flushStore())
+    .catch((error) => {
+      log.warn('[electron] browser panel cookie flush before quit failed:', error);
+    });
+  await Promise.race([
+    Promise.all([...pages, panelCookies]),
+    new Promise((resolve) => setTimeout(resolve, RENDERER_STORAGE_FLUSH_TIMEOUT_MS)),
+  ]);
+  for (const storageSession of [session.defaultSession, panelSession]) {
+    try {
+      storageSession.flushStorageData();
+    } catch (error) {
+      log.warn('[electron] storage flush before quit failed:', error);
+    }
+  }
+};
+
 const prepareForQuit = () => {
   state.quitRequested = true;
   state.quitConfirmed = true;
@@ -402,6 +485,14 @@ const prepareForQuit = () => {
     app.removeListener('browser-window-focus', state.trayFocusListener);
     state.trayFocusListener = null;
   }
+  try {
+    globalShortcut.unregisterAll();
+  } catch {
+  }
+  if (state.miniChatFocusListener) {
+    app.removeListener('browser-window-focus', state.miniChatFocusListener);
+    state.miniChatFocusListener = null;
+  }
 
   if (state.mainWindow && !state.mainWindow.isDestroyed()) {
     try {
@@ -412,7 +503,18 @@ const prepareForQuit = () => {
 
   setDesktopKeepAwakeActive(false);
 
-  return shutdownBackgroundServices();
+  return Promise.all([flushRendererStorage(), shutdownBackgroundServices()]);
+};
+
+// An installed .deb or .rpm updates through pkexec, which app.relaunch()'s
+// no_new_privs process can no longer run; see linux-relaunch.mjs.
+const isLinuxPackageInstall = () => process.platform === 'linux'
+  && app.isPackaged
+  && ['deb', 'rpm'].includes(readLinuxPackageType());
+
+const relaunchApp = () => {
+  if (isLinuxPackageInstall()) relaunchAfterExit();
+  else app.relaunch();
 };
 
 const performConfirmedQuit = async ({ relaunch = false } = {}) => {
@@ -428,7 +530,7 @@ const performConfirmedQuit = async ({ relaunch = false } = {}) => {
   } catch (error) {
     log.warn('[electron] background shutdown failed:', error);
   } finally {
-    if (relaunch) app.relaunch();
+    if (relaunch) relaunchApp();
     app.exit(0);
   }
 };
@@ -799,6 +901,9 @@ const writeDesktopHostsConfig = async (config) => {
 const writeWindowState = async (browserWindow) => {
   if (!browserWindow || browserWindow.isDestroyed()) return;
   if (!state.mainWindow || browserWindow.id !== state.mainWindow.id) return;
+  // Quake geometry is transient: persisting it would overwrite the user's
+  // normal window bounds with the dropdown size.
+  if (state.quakeActive) return;
 
   const bounds = browserWindow.getBounds();
   await mutateSettingsRoot((root) => {
@@ -971,13 +1076,21 @@ const resolveWebDistDir = () => path.join(resourceRoot(), 'web-dist');
 const packagedUiOrigin = () => `${UI_PROTOCOL}://app`;
 const buildPackagedUiUrl = (pathname = '/index.html') => new URL(pathname, `${packagedUiOrigin()}/`).toString();
 
-const injectRuntimeConfigIntoHtml = (html) => {
+// Held while the main window loads the application ahead of the local server;
+// see packaged-runtime-config.mjs.
+const runtimeConfigGate = createRuntimeConfigGate();
+
+const buildRuntimeConfigScript = () => {
   const apiBaseUrl = state.apiBaseUrl || state.sidecarUrl || '';
   const localOrigin = state.localOrigin || state.sidecarUrl || '';
-  const initScript = `<script>if(window.__OPENCHAMBER_LOCAL_ORIGIN__===undefined){window.__OPENCHAMBER_LOCAL_ORIGIN__=${JSON.stringify(localOrigin)};}if(window.__OPENCHAMBER_API_BASE_URL__===undefined){window.__OPENCHAMBER_API_BASE_URL__=${JSON.stringify(apiBaseUrl)};}if(window.__OPENCHAMBER_CLIENT_TOKEN__===undefined&&${JSON.stringify(state.clientToken || '')}){window.__OPENCHAMBER_CLIENT_TOKEN__=${JSON.stringify(state.clientToken || '')};}</script>`;
-  if (html.includes('<head>')) return html.replace('<head>', `<head>${initScript}`);
-  if (html.includes('</head>')) return html.replace('</head>', `${initScript}</head>`);
-  return `${initScript}${html}`;
+  return `if(window.__OPENCHAMBER_LOCAL_ORIGIN__===undefined){window.__OPENCHAMBER_LOCAL_ORIGIN__=${JSON.stringify(localOrigin)};}if(window.__OPENCHAMBER_API_BASE_URL__===undefined){window.__OPENCHAMBER_API_BASE_URL__=${JSON.stringify(apiBaseUrl)};}if(window.__OPENCHAMBER_CLIENT_TOKEN__===undefined&&${JSON.stringify(state.clientToken || '')}){window.__OPENCHAMBER_CLIENT_TOKEN__=${JSON.stringify(state.clientToken || '')};}`;
+};
+
+const injectRuntimeConfigIntoHtml = (html) => {
+  if (runtimeConfigGate.isHeld()) {
+    return injectRuntimeConfig(html, { pending: true, scriptBody: '', nonce: runtimeConfigGate.issueScriptNonce() });
+  }
+  return injectRuntimeConfig(html, { pending: false, scriptBody: buildRuntimeConfigScript() });
 };
 
 /**
@@ -1025,23 +1138,27 @@ const resolveBrowserPanelContents = (rawId) => {
   if (id === null || id < 0) throw new Error('webContentsId is required');
   const target = webContents.fromId(id);
   if (!target || target.isDestroyed()) throw new Error('WebContents not found');
-  if (target.session !== session.fromPartition(BROWSER_PANEL_PARTITION)) {
+  if (!isPanelSession(target.session)) {
     throw new Error('That view is not a browser panel page');
   }
   return target;
 };
 
-const hardenBrowserPanelSession = () => {
-  const panelSession = session.fromPartition(BROWSER_PANEL_PARTITION);
+/** Panel pages the agent has worked in; their debugger session holds focus emulation. */
+const focusEmulatedPanelContents = new WeakSet();
 
-  app.on('certificate-error', (event, contents, url, error, _certificate, callback) => {
-    if (contents.session === panelSession && shouldAllowBrowserPanelCertificateError({ url, error })) {
-      event.preventDefault();
-      callback(true);
-      return;
-    }
-    callback(false);
-  });
+/**
+ * The sessions of the browser panel: the user's persistent one, and one per
+ * isolated space whose pages are shown. Membership is what the panel commands
+ * check, so a space's view answers to annotation and capture like any other.
+ */
+const panelSessions = new Set();
+const isPanelSession = (candidate) => panelSessions.has(candidate);
+
+const hardenPanelSession = (panelSession) => {
+  if (panelSessions.has(panelSession)) return;
+  panelSessions.add(panelSession);
+  panelSession.setUserAgent(plainChromeUserAgent(panelSession.getUserAgent()));
 
   panelSession.setPermissionRequestHandler((contents, permission, callback, details) => {
     const allowed = shouldAllowBrowserPanelPermission({
@@ -1074,6 +1191,127 @@ const hardenBrowserPanelSession = () => {
   panelSession.setDevicePermissionHandler(() => false);
 };
 
+const hardenBrowserPanelSession = () => {
+  const panelSession = session.fromPartition(BROWSER_PANEL_PARTITION);
+  hardenPanelSession(panelSession);
+  // Only the user's session: a space's pages open everything in place anyway.
+  panelSession.registerPreloadScript({ type: 'frame', filePath: resolveBrowserPanelPreloadPath() });
+
+  app.on('certificate-error', (event, contents, url, error, _certificate, callback) => {
+    if (isPanelSession(contents.session) && shouldAllowBrowserPanelCertificateError({ url, error })) {
+      event.preventDefault();
+      callback(true);
+      return;
+    }
+    callback(false);
+  });
+};
+
+/**
+ * Pages from an isolated space, shown in the panel through a tunnel into the
+ * space. Each space gets a session of its own, routed through a proxy that
+ * answers nothing and bypassed only for that space's own tunnel ports, so the
+ * page reaches the space and nothing else from this machine: not the local
+ * API, not the user's own dev servers, not the internet. The rules are in
+ * space-preview.mjs; the dead proxy is a listener of this process that drops
+ * every connection, so a request sent there is refused at once.
+ *
+ * The proxy is applied before a tunnel's port is handed to the renderer, and
+ * again, with no port, the moment a view with a space partition is attached,
+ * so no page of a space ever loads on a session without it.
+ */
+const spacePreviews = new Map();
+let deadProxyPortPromise = null;
+const getDeadProxyPort = () => {
+  if (!deadProxyPortPromise) {
+    deadProxyPortPromise = new Promise((resolve, reject) => {
+      const server = net.createServer((socket) => socket.destroy());
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        const port = server.address()?.port;
+        if (!port) {
+          reject(new Error('Failed to bind the dead proxy'));
+          return;
+        }
+        server.unref();
+        resolve(port);
+      });
+    }).catch((error) => {
+      deadProxyPortPromise = null;
+      throw error;
+    });
+  }
+  return deadProxyPortPromise;
+};
+
+const spacePreviewOf = (spaceId) => {
+  let entry = spacePreviews.get(spaceId);
+  if (!entry) {
+    entry = { ports: new Set(), chain: Promise.resolve() };
+    spacePreviews.set(spaceId, entry);
+  }
+  return entry;
+};
+
+/** Writes the space's current port set into its session, one write after another. */
+const applySpacePreviewProxy = (spaceId) => {
+  const entry = spacePreviewOf(spaceId);
+  entry.chain = entry.chain.catch(() => {}).then(async () => {
+    const panelSession = session.fromPartition(spacePreviewPartition(spaceId));
+    hardenPanelSession(panelSession);
+    const deadProxyPort = await getDeadProxyPort();
+    await panelSession.setProxy(spacePreviewProxyConfig({ deadProxyPort, localPorts: [...entry.ports] }));
+  });
+  return entry.chain;
+};
+
+const openSpacePreviewPort = (spaceId, localPort) => {
+  spacePreviewOf(spaceId).ports.add(localPort);
+  return applySpacePreviewProxy(spaceId);
+};
+
+const closeSpacePreviewPort = (spaceId, localPort) => {
+  const entry = spacePreviews.get(spaceId);
+  if (!entry || !entry.ports.delete(localPort)) return Promise.resolve();
+  return applySpacePreviewProxy(spaceId);
+};
+
+const closeAllSpacePreviewPorts = () => {
+  for (const [spaceId, entry] of spacePreviews) {
+    if (entry.ports.size === 0) continue;
+    entry.ports.clear();
+    applySpacePreviewProxy(spaceId).catch((error) => {
+      log.warn(`[electron] could not reset the preview proxy of space ${spaceId}: ${error?.message || error}`);
+    });
+  }
+};
+
+/**
+ * Every view the page attaches runs in a panel session, and nothing else: the
+ * user's panel partition, or a space's partition, whose proxy the renderer asks
+ * for before it attaches the view and which is applied here again as a backstop. A view that names no partition would share the app's own
+ * session, cookies and all, with whatever page it loads.
+ */
+const guardAttachedWebviews = (contents) => {
+  contents.on('will-attach-webview', (event, webPreferences, params) => {
+    delete webPreferences.preload;
+    delete webPreferences.preloadURL;
+    webPreferences.nodeIntegration = false;
+    webPreferences.contextIsolation = true;
+    const partition = String(webPreferences.partition || params?.partition || '');
+    if (partition === BROWSER_PANEL_PARTITION) return;
+    const spaceId = spaceIdOfPreviewPartition(partition);
+    if (spaceId) {
+      applySpacePreviewProxy(spaceId).catch((error) => {
+        log.warn(`[electron] could not apply the preview proxy of space ${spaceId}: ${error?.message || error}`);
+      });
+      return;
+    }
+    log.warn('[electron] refused a webview outside the browser panel sessions');
+    event.preventDefault();
+  });
+};
+
 const registerPackagedUiProtocol = () => {
   if (!shouldUsePackagedUi()) return;
   installPackagedUiRequestHandler(async (request) => {
@@ -1086,6 +1324,17 @@ const registerPackagedUiProtocol = () => {
         { error: { code: 'runtime_unavailable' } },
         { status: 503, headers: { 'x-openchamber-error': 'runtime-unavailable' } },
       );
+    }
+
+    if (new URL(request.url).pathname === RUNTIME_CONFIG_SCRIPT_PATHNAME) {
+      // Carries the client token: only the document it was issued to gets it.
+      if (!claimRuntimeConfigScriptRequest(runtimeConfigGate, request)) {
+        return new Response('', { status: 404, headers: { 'Cache-Control': 'no-store' } });
+      }
+      await runtimeConfigGate.whenReleased();
+      return new Response(buildRuntimeConfigScript(), {
+        headers: { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' },
+      });
     }
 
     const distPath = resolveWebDistDir();
@@ -1128,15 +1377,6 @@ const registerPackagedUiProtocol = () => {
   });
 };
 
-const normalizeNotificationInput = (raw) => {
-  if (!raw || typeof raw !== 'object') return {};
-  // UI IPC path wraps in { payload: {...} }; sidecar stdout path is flat.
-  if (raw.payload && typeof raw.payload === 'object') {
-    return { ...raw, ...raw.payload };
-  }
-  return raw;
-};
-
 const isAnyWindowFocused = () =>
   BrowserWindow.getAllWindows().some(
     (window) => !window.isDestroyed() && window.isFocused(),
@@ -1166,6 +1406,17 @@ const focusForegroundWindow = () => {
 const activeNotifications = new Set();
 const nativeNotificationClaims = new Map();
 const NATIVE_NOTIFICATION_DEDUPE_TTL_MS = 5000;
+// Ids of the notifications this run delivered on macOS, by session, so viewing
+// the session removes them from Notification Center. Only macOS can remove a
+// delivered notification.
+const deliveredNotificationIdsBySession = new Map();
+
+const clearSessionNotifications = (sessionId) => {
+  const ids = deliveredNotificationIdsBySession.get(sessionId);
+  if (!ids) return;
+  deliveredNotificationIdsBySession.delete(sessionId);
+  Notification.remove(ids);
+};
 
 const getNativeNotificationClaimKey = (payload) => {
   const tag = typeof payload?.tag === 'string' ? payload.tag.trim() : '';
@@ -1222,13 +1473,21 @@ const maybeShowNativeNotification = (rawInput) => {
   const directory = typeof payload.directory === 'string' && payload.directory.trim()
     ? payload.directory.trim()
     : null;
+  const runtimeKey = readTrimmedString(payload.runtimeKey) || null;
 
+  const notificationId = globalThis.crypto.randomUUID();
   const notification = new Notification({
+    id: notificationId,
     title,
     body,
     silent: false,
     ...(process.platform === 'darwin' ? { sound: 'Glass' } : {}),
   });
+  if (process.platform === 'darwin' && sessionId) {
+    const ids = deliveredNotificationIdsBySession.get(sessionId) ?? [];
+    ids.push(notificationId);
+    deliveredNotificationIdsBySession.set(sessionId, ids);
+  }
 
   activeNotifications.add(notification);
   const release = () => { activeNotifications.delete(notification); };
@@ -1236,7 +1495,12 @@ const maybeShowNativeNotification = (rawInput) => {
   notification.on('click', () => {
     focusForegroundWindow();
     if (sessionId) {
-      emitToPrimaryWindow('openchamber:open-session', { sessionId, directory });
+      // Name the runtime that owns the session so the receiving window can
+      // tell a session of its own instance from one of another, and route
+      // cross-instance clicks to the owning instance's window.
+      const openSessionPayload = { sessionId, directory };
+      if (runtimeKey) openSessionPayload.runtimeKey = runtimeKey;
+      emitToPrimaryWindow('openchamber:open-session', openSessionPayload);
     }
     release();
   });
@@ -1333,32 +1597,34 @@ const spawnLocalServer = async () => {
   // OPENCHAMBER_RUNTIME at import time (top-level const), so these must be
   // set before the first import. After this point, the same env is used by
   // both the Electron main and the server running inside it.
-  process.env.OPENCHAMBER_HOST = bindHost;
-  process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_ACTIVE = effectiveLanAccessEnabled ? 'true' : 'false';
-  if (lanAccessBlockedByEnterprise) {
-    process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_BLOCKED_REASON = 'enterprise-mode';
-  } else if (lanAccessBlockedByMissingPassword) {
-    process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_BLOCKED_REASON = 'missing-password';
-  } else {
+  // They are recorded as injected, so a shell opened from this app (the
+  // integrated terminal, an agent) can tell them from the user's own exports.
+  if (!lanAccessBlockedByEnterprise && !lanAccessBlockedByMissingPassword) {
     delete process.env.OPENCHAMBER_DESKTOP_LAN_ACCESS_BLOCKED_REASON;
   }
-  process.env.OPENCHAMBER_DIST_DIR = resolveWebDistDir();
-  process.env.OPENCHAMBER_RUNTIME = 'desktop';
-  // OpenCode uses process cwd as a fallback directory; app userData would make
-  // packaged desktop look like a separate empty workspace.
-  process.env.OPENCHAMBER_OPENCODE_CWD = resolveManagedOpenCodeCwd({
-    env: process.env,
-    homedir: () => os.homedir(),
-  });
-  process.env.OPENCHAMBER_DESKTOP_NOTIFY = 'true';
-  if (desktopUiPassword) {
-    process.env.OPENCHAMBER_UI_PASSWORD = desktopUiPassword;
-  } else {
+  if (!desktopUiPassword) {
     delete process.env.OPENCHAMBER_UI_PASSWORD;
   }
-  process.env.OPENCHAMBER_SKIP_API_COMPRESSION = process.env.OPENCHAMBER_SKIP_API_COMPRESSION || 'true';
-  process.env.NO_PROXY = process.env.NO_PROXY || 'localhost,127.0.0.1';
-  process.env.no_proxy = process.env.no_proxy || 'localhost,127.0.0.1';
+  assignInjectedEnv(process.env, {
+    OPENCHAMBER_HOST: bindHost,
+    OPENCHAMBER_DESKTOP_LAN_ACCESS_ACTIVE: effectiveLanAccessEnabled ? 'true' : 'false',
+    OPENCHAMBER_DESKTOP_LAN_ACCESS_BLOCKED_REASON: lanAccessBlockedByEnterprise
+      ? 'enterprise-mode'
+      : lanAccessBlockedByMissingPassword ? 'missing-password' : undefined,
+    OPENCHAMBER_DIST_DIR: resolveWebDistDir(),
+    OPENCHAMBER_RUNTIME: 'desktop',
+    // OpenCode uses process cwd as a fallback directory; app userData would make
+    // packaged desktop look like a separate empty workspace.
+    OPENCHAMBER_OPENCODE_CWD: resolveManagedOpenCodeCwd({
+      env: process.env,
+      homedir: () => os.homedir(),
+    }),
+    OPENCHAMBER_DESKTOP_NOTIFY: 'true',
+    OPENCHAMBER_UI_PASSWORD: desktopUiPassword || undefined,
+    OPENCHAMBER_SKIP_API_COMPRESSION: process.env.OPENCHAMBER_SKIP_API_COMPRESSION || 'true',
+    NO_PROXY: process.env.NO_PROXY || 'localhost,127.0.0.1',
+    no_proxy: process.env.no_proxy || 'localhost,127.0.0.1',
+  });
 
   const { startWebUiServer } = await import('@openchamber/web/server/index.js');
 
@@ -1372,17 +1638,25 @@ const spawnLocalServer = async () => {
     builtInExtensionsDir: app.isPackaged
       ? path.join(app.getAppPath().endsWith('.asar') ? `${app.getAppPath()}.unpacked` : app.getAppPath(), 'node_modules/@openchamber/web/server/built-in-extensions')
       : undefined,
-    onDesktopNotification: (payload) => maybeShowNativeNotification(payload),
+    // The in-process server's notifications belong to the local instance.
+    onDesktopNotification: (payload) => maybeShowNativeNotification({ ...payload, runtimeKey: 'local' }),
     getIsWindowFocused: isAnyWindowFocused,
     getDesktopRuntimeConfig: () => ({
       apiBaseUrl: state.apiBaseUrl || '',
       requestHeaders: sanitizeRuntimeRequestHeaders(state.requestHeaders || {}),
     }),
+    // Remote clients only. A package install asks for the administrator
+    // password on this machine's screen, so nobody at a phone could answer it
+    // and the server would stay down until someone at the desk did.
     desktopUpdater: {
-      check: () => handleInvoke(null, 'desktop_check_for_updates'),
+      check: async () => {
+        const updateInfo = await handleInvoke(null, 'desktop_check_for_updates');
+        return isLinuxPackageInstall() ? { ...updateInfo, installBlocked: 'desktop-host' } : updateInfo;
+      },
       install: async () => {
         const updateInfo = await handleInvoke(null, 'desktop_check_for_updates');
         if (!updateInfo.available) return updateInfo;
+        if (isLinuxPackageInstall()) return { ...updateInfo, installBlocked: 'desktop-host' };
         await handleInvoke(null, 'desktop_download_and_install_update');
         return updateInfo;
       },
@@ -1508,9 +1782,10 @@ const buildInitScript = (localOrigin, bootOutcome, apiBaseUrl = '', clientToken 
   const packagedOrigin = JSON.stringify(packagedUiOrigin());
   const macVersion = macosMajorVersion();
   const outcome = JSON.stringify(bootOutcome ?? null);
+  const sshForwardedApiUrl = JSON.stringify(sshManager.isForwardedApiUrl(apiBaseUrl) ? apiBaseUrl : '');
   return [
     '(function(){',
-    `try{var __oc_local=${local};var __oc_api=${apiBase};var __oc_headers=${headers};var __oc_packaged=${packagedOrigin};var __oc_origin=window.location&&window.location.origin||'';var __oc_is_packaged=__oc_origin===__oc_packaged;var __oc_is_local=__oc_local&&__oc_origin===new URL(__oc_local).origin;window.__OPENCHAMBER_MACOS_MAJOR__=${macVersion};window.__OPENCHAMBER_LOCAL_ORIGIN__=__oc_local;window.__OPENCHAMBER_API_BASE_URL__=__oc_api;if(__oc_is_local||__oc_is_packaged){window.__OPENCHAMBER_HOME__=${home};window.__OPENCHAMBER_RUNTIME_HEADERS__=__oc_headers;}if((__oc_is_local||__oc_is_packaged)&&${token}){window.__OPENCHAMBER_CLIENT_TOKEN__=${token};}var __oc_bo=${outcome};if(__oc_bo){window.__OPENCHAMBER_DESKTOP_BOOT_OUTCOME__=__oc_bo;}}catch(_e){}`,
+    `try{var __oc_local=${local};var __oc_api=${apiBase};var __oc_headers=${headers};var __oc_packaged=${packagedOrigin};var __oc_origin=window.location&&window.location.origin||'';var __oc_is_packaged=__oc_origin===__oc_packaged;var __oc_is_local=__oc_local&&__oc_origin===new URL(__oc_local).origin;window.__OPENCHAMBER_MACOS_MAJOR__=${macVersion};window.__OPENCHAMBER_LOCAL_ORIGIN__=__oc_local;window.__OPENCHAMBER_API_BASE_URL__=__oc_api;window.__OPENCHAMBER_SSH_FORWARD_API_URL__=${sshForwardedApiUrl};if(__oc_is_local||__oc_is_packaged){window.__OPENCHAMBER_HOME__=${home};window.__OPENCHAMBER_RUNTIME_HEADERS__=__oc_headers;}if((__oc_is_local||__oc_is_packaged)&&${token}){window.__OPENCHAMBER_CLIENT_TOKEN__=${token};}var __oc_bo=${outcome};if(__oc_bo){window.__OPENCHAMBER_DESKTOP_BOOT_OUTCOME__=__oc_bo;}}catch(_e){}`,
     '}())',
   ].join('');
 };
@@ -1727,16 +2002,28 @@ const setTaskbarProgress = (value) => {
 const pendingDeepLinks = [];
 const PENDING_SESSION_LINK_FALLBACK_MS = 10_000;
 
+// A session link (`openchamber://session/<id>`) can also name the message to
+// show (`?message=<id>`) and the saved host that owns the session
+// (`?host=<id>`). The renderer validates the IDs and opens a session of
+// another host in that host's window, as for a notification click.
+const sessionDeepLinkTarget = (link) => {
+  const target = { sessionId: link.value };
+  const messageId = readDeepLinkQueryParam(link.raw, 'message');
+  if (messageId) target.messageId = messageId;
+  const runtimeKey = runtimeKeyForDeepLinkHost(readDeepLinkQueryParam(link.raw, 'host'));
+  if (runtimeKey) target.runtimeKey = runtimeKey;
+  return target;
+};
+
 // Hands the main window's renderer the session links that arrived before it
-// could listen, as { sessionId, messageId? }; the renderer validates both.
+// could listen, as { sessionId, messageId?, runtimeKey? }.
 const takePendingSessionDeepLinks = () => {
   const taken = [];
   for (let index = pendingDeepLinks.length - 1; index >= 0; index -= 1) {
     const link = pendingDeepLinks[index];
     if (link.type !== 'session' || !link.value) continue;
     pendingDeepLinks.splice(index, 1);
-    const messageId = readDeepLinkQueryParam(link.raw, 'message');
-    taken.unshift(messageId ? { sessionId: link.value, messageId } : { sessionId: link.value });
+    taken.unshift(sessionDeepLinkTarget(link));
   }
   return taken;
 };
@@ -1770,133 +2057,17 @@ const readDeepLinkQueryParam = (raw, name) => {
   }
 };
 
-const decodeBase64UrlJson = (value) => {
-  if (typeof value !== 'string' || !value.trim()) return null;
-  try {
-    const json = Buffer.from(value.trim(), 'base64url').toString('utf8');
-    return JSON.parse(json);
-  } catch {
-    return null;
-  }
-};
+// Host work the main window's renderer does itself (desktop_take_pending_host_actions):
+// redeeming a pairing link the user confirmed, and activating a host with a
+// relay leg. Both need the E2EE relay client, which lives in the renderer; it
+// probes the direct address first and falls back to the tunnel, like the host
+// switcher. Pairing links carry the one-time secret: they leave this queue only
+// to that renderer and are never logged.
+const pendingHostActions = [];
 
-const parseConnectPairingDeepLinkPayload = (raw) => {
-  if (typeof raw !== 'string') return null;
-  try {
-    const url = new URL(raw.trim());
-    if (url.protocol !== `${DEEP_LINK_PROTOCOL}:` || url.hostname !== 'connect') return null;
-    if (url.searchParams.get('v') !== '2') return null;
-    const payload = decodeBase64UrlJson(url.searchParams.get('p') || '');
-    if (!payload || payload.v !== 2 || typeof payload !== 'object') return null;
-    const pairingId = typeof payload.pairingId === 'string' ? payload.pairingId.trim() : '';
-    const secret = typeof payload.secret === 'string' ? payload.secret.trim() : '';
-    if (!pairingId || !secret) return null;
-    const candidates = Array.isArray(payload.candidates)
-      ? payload.candidates.flatMap((candidate) => {
-        if (!candidate || typeof candidate !== 'object') return [];
-        const type = candidate.type === 'lan' || candidate.type === 'tunnel' || candidate.type === 'relay'
-          ? candidate.type
-          : null;
-        const candidateUrl = normalizeHostUrl(candidate.url || '');
-        if (!type || !candidateUrl) return [];
-        const priority = Number.isFinite(candidate.priority) ? candidate.priority : 100;
-        return [{ type, url: candidateUrl, priority }];
-      })
-      : [];
-    if (candidates.length === 0) return null;
-    const expiresAt = typeof payload.expiresAt === 'string' ? payload.expiresAt.trim() : '';
-    if (expiresAt) {
-      const expiresTime = Date.parse(expiresAt);
-      if (!Number.isFinite(expiresTime) || expiresTime <= Date.now()) return null;
-    }
-    return {
-      pairingId,
-      secret,
-      label: typeof payload.label === 'string' && payload.label.trim() ? payload.label.trim() : 'OpenChamber',
-      fingerprint: typeof payload.fingerprint === 'string' && payload.fingerprint.trim() ? payload.fingerprint.trim() : '',
-      expiresAt: expiresAt || null,
-      candidates: candidates.sort((left, right) => left.priority - right.priority),
-    };
-  } catch {
-    return null;
-  }
-};
-
-const importConnectDeepLink = async (payload) => {
-  if (!payload?.serverUrl || !payload?.token) return null;
-  const serverUrl = normalizeHostUrl(payload.serverUrl);
-  if (!serverUrl) return null;
-  const config = readDesktopHostsConfig();
-  const existing = config.hosts.find((host) => {
-    const hostUrl = normalizeHostUrl(host?.url || '');
-    const apiUrl = normalizeHostUrl(host?.apiUrl || host?.url || '');
-    return serverUrl === hostUrl || serverUrl === apiUrl;
-  });
-
-  const id = existing?.id || `host-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const importedHost = {
-    ...(existing || {}),
-    id,
-    label: payload.label || existing?.label || serverUrl,
-    url: serverUrl,
-    apiUrl: serverUrl,
-    clientToken: payload.token,
-  };
-  const hosts = existing
-    ? config.hosts.map((host) => (host.id === existing.id ? importedHost : host))
-    : [importedHost, ...config.hosts];
-  await writeDesktopHostsConfig({
-    ...config,
-    hosts,
-    defaultHostId: config.defaultHostId || id,
-    initialHostChoiceCompleted: true,
-  });
-  return id;
-};
-
-const requestJsonWithTimeout = async (url, init = {}, timeoutMs = 8000) => {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
-    const data = await response.json().catch(() => null);
-    return { ok: response.ok, status: response.status, data };
-  } finally {
-    clearTimeout(timer);
-  }
-};
-
-const selectPairingCandidateUrl = async (payload) => {
-  for (const candidate of payload.candidates || []) {
-    try {
-      const health = await requestJsonWithTimeout(`${candidate.url.replace(/\/+$/g, '')}/health`, { method: 'GET' }, 3500);
-      if (health.ok) return candidate.url.replace(/\/+$/g, '');
-    } catch {
-    }
-  }
-  return null;
-};
-
-const redeemConnectPairingDeepLink = async (payload, serverUrl) => {
-  const response = await requestJsonWithTimeout(`${serverUrl.replace(/\/+$/g, '')}/api/client-auth/pairing/redeem`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({
-      pairingId: payload.pairingId,
-      secret: payload.secret,
-      clientLabel: 'OpenChamber Desktop',
-      clientKind: 'desktop',
-      deviceName: 'OpenChamber Desktop',
-      ...desktopDeviceMetadata(),
-      dedupeKey: `desktop:${await getOrCreateDesktopInstallId()}`,
-    }),
-  });
-  if (!response.ok || !response.data || typeof response.data.clientToken !== 'string') return null;
-  return {
-    serverUrl,
-    token: sanitizeClientTokenForStorage(response.data.clientToken),
-    label: payload.label || response.data?.server?.label || serverUrl,
-  };
+const queueHostAction = (action) => {
+  pendingHostActions.push(action);
+  emitToWindow(state.mainWindow, 'openchamber:host-actions-ready');
 };
 
 const switchToHostById = async (rawId) => {
@@ -1916,6 +2087,13 @@ const switchToHostById = async (rawId) => {
     const host = config.hosts.find((entry) => entry.id === id);
     if (!host) {
       log.warn('[electron] deep-link host not found:', id);
+      return;
+    }
+    if (sanitizeHostRelayForStorage(host.relay)) {
+      // A fixed apiBaseUrl would strand the window when the direct address is
+      // unreachable; the renderer picks direct or relay.
+      log.info('[electron] activating relay-capable host in renderer', { id });
+      queueHostAction({ type: 'host', hostId: id });
       return;
     }
     targetUrl = shouldUsePackagedUi() ? buildPackagedUiUrl('/index.html') : host.url;
@@ -1970,33 +2148,17 @@ const dispatchDeepLink = (link) => {
   if (!link) return;
   log.info('[electron] dispatching deep-link', { type: link.type, valueLen: link.value?.length || 0 });
   if (link.type === 'connect') {
-    const pairingPayload = parseConnectPairingDeepLinkPayload(link.raw);
-    if (pairingPayload) {
-      const previewUrl = pairingPayload.candidates[0]?.url || pairingPayload.label;
+    const pairing = parsePairingDeepLink(link.raw, { protocol: DEEP_LINK_PROTOCOL });
+    if (pairing) {
       void confirmConnectDeepLink({
-        serverUrl: previewUrl,
-        token: 'pairing-v2',
-        label: pairingPayload.fingerprint ? `${pairingPayload.label} (${pairingPayload.fingerprint})` : pairingPayload.label,
-      }).then(async (confirmed) => {
+        serverUrl: pairing.target,
+        label: pairing.fingerprint ? `${pairing.label} (${pairing.fingerprint})` : pairing.label,
+      }).then((confirmed) => {
         if (!confirmed) {
           log.info('[electron] connect pairing deep-link declined by user');
           return;
         }
-        const serverUrl = await selectPairingCandidateUrl(pairingPayload);
-        if (!serverUrl) {
-          log.warn('[electron] connect pairing deep-link has no reachable candidate');
-          return;
-        }
-        const importedPayload = await redeemConnectPairingDeepLink(pairingPayload, serverUrl).catch((error) => {
-          log.warn('[electron] connect pairing redeem failed:', error);
-          return null;
-        });
-        if (!importedPayload?.token) {
-          log.warn('[electron] connect pairing redeem returned no client token');
-          return;
-        }
-        const id = await importConnectDeepLink(importedPayload);
-        if (id) void switchToHostById(id);
+        queueHostAction({ type: 'pairing', link: link.raw.trim() });
       });
       return;
     }
@@ -2021,12 +2183,12 @@ const dispatchDeepLink = (link) => {
   }
 
   if (link.type === 'session' && link.value) {
-    // A message link (`openchamber://session/<id>?message=<id>`) also names
-    // the message to show; the renderer validates both IDs.
-    const messageId = readDeepLinkQueryParam(link.raw, 'message');
-    emitToPrimaryWindow('openchamber:open-session', messageId
-      ? { sessionId: link.value, messageId }
-      : { sessionId: link.value });
+    // The session opens in the main window, so raise it: on macOS the link
+    // brings the app forward with whichever window was used last. A session of
+    // another host then opens in that host's window, which comes up on top,
+    // as for a notification click.
+    focusForegroundWindow();
+    emitToPrimaryWindow('openchamber:open-session', sessionDeepLinkTarget(link));
     return;
   }
   if (link.type === 'host' && link.value) {
@@ -2084,6 +2246,22 @@ const dispatchDomEventToWindow = (browserWindow, event, detail) => {
   void browserWindow.webContents.executeJavaScript(script, true).catch(() => {});
 };
 
+const closeTabTargets = new WeakSet();
+const closeTabWatched = new WeakSet();
+
+/** Cmd/Ctrl+W: the page's own tab when it has one open, else the window. */
+const closeTabOrWindow = () => {
+  // Only the focused window: with an About panel or nothing of ours in front,
+  // falling back to the main window would close the wrong thing.
+  const target = BrowserWindow.getFocusedWindow();
+  if (!target || target.isDestroyed()) return;
+  if (closeTabTargets.has(target.webContents)) {
+    dispatchDomEventToWindow(target, 'openchamber:close-tab');
+    return;
+  }
+  target.close();
+};
+
 const getMenuTargetWindow = () => {
   const focused = BrowserWindow.getFocusedWindow();
   if (focused && !focused.isDestroyed()) return focused;
@@ -2094,23 +2272,16 @@ const getMenuTargetWindow = () => {
 
 const dispatchMenuAction = (action) => {
   const target = getMenuTargetWindow();
-  // Zoom actions are consumed by the renderer's DOM listener. Sending them
-  // through both the IPC bridge and the DOM event would invoke the handler
-  // multiple times because preload fans the IPC event back into both paths.
   if (action === 'zoom-in' || action === 'zoom-out' || action === 'zoom-reset') {
     dispatchDomEventToWindow(target, 'openchamber:zoom', action);
     return;
   }
-  emitToWindow(target, 'openchamber:menu-action', action);
+  // Preload already fans IPC events into both its listeners and the DOM.
+  // Deliver menu actions through one path so a shortcut runs only once.
   dispatchDomEventToWindow(target, 'openchamber:menu-action', action);
 };
 
-// Append-style menu actions must reach the renderer exactly once. Dual IPC+DOM
-// delivery (dispatchMenuAction) would insert the selection twice.
-const dispatchAddSelectionToChat = () => {
-  const target = getMenuTargetWindow();
-  if (target) emitToWindow(target, 'openchamber:menu-action', 'add-selection-to-chat');
-};
+const dispatchAddSelectionToChat = () => dispatchMenuAction('add-selection-to-chat');
 
 // Mini-chat draft windows are not deduplicated, so this must reach the renderer
 // exactly once — emitToWindow alone (no DOM-event double dispatch). The renderer
@@ -2120,11 +2291,277 @@ const dispatchOpenMiniChat = (browserWindow) => {
   if (target) emitToWindow(target, 'openchamber:open-mini-chat');
 };
 
-const dispatchCheckForUpdates = () => {
-  emitToAllWindows('openchamber:check-for-updates');
-  for (const browserWindow of BrowserWindow.getAllWindows()) {
-    dispatchDomEventToWindow(browserWindow, 'openchamber:check-for-updates');
+// Mini Chat global shortcut. The combo is stored in settings.json under
+// desktopMiniChatGlobalShortcut using the in-app shortcut syntax. Electron
+// globalShortcut accepts a single accelerator, so the combo must convert; a
+// stored combo that fails to convert (or is taken by another app) stays
+// configured but inactive, and the settings row surfaces that state.
+let registeredMiniChatGlobalShortcutAccelerator = null;
+
+const readDesktopMiniChatGlobalShortcutStatus = () => {
+  const combo = normalizeStoredShortcutCombo(readSettingsRoot()[MINI_CHAT_GLOBAL_SHORTCUT_SETTING_KEY]);
+  return { supported: true, combo, active: registeredMiniChatGlobalShortcutAccelerator !== null };
+};
+
+const ensureMiniChatFocusStampListener = () => {
+  if (state.miniChatFocusListener) return;
+  state.miniChatFocusListener = (_event, browserWindow) => {
+    if (browserWindow && !browserWindow.isDestroyed() && browserWindow.__ocMiniChat === true) {
+      browserWindow.__ocMiniChatFocusedAt = Date.now();
+    }
+  };
+  app.on('browser-window-focus', state.miniChatFocusListener);
+};
+
+const handleMiniChatGlobalShortcut = () => {
+  const action = selectMiniChatGlobalShortcutAction(
+    BrowserWindow.getAllWindows().map((browserWindow) => ({
+      id: browserWindow.id,
+      isMiniChat: browserWindow.__ocMiniChat === true,
+      isFocused: browserWindow.isFocused(),
+      focusedAt: browserWindow.__ocMiniChatFocusedAt ?? 0,
+    })),
+    { hasRendererWindow: getMenuTargetWindow() !== null },
+  );
+  if (action.type === 'hide' || action.type === 'focus') {
+    const target = BrowserWindow.fromId(action.windowId);
+    if (!target || target.isDestroyed()) return;
+    if (action.type === 'hide') {
+      target.hide();
+    } else {
+      if (!target.isVisible()) target.show();
+      target.focus();
+    }
+    return;
   }
+  if (action.type === 'reveal-main') {
+    // No renderer window is alive (windowless tray mode): the renderer owns
+    // draft-mini-chat creation, so surface the main window and let the next
+    // press open one.
+    void revealMainWindow();
+    return;
+  }
+  dispatchOpenMiniChat();
+};
+
+const applyDesktopMiniChatGlobalShortcut = () => {
+  if (registeredMiniChatGlobalShortcutAccelerator !== null) {
+    try {
+      globalShortcut.unregister(registeredMiniChatGlobalShortcutAccelerator);
+    } catch {
+    }
+    registeredMiniChatGlobalShortcutAccelerator = null;
+  }
+  const { combo } = readDesktopMiniChatGlobalShortcutStatus();
+  if (!combo) return;
+  const accelerator = convertShortcutComboToAccelerator(combo);
+  if (!accelerator) {
+    log.warn('[electron] mini chat global shortcut: unsupported combo', { combo });
+    return;
+  }
+  if (registeredQuakeModeAccelerator !== null && accelerator === registeredQuakeModeAccelerator) {
+    log.warn('[electron] mini chat global shortcut: combo collides with Quake Mode', { combo, accelerator });
+    return;
+  }
+  try {
+    globalShortcut.register(accelerator, handleMiniChatGlobalShortcut);
+    if (globalShortcut.isRegistered(accelerator)) {
+      registeredMiniChatGlobalShortcutAccelerator = accelerator;
+      ensureMiniChatFocusStampListener();
+    } else {
+      log.warn('[electron] mini chat global shortcut: combo is taken by another app', { combo, accelerator });
+    }
+  } catch (error) {
+    log.warn('[electron] mini chat global shortcut: registration failed', error);
+  }
+};
+
+// Quake Mode: one global hotkey toggles the existing main window between
+// hidden (process keeps running, renderer untouched) and a top-attached
+// dropdown. The combo is stored in settings.json under
+// desktopQuakeModeShortcut using the in-app shortcut syntax; when Quake is
+// enabled but nothing was stored, the default applies (Ctrl+`, deliberately
+// without the Win key so it never fires Windows Terminal's own dropdown), and
+// an explicitly unassigned one registers nothing. A stored combo that fails to
+// convert, is taken by another app, or collides with the Mini Chat shortcut
+// stays configured but inactive, and the settings row surfaces that state.
+let registeredQuakeModeAccelerator = null;
+
+const readDesktopQuakeModeStatus = () => {
+  const { enabled, storedCombo, combo, heightFraction } = readQuakeModeSettings(readSettingsRoot());
+  return {
+    supported: true,
+    enabled,
+    combo,
+    storedCombo,
+    active: registeredQuakeModeAccelerator !== null,
+    heightFraction,
+  };
+};
+
+// Close-to-quake gate. Quake Mode is itself a background lifecycle (like the
+// tray): closing the window hides it so the hotkey can bring it back, instead
+// of quitting the app out from under the user. Without a registered hotkey
+// (unassigned, taken by another app, unsupported on Wayland) nothing could
+// bring the window back, so close behaves as if Quake were off.
+const shouldHideMainWindowToQuake = (browserWindow) => {
+  if (!browserWindow || browserWindow.isDestroyed()) return false;
+  if (browserWindow.__ocMiniChat === true) return false;
+  if (registeredQuakeModeAccelerator === null) return false;
+  return readSettingsRoot()[QUAKE_MODE_ENABLED_KEY] === true;
+};
+
+// The display the Quake window opens on: the one holding the cursor (like
+// Windows Terminal), falling back to the primary display.
+const getQuakeDisplayBounds = () => {
+  try {
+    const cursor = screen.getCursorScreenPoint();
+    const display = screen.getDisplayNearestPoint(cursor);
+    if (display?.bounds) return display.bounds;
+  } catch {
+    // A cursor that cannot be read (locked screen, RDP edge) falls through.
+  }
+  try {
+    const primary = screen.getPrimaryDisplay();
+    if (primary?.bounds) return primary.bounds;
+  } catch {
+    return null;
+  }
+  return null;
+};
+
+// Shows the existing main window as the Quake dropdown WITHOUT navigating or
+// reloading it, then focuses it so the user can type immediately. The window
+// stays an ordinary window (taskbar entry, Alt+Tab, minimize/maximize all work
+// as usual); only its geometry and the hotkey toggle are Quake Mode behavior.
+const showQuakeWindow = (browserWindow, heightFraction) => {
+  if (!browserWindow || browserWindow.isDestroyed()) return false;
+  if (!state.quakeActive) {
+    try {
+      state.quakeNormalBounds = browserWindow.getBounds();
+    } catch {
+      state.quakeNormalBounds = null;
+    }
+    state.quakeNormalMaximized = (() => {
+      try {
+        return browserWindow.isMaximized();
+      } catch {
+        return false;
+      }
+    })();
+  }
+  try {
+    // macOS: a hotkey pressed from another app leaves OpenChamber in the
+    // background, where show/focus alone do not bring it forward.
+    if (process.platform === 'darwin') app.focus({ steal: true });
+    if (browserWindow.isMinimized()) browserWindow.restore();
+    if (state.quakeNormalMaximized) browserWindow.unmaximize();
+    const displayBounds = getQuakeDisplayBounds();
+    if (displayBounds) {
+      browserWindow.setBounds(computeQuakeBounds(displayBounds, heightFraction));
+    }
+    if (!browserWindow.isVisible()) browserWindow.show();
+    browserWindow.focus();
+    browserWindow.moveTop();
+    state.quakeActive = true;
+    return true;
+  } catch (error) {
+    log.warn('[electron] quake mode: show failed', error);
+    return false;
+  }
+};
+
+const hideQuakeWindow = (browserWindow) => {
+  if (!browserWindow || browserWindow.isDestroyed()) return;
+  try {
+    debounceWindowStatePersist(browserWindow, true);
+  } catch {
+    // Persist is best-effort; hiding must not fail because of it.
+  }
+  browserWindow.hide();
+};
+
+// Leaves the dropdown and puts the normal window back: the bounds and the
+// maximized state captured before Quake reshaped the window.
+const restoreNormalWindowFromQuake = () => {
+  const target = state.mainWindow;
+  if (!state.quakeActive) return target;
+  state.quakeActive = false;
+  if (!target || target.isDestroyed()) return target;
+  try {
+    if (state.quakeNormalBounds) {
+      target.setBounds(state.quakeNormalBounds);
+    }
+    if (state.quakeNormalMaximized) target.maximize();
+  } catch (error) {
+    log.warn('[electron] quake mode: restore failed', error);
+  }
+  state.quakeNormalBounds = null;
+  state.quakeNormalMaximized = false;
+  return target;
+};
+
+const handleQuakeModeGlobalShortcut = () => {
+  const { heightFraction } = readQuakeModeSettings(readSettingsRoot());
+  const mainWindow = state.mainWindow && !state.mainWindow.isDestroyed() ? state.mainWindow : null;
+  const action = selectQuakeToggleAction({
+    windowExists: mainWindow !== null,
+    isVisible: mainWindow?.isVisible() === true,
+    isMinimized: mainWindow?.isMinimized() === true,
+    isFocused: mainWindow?.isFocused() === true,
+  });
+  if (action === 'hide' && mainWindow) {
+    hideQuakeWindow(mainWindow);
+    return;
+  }
+  if (mainWindow) {
+    showQuakeWindow(mainWindow, heightFraction);
+    return;
+  }
+  // Windowless background start (or a truly closed window): create the main
+  // window, then shape it into the dropdown once it exists.
+  void openMainWindow().then((created) => {
+    const target = created && !created.isDestroyed() ? created : state.mainWindow;
+    if (target && !target.isDestroyed()) showQuakeWindow(target, heightFraction);
+  }).catch((error) => {
+    log.warn('[electron] quake mode: open failed', error);
+  });
+};
+
+const applyDesktopQuakeModeShortcut = () => {
+  if (registeredQuakeModeAccelerator !== null) {
+    try {
+      globalShortcut.unregister(registeredQuakeModeAccelerator);
+    } catch {
+    }
+    registeredQuakeModeAccelerator = null;
+  }
+  const { enabled, combo } = readDesktopQuakeModeStatus();
+  if (!enabled || !combo) return;
+  const accelerator = convertShortcutComboToAccelerator(combo);
+  if (!accelerator) {
+    log.warn('[electron] quake mode: unsupported combo', { combo });
+    return;
+  }
+  if (accelerator === registeredMiniChatGlobalShortcutAccelerator) {
+    log.warn('[electron] quake mode: combo collides with the Mini Chat shortcut', { combo, accelerator });
+    return;
+  }
+  try {
+    globalShortcut.register(accelerator, handleQuakeModeGlobalShortcut);
+    if (globalShortcut.isRegistered(accelerator)) {
+      registeredQuakeModeAccelerator = accelerator;
+    } else {
+      log.warn('[electron] quake mode: combo is taken by another app', { combo, accelerator });
+    }
+  } catch (error) {
+    log.warn('[electron] quake mode: registration failed', error);
+  }
+};
+
+const dispatchCheckForUpdates = () => {
+  // Preload dispatches this IPC notification as a DOM event.
+  emitToAllWindows('openchamber:check-for-updates');
 };
 
 const reloadMenuTargetWindow = () => {
@@ -2178,6 +2615,7 @@ const createBrowserWindow = ({ label, restoreGeometry, url, runtimeConfig = {}, 
       requestHeaders: desktopRequestHeaders,
       bootOutcome: state.bootOutcome || null,
       relayHostId: rendererRuntimeConfig.relayHostId || '',
+      explicitRuntime: runtimeConfig.explicitRuntime === true,
       trayEnabled: isMacMenuBarEnabled(),
     }),
   }));
@@ -2211,7 +2649,7 @@ const createBrowserWindow = ({ label, restoreGeometry, url, runtimeConfig = {}, 
       if (browserWindow.isDestroyed()) return;
       try {
         browserWindow.setWindowButtonVisibility(true);
-        browserWindow.setTrafficLightPosition({ x: 16, y: 17 });
+        browserWindow.setTrafficLightPosition(macTrafficLightPosition());
       } catch {}
     };
     browserWindow.on('minimize', () => {
@@ -2250,9 +2688,15 @@ const createBrowserWindow = ({ label, restoreGeometry, url, runtimeConfig = {}, 
       return;
     }
 
+    if (!state.quitRequested && shouldHideMainWindowToQuake(browserWindow)) {
+      event.preventDefault();
+      hideQuakeWindow(browserWindow);
+      return;
+    }
+
     if (process.platform === 'darwin' && !state.quitRequested) {
       const remainingVisible = BrowserWindow.getAllWindows().filter(
-        (window) => !window.isDestroyed() && window.isVisible(),
+        (window) => !window.isDestroyed() && window.isVisible() && !isBrowserPanelPopup(window),
       ).length;
 
       if (remainingVisible <= 1) {
@@ -2316,15 +2760,9 @@ const createBrowserWindow = ({ label, restoreGeometry, url, runtimeConfig = {}, 
         } catch {
         }
       }
-      const hosts = includeHosts ? readDesktopHostsConfig()?.hosts || [] : [];
-      for (const entry of hosts) {
-        if (typeof entry?.url !== 'string') continue;
-        try {
-          if (new URL(entry.url).origin === url.origin) return true;
-        } catch {
-        }
-      }
-      return false;
+      // Matches the host's `apiUrl` as well as its `url`: when the two differ,
+      // extension frames load from `apiUrl`.
+      return includeHosts && findConfiguredHostForUrl(raw) !== null;
     } catch {
       return false;
     }
@@ -2387,11 +2825,11 @@ const createBrowserWindow = ({ label, restoreGeometry, url, runtimeConfig = {}, 
     log.warn(`[guests] refused an extension frame navigating to ${host || 'an invalid URL'}`);
   });
 
-  browserWindow.webContents.setZoomFactor(1);
-  browserWindow.webContents.on('zoom-changed', () => {
-    browserWindow.webContents.setZoomFactor(1);
-  });
+  // The app scales itself (View > Zoom changes the interface scale), so
+  // Chromium's page zoom from pinch or Ctrl+wheel stays off.
+  browserWindow.webContents.setZoomMode('disabled');
   attachRendererRecovery(browserWindow, { log, label: 'window' });
+  attachDevWindowTape(app, browserWindow);
 
   browserWindow.webContents.on('dom-ready', () => {
     if (browserWindow.__ocLabel === 'main') {
@@ -2411,7 +2849,6 @@ const createBrowserWindow = ({ label, restoreGeometry, url, runtimeConfig = {}, 
         documentClass: classifyStartupDocument(browserWindow.webContents.getURL()),
       });
     }
-    browserWindow.webContents.setZoomFactor(1);
     if (state.mainWindow && browserWindow.id === state.mainWindow.id && pendingDeepLinks.length > 0) {
       const timer = setTimeout(() => flushPendingDeepLinks({ includeSessions: false }), 400);
       if (typeof timer?.unref === 'function') timer.unref();
@@ -2439,6 +2876,19 @@ const createBrowserWindow = ({ label, restoreGeometry, url, runtimeConfig = {}, 
   }
 
   return browserWindow;
+};
+
+// Starts loading the packaged application in the main window before the local
+// server is up. The document's runtime values wait behind runtimeConfigGate
+// until activateMainWindow has them; the renderer loads its scripts meanwhile.
+const startEarlyMainNavigation = (url) => {
+  const mainWindow = state.mainWindow;
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  runtimeConfigGate.hold();
+  const loaded = navigateWindow(mainWindow, url, { allowAbort: true });
+  // Awaited by activateMainWindow; a startup that fails first exits the app.
+  loaded.catch(() => {});
+  state.earlyNavigation = { window: mainWindow, url, loaded };
 };
 
 // Bounded so a renderer that never reports ready-to-show cannot hold the
@@ -2492,10 +2942,20 @@ const activateMainWindow = async (url, localOrigin, bootOutcome, runtimeConfig =
   syncMainWindowInitScript(state.initScript);
 
   const mainWindow = state.mainWindow;
+  const earlyNavigation = state.earlyNavigation;
+  state.earlyNavigation = null;
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.__ocRuntimeConfig = rendererRuntimeConfig;
     mainWindow.__ocInitScript = state.initScript;
-    await navigateWindow(mainWindow, url, { allowAbort: true });
+  }
+  // The runtime is in state now: the document loading ahead of startup gets it.
+  runtimeConfigGate.release();
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (earlyNavigation?.window === mainWindow && earlyNavigation.url === url) {
+      await earlyNavigation.loaded;
+    } else {
+      await navigateWindow(mainWindow, url, { allowAbort: true });
+    }
     mainWindow.show();
     mainWindow.focus();
     return mainWindow;
@@ -2586,6 +3046,9 @@ const findConfiguredHostForUrl = (raw) => {
   } catch {
     return null;
   }
+  // Custom schemes (vscode://, relay://) have the opaque origin "null", which
+  // would match any relay-only host and open it instead of the app link.
+  if (origin === 'null') return null;
   const hosts = readDesktopHostsConfig()?.hosts || [];
   return hosts.find((entry) => [entry?.url, entry?.apiUrl].some((candidate) => {
     if (typeof candidate !== 'string' || !candidate) return false;
@@ -2643,7 +3106,7 @@ const openHostWindow = async (host, route = null, { reuseOpenWindow = false } = 
       requestHeaders: sanitizeRuntimeRequestHeaders(host.requestHeaders || {}),
     };
   }
-  const browserWindow = await createAdditionalWindow(withSessionRoute(windowUrl, route), runtimeConfig);
+  const browserWindow = await createAdditionalWindow(withSessionRoute(windowUrl, route), { ...runtimeConfig, explicitRuntime: true });
   if (browserWindow) {
     browserWindow.__ocHostWindowId = host.id;
     browserWindow.__ocHostWindowBaseUrl = windowUrl;
@@ -2680,7 +3143,9 @@ const buildMiniChatUrl = ({ mode, sessionId, directory, projectId }) => {
 };
 
 const miniChatSessionWindowKey = (runtimeConfig, sessionId) => {
-  const runtimeKey = normalizeHostUrl(runtimeConfig?.apiBaseUrl || state.apiBaseUrl || state.localOrigin || state.sidecarUrl || '') || 'local';
+  const runtimeKey = runtimeConfig?.relayHostId
+    ? `host:${runtimeConfig.relayHostId}`
+    : normalizeHostUrl(runtimeConfig?.apiBaseUrl || state.apiBaseUrl || state.localOrigin || state.sidecarUrl || '') || 'local';
   return `${runtimeKey}\n${sessionId}`;
 };
 
@@ -2700,11 +3165,22 @@ const getWindowRuntimeConfig = (browserWindow) => {
 };
 
 const createMiniChatWindow = async ({ mode, sessionId = '', directory = '', projectId = '', runtimeConfig = {} } = {}) => {
-  const effectiveRuntimeConfig = {
-    apiBaseUrl: normalizeHostUrl(runtimeConfig.apiBaseUrl || state.apiBaseUrl || state.localOrigin || state.sidecarUrl || ''),
-    clientToken: sanitizeClientTokenForStorage(runtimeConfig.clientToken || state.clientToken || ''),
-    requestHeaders: sanitizeRuntimeRequestHeaders(runtimeConfig.requestHeaders || state.requestHeaders || {}),
-  };
+  const relayHostId = typeof runtimeConfig.relayHostId === 'string' ? runtimeConfig.relayHostId : '';
+  // A relay-target window resolves its own transport from the host id, so the
+  // app's startup runtime (another instance) must not stand in for any of it.
+  const effectiveRuntimeConfig = relayHostId
+    ? {
+      apiBaseUrl: '',
+      clientToken: sanitizeClientTokenForStorage(runtimeConfig.clientToken || ''),
+      requestHeaders: sanitizeRuntimeRequestHeaders(runtimeConfig.requestHeaders || {}),
+      relayHostId,
+    }
+    : {
+      apiBaseUrl: normalizeHostUrl(runtimeConfig.apiBaseUrl || state.apiBaseUrl || state.localOrigin || state.sidecarUrl || ''),
+      clientToken: sanitizeClientTokenForStorage(runtimeConfig.clientToken || state.clientToken || ''),
+      requestHeaders: sanitizeRuntimeRequestHeaders(runtimeConfig.requestHeaders || state.requestHeaders || {}),
+      relayHostId: '',
+    };
   const sessionWindowKey = mode === 'session' && sessionId ? miniChatSessionWindowKey(effectiveRuntimeConfig, sessionId) : '';
   if (mode === 'session' && sessionId) {
     const existing = state.miniChatWindowsBySession.get(sessionWindowKey);
@@ -2730,16 +3206,19 @@ const createMiniChatWindow = async ({ mode, sessionId = '', directory = '', proj
     icon: getWindowIconPath(),
     show: false,
     backgroundColor: resolveSplashBackgroundColor(),
-    frame: usesFramelessChrome ? false : undefined,
+    frame: usesFramelessChrome() ? false : undefined,
     autoHideMenuBar: process.platform !== 'darwin',
-    titleBarStyle: process.platform === 'darwin' || usesFramelessChrome ? 'hidden' : 'default',
-    trafficLightPosition: process.platform === 'darwin' ? { x: 16, y: 17 } : undefined,
+    titleBarStyle: process.platform === 'darwin' || usesFramelessChrome() ? 'hidden' : 'default',
+    trafficLightPosition: process.platform === 'darwin' ? macTrafficLightPosition() : undefined,
+    acceptFirstMouse: true,
     webPreferences: {
       additionalArguments: buildRendererAdditionalArguments({
         localOrigin: desktopLocalOrigin,
         apiBaseUrl: desktopApiBaseUrl,
         clientToken: desktopClientToken,
         requestHeaders: desktopRequestHeaders,
+        relayHostId: effectiveRuntimeConfig.relayHostId || '',
+        explicitRuntime: true,
       }),
       preload: resolvePreloadPath(),
       backgroundThrottling: false,
@@ -2755,9 +3234,12 @@ const createMiniChatWindow = async ({ mode, sessionId = '', directory = '', proj
   browserWindow.__ocInitScript = buildInitScript(desktopLocalOrigin, state.bootOutcome, desktopApiBaseUrl, desktopClientToken, desktopRequestHeaders);
   browserWindow.__ocMiniChat = true;
   browserWindow.__ocMiniChatSessionId = sessionWindowKey;
-  browserWindow.__ocPinned = false;
+  // A mini chat is for keeping a chat in view while working elsewhere, so it
+  // opens on top of other windows; the pin button unpins this window only.
+  setMiniChatPinned(browserWindow, true);
 
   attachRendererRecovery(browserWindow, { log, label: 'mini chat' });
+  attachDevWindowTape(app, browserWindow);
 
   if (sessionWindowKey) {
     state.miniChatWindowsBySession.set(sessionWindowKey, browserWindow);
@@ -2777,7 +3259,7 @@ const createMiniChatWindow = async ({ mode, sessionId = '', directory = '', proj
       if (browserWindow.isDestroyed()) return;
       try {
         browserWindow.setWindowButtonVisibility(true);
-        browserWindow.setTrafficLightPosition({ x: 16, y: 17 });
+        browserWindow.setTrafficLightPosition(macTrafficLightPosition());
       } catch {}
     };
     browserWindow.on('show', refreshTrafficLights);
@@ -2838,6 +3320,26 @@ const resolveMiniChatRuntimeConfig = (browserWindow, args = {}) => {
   const windowConfig = getWindowRuntimeConfig(browserWindow);
   const argApiBaseUrl = typeof args.apiBaseUrl === 'string' ? args.apiBaseUrl : '';
   const targetUrl = normalizeHostUrl(argApiBaseUrl || windowConfig.apiBaseUrl || state.apiBaseUrl || state.localOrigin || state.sidecarUrl || '');
+
+  // The parent window's runtime key names the instance it is on. A relay-capable
+  // host has no injectable HTTP base (its base is the window origin on the
+  // tunnel, and the direct leg can move), so the mini chat reopens that host's
+  // own transport: the restore probes direct first and falls back to the
+  // tunnel, instead of pinning one leg or the renderer's default-host restore.
+  const runtimeKey = typeof args.runtimeKey === 'string' ? args.runtimeKey.trim() : '';
+  const hostId = runtimeKey.startsWith('host:') ? runtimeKey.slice('host:'.length) : '';
+  const relayHost = hostId
+    ? (readDesktopHostsConfig().hosts || []).find((entry) => entry.id === hostId && entry.relay) || null
+    : null;
+  if (relayHost) {
+    return {
+      apiBaseUrl: '',
+      clientToken: sanitizeClientTokenForStorage(relayHost.clientToken) || '',
+      requestHeaders: sanitizeRuntimeRequestHeaders(relayHost.requestHeaders || {}),
+      relayHostId: relayHost.id,
+    };
+  }
+
   const providedToken = sanitizeClientTokenForStorage(args.clientToken);
   const storedToken = targetUrl ? resolveStoredClientTokenForUrl(targetUrl) : '';
   const windowToken = targetUrl && sameOrigin(windowConfig.apiBaseUrl, targetUrl) ? windowConfig.clientToken : '';
@@ -2846,21 +3348,72 @@ const resolveMiniChatRuntimeConfig = (browserWindow, args = {}) => {
     apiBaseUrl: targetUrl,
     clientToken: providedToken || windowToken || storedToken || '',
     requestHeaders: sanitizeRuntimeRequestHeaders(args.requestHeaders || windowHeaders || {}),
+    relayHostId: '',
   };
 };
 
-const resolveInitialUrl = async () => {
+// A line of text under the splash logo, for a startup step the user waits
+// on (the default remote or SSH instance). The splash is a plain document
+// owned by main, so the text is added from here; the app replaces the page.
+const showSplashStatus = (text) => {
+  const mainWindow = state.mainWindow;
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  // Development shows the splash as a data: URL, packaged builds as /__splash.
+  const url = mainWindow.webContents.getURL();
+  if (!url.startsWith('data:') && !url.endsWith('/__splash')) return;
+  const script = `(() => {
+    const show = () => {
+    const stack = document.querySelector('.stack');
+    if (!stack) return;
+    let line = document.getElementById('oc-splash-status');
+    if (!line) {
+      line = document.createElement('div');
+      line.id = 'oc-splash-status';
+      line.style.cssText = 'margin-top:16px;font-size:13px;opacity:0.7;max-width:80vw;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+      stack.appendChild(line);
+    }
+    line.textContent = ${JSON.stringify(text)};
+    };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', show, { once: true });
+    else show();
+  })();`;
+  mainWindow.webContents.executeJavaScript(script).catch(() => {});
+};
+
+const showSplashConnecting = (hostLabel) => {
+  showSplashStatus(menuLabel(normalizeMenuLocale(readPreferredLocale()), 'splash.connectingTo').replace('{host}', hostLabel));
+};
+
+// A launch that will open on the local server: no server URL from the
+// environment and no remote or SSH default instance. Those keep the splash
+// until resolved, because it reports the connection attempt.
+const isPlainLocalBoot = () => {
+  if (normalizeHostUrl(process.env.OPENCHAMBER_SERVER_URL || '')) return false;
+  const { defaultHostId } = readDesktopHostsConfig();
+  return !defaultHostId || defaultHostId === LOCAL_HOST_ID;
+};
+
+const resolveInitialUrl = async ({ onPlainLocalBoot = null } = {}) => {
   const hmrApiPort = process.env.OPENCHAMBER_HMR_API_PORT || '3901';
   const hmrUiPort = process.env.OPENCHAMBER_HMR_UI_PORT || '5173';
   const hmrApiUrl = `http://127.0.0.1:${hmrApiPort}`;
   const hmrUiUrl = `http://127.0.0.1:${hmrUiPort}`;
   const usePackagedUi = shouldUsePackagedUi();
   const skipLocalServer = await shouldSkipLocalServer();
+  for (const line of describeStartupEnvironmentOverrides({
+    skipLocalServer,
+    serverUrl: process.env.OPENCHAMBER_SERVER_URL,
+  })) {
+    log.warn(`[startup] ${line}`);
+  }
   const startupProbePlan = resolveStartupUrlProbePlan({
     development: isDev,
     packagedUi: usePackagedUi,
     skipLocalServer,
   });
+  if (onPlainLocalBoot && usePackagedUi && !skipLocalServer && isPlainLocalBoot()) {
+    onPlainLocalBoot(buildPackagedUiUrl('/index.html'));
+  }
   const localUrl = skipLocalServer
     ? null
     : startupProbePlan.probeHmrApi && await waitForHealth(hmrApiUrl, 5_000, 100)
@@ -2895,13 +3448,32 @@ const resolveInitialUrl = async () => {
   let remoteProbe = null;
 
   const envTarget = normalizeHostUrl(process.env.OPENCHAMBER_SERVER_URL || '');
-  const config = readDesktopHostsConfig();
+  let config = readDesktopHostsConfig();
+  // A default SSH instance is reachable only through its tunnel: open it
+  // before the probe, and boot Local when it cannot be opened.
+  let sshStartupFallbackHostId = null;
+  const defaultSshInstanceId = envTarget
+    ? null
+    : resolveDefaultSshInstanceId(config.defaultHostId, sshManager.readInstances().instances);
+  if (defaultSshInstanceId) {
+    const sshHostLabel = config.hosts.find((entry) => entry.id === defaultSshInstanceId)?.label
+      || sshManager.readInstances().instances.find((entry) => entry?.id === defaultSshInstanceId)?.nickname
+      || defaultSshInstanceId;
+    showSplashConnecting(sshHostLabel);
+    const connected = await connectDefaultSshInstanceAtStartup({ sshManager, instanceId: defaultSshInstanceId });
+    if (connected.ok) {
+      config = readDesktopHostsConfig();
+    } else if (localAvailable) {
+      console.warn(`[startup] default SSH instance did not connect (${connected.reason}); opening Local`);
+      sshStartupFallbackHostId = defaultSshInstanceId;
+    }
+  }
   if (envTarget) {
     apiBaseUrl = envTarget;
     clientToken = '';
     requestHeaders = {};
     initialUrl = usePackagedUi ? localUiUrl : envTarget;
-  } else if (config.defaultHostId && config.defaultHostId !== LOCAL_HOST_ID) {
+  } else if (config.defaultHostId && config.defaultHostId !== LOCAL_HOST_ID && !sshStartupFallbackHostId) {
     const host = config.hosts.find((entry) => entry.id === config.defaultHostId);
     if (host?.url) {
       apiBaseUrl = host.apiUrl || host.url;
@@ -2917,6 +3489,17 @@ const resolveInitialUrl = async () => {
     && sanitizeHostRelayForStorage(config.hosts.find((entry) => entry.id === config.defaultHostId)?.relay),
   );
   if (apiBaseUrl && apiBaseUrl !== localUrl) {
+    // The probe can take up to twelve seconds against a slow or absent host.
+    const remoteLabel = envTarget
+      ? null
+      : config.hosts.find((entry) => entry.id === config.defaultHostId)?.label;
+    let remoteHostName = '';
+    try {
+      remoteHostName = new URL(apiBaseUrl).host;
+    } catch {
+      // A malformed stored URL fails the probe below; the label is cosmetic.
+    }
+    showSplashConnecting(remoteLabel || remoteHostName || apiBaseUrl);
     remoteProbe = await probeHostWithTimeout(apiBaseUrl, 2_000, clientToken, requestHeaders);
     if (remoteProbe.status === 'unreachable' && !defaultHostRelayCapable) {
       remoteProbe = await probeHostWithTimeout(apiBaseUrl, 10_000, clientToken, requestHeaders);
@@ -2946,12 +3529,14 @@ const resolveInitialUrl = async () => {
     );
   }
 
-  const bootOutcome = computeBootOutcome({
-    envTargetUrl: envTarget || null,
-    probe: remoteProbe,
-    config,
-    localAvailable,
-  });
+  const bootOutcome = sshStartupFallbackHostId
+    ? { target: 'local', status: 'ok', localAvailable, sshStartupFallbackHostId }
+    : computeBootOutcome({
+      envTargetUrl: envTarget || null,
+      probe: remoteProbe,
+      config,
+      localAvailable,
+    });
 
   return { initialUrl, localOrigin, localUiUrl, bootOutcome, apiBaseUrl, clientToken, requestHeaders };
 };
@@ -3013,6 +3598,7 @@ const setupAutoUpdater = () => {
     setTaskbarProgress(-1);
     if (state.pendingUpdate) {
       state.pendingUpdate.downloaded = true;
+      if (info?.downloadedFile) state.pendingUpdate.downloadedFile = info.downloadedFile;
     }
   });
 
@@ -3043,6 +3629,7 @@ const UPDATE_SHUTDOWN_TIMEOUT_MS = 40_000;
 const installDownloadedUpdate = () => new Promise((resolve, reject) => {
   let settled = false;
   let graceTimer;
+  let backendStopped = false;
 
   // Hold the process from here until the installer has control. Every quit
   // path checks this, so closing the last window during shutdown can no longer
@@ -3063,6 +3650,13 @@ const installDownloadedUpdate = () => new Promise((resolve, reject) => {
     rollbackQuitState();
     log.error('[electron] update install failed', error);
     reject(error instanceof Error ? error : new Error(String(error)));
+    // The backend is gone and does not restart in place, so a failure from
+    // here on (a cancelled Linux password prompt is the common one) would
+    // leave a window that reaches no server. Come back on the current version.
+    if (backendStopped) {
+      log.info('[electron] relaunching on the current version after the failed install');
+      void performConfirmedQuit({ relaunch: true });
+    }
   };
 
   autoUpdater.on('error', fail);
@@ -3076,6 +3670,7 @@ const installDownloadedUpdate = () => new Promise((resolve, reject) => {
       // The flags exist only to let the installer's own quit through the
       // hide-on-close and confirmation guards, so nothing sets them while the
       // app is still doing work that can fail.
+      backendStopped = true;
       await Promise.race([
         shutdownBackgroundServices(),
         new Promise((resolveTimeout) => {
@@ -3086,6 +3681,26 @@ const installDownloadedUpdate = () => new Promise((resolve, reject) => {
         }),
       ]);
       if (settled) return;
+      if (isLinuxPackageInstall()) {
+        // Our own async install: the window keeps drawing through the
+        // password prompt, and a rejection lands in fail() like any other.
+        log.info('[electron] installing the downloaded package');
+        // The prompt can stay open for minutes, and a background update check
+        // failing meanwhile must not relaunch the app under a running install.
+        // This install reports its own failure through the await.
+        autoUpdater.off('error', fail);
+        await installLinuxPackage({
+          packageType: readLinuxPackageType(),
+          file: state.pendingUpdate?.downloadedFile,
+        });
+        settled = true;
+        autoUpdater.off('error', fail);
+        resolve(null);
+        log.info('[electron] package installed; restarting into the new version');
+        state.updateInstallPending = false;
+        void performConfirmedQuit({ relaunch: true });
+        return;
+      }
       // Start the installer error window after terminal cleanup, which can
       // legitimately take longer than UPDATE_INSTALL_GRACE_MS.
       graceTimer = setTimeout(() => {
@@ -3572,9 +4187,6 @@ const buildWindowsOpenProjectSpecs = ({ projectPath, appId, appName }) => {
 };
 
 const buildWindowsOpenFileSpecs = ({ filePath, appId, appName }) => {
-  if (appId === 'finder') {
-    return [{ program: 'explorer.exe', args: ['/select,', filePath] }];
-  }
   if (appId === 'terminal') {
     return buildWindowsOpenProjectSpecs({ projectPath: path.dirname(filePath), appId, appName });
   }
@@ -3729,7 +4341,18 @@ const runSpecChain = (specs, appName) => {
 // The tunnel client lives in the web package (it already has a WebSocket
 // client) and is loaded only if the user actually previews a remote dev server.
 let devTunnelClientPromise = null;
-const relayDevTunnelBridge = createRelayDevTunnelBridge({ createMessageChannel: () => new MessageChannelMain(), logger: log });
+const relayDevTunnelBridge = createRelayDevTunnelBridge({
+  createMessageChannel: () => new MessageChannelMain(),
+  logger: log,
+  // A relay tunnel of a space that closes for any reason, the window going among them, takes
+  // its port out of the space's session; a stale port would be a hole in the list.
+  onClosed: ({ spaceId, localPort }) => {
+    if (!spaceId) return;
+    closeSpacePreviewPort(spaceId, localPort).catch((error) => {
+      log.warn(`[electron] could not drop a preview port of space ${spaceId}: ${error?.message || error}`);
+    });
+  },
+});
 const getDevTunnelClient = async () => {
   if (!devTunnelClientPromise) {
     devTunnelClientPromise = import('@openchamber/web/server/lib/dev-tunnel/client.js')
@@ -3744,6 +4367,7 @@ const getDevTunnelClient = async () => {
 
 const closeAllDevTunnels = () => {
   relayDevTunnelBridge.closeAll();
+  closeAllSpacePreviewPorts();
   if (!devTunnelClientPromise) return;
   const pending = devTunnelClientPromise;
   devTunnelClientPromise = null;
@@ -3752,6 +4376,38 @@ const closeAllDevTunnels = () => {
 
 const handleInvoke = async (browserWindow, command, args = {}) => {
   switch (command) {
+    case 'desktop_collect_local_diagnostics':
+      {
+        const ssh = collectSshBufferDiagnostics(sshManager.diagnosticLogSnapshots());
+        let files;
+        try {
+          files = await collectLocalFileDiagnostics({ electronLogPath: log.transports.file.getFile().path });
+        } catch {
+          files = { events: [], coverage: [{ source: 'local files', status: 'unavailable' }] };
+        }
+        return { events: [...files.events, ...ssh.events], coverage: [...files.coverage, ...ssh.coverage] };
+      }
+    // The page says whether Cmd/Ctrl+W has a tab of its own to close (a file
+    // open in Files). The menu decides in this process, so a page that never
+    // reports one, older or remote, keeps closing the window as before.
+    case 'desktop_set_close_tab_target': {
+      const contents = browserWindow && !browserWindow.isDestroyed() ? browserWindow.webContents : null;
+      if (!contents) return null;
+      if (args?.active === true) {
+        closeTabTargets.add(contents);
+        // A reload or navigation drops the page that registered; until the
+        // new page reports again, the shortcut closes the window.
+        if (!closeTabWatched.has(contents)) {
+          closeTabWatched.add(contents);
+          const forget = () => closeTabTargets.delete(contents);
+          contents.on('did-navigate', forget);
+          contents.on('render-process-gone', forget);
+        }
+      } else {
+        closeTabTargets.delete(contents);
+      }
+      return null;
+    }
     case 'desktop_pick_theme_file': {
       const { pickThemeFile } = await import('./theme-file-picker.mjs');
       return pickThemeFile({ showDialog: (options) => dialog.showOpenDialog(browserWindow || undefined, options) });
@@ -3816,7 +4472,6 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
       const enabled = args.enabled === true;
       const settingsArgs = {
         openAtLogin: enabled,
-        ...(process.platform === 'darwin' ? { openAsHidden: enabled } : {}),
         ...(process.platform === 'win32' ? getLoginItemOptions() : { args: enabled ? [BACKGROUND_START_ARG] : [] }),
         ...(process.platform === 'win32' ? { enabled } : {}),
       };
@@ -3852,19 +4507,97 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
       return { supported: true, enabled, active };
     }
 
+    case 'desktop_get_mini_chat_global_shortcut': {
+      return readDesktopMiniChatGlobalShortcutStatus();
+    }
+
+    case 'desktop_set_mini_chat_global_shortcut': {
+      const combo = normalizeStoredShortcutCombo(args.combo);
+      // A combo the OS cannot grab leaves the stored setting untouched and
+      // says why, so the settings row can explain instead of failing generically.
+      if (combo !== null && convertShortcutComboToAccelerator(combo) === null) {
+        return { ...readDesktopMiniChatGlobalShortcutStatus(), error: 'unsupported-combo' };
+      }
+      await mutateSettingsRoot((root) => {
+        if (combo === null) delete root[MINI_CHAT_GLOBAL_SHORTCUT_SETTING_KEY];
+        else root[MINI_CHAT_GLOBAL_SHORTCUT_SETTING_KEY] = combo;
+      });
+      applyDesktopMiniChatGlobalShortcut();
+      // A combo Mini Chat just released may be the one Quake was waiting for.
+      applyDesktopQuakeModeShortcut();
+      return readDesktopMiniChatGlobalShortcutStatus();
+    }
+
+    case 'desktop_get_quake_mode': {
+      return readDesktopQuakeModeStatus();
+    }
+
+    case 'desktop_set_quake_mode_enabled': {
+      const enabled = args.enabled === true;
+      await mutateSettingsRoot((root) => {
+        root[QUAKE_MODE_ENABLED_KEY] = enabled;
+      });
+      if (!enabled) restoreNormalWindowFromQuake();
+      applyDesktopQuakeModeShortcut();
+      applyDesktopMiniChatGlobalShortcut();
+      return readDesktopQuakeModeStatus();
+    }
+
+    case 'desktop_set_quake_mode_shortcut': {
+      // Unassigned is stored as such, so the default does not come back and
+      // collide with whatever the combo was given to.
+      if (args.combo === QUAKE_MODE_UNASSIGNED) {
+        await mutateSettingsRoot((root) => {
+          root[QUAKE_MODE_SHORTCUT_KEY] = QUAKE_MODE_UNASSIGNED;
+        });
+        applyDesktopQuakeModeShortcut();
+        applyDesktopMiniChatGlobalShortcut();
+        return readDesktopQuakeModeStatus();
+      }
+      const combo = normalizeStoredShortcutCombo(args.combo);
+      // A combo the OS cannot grab leaves the stored setting untouched and
+      // says why, so the settings row can explain instead of failing generically.
+      if (combo !== null && convertShortcutComboToAccelerator(combo) === null) {
+        return { ...readDesktopQuakeModeStatus(), error: 'unsupported-combo' };
+      }
+      await mutateSettingsRoot((root) => {
+        if (combo === null) delete root[QUAKE_MODE_SHORTCUT_KEY];
+        else root[QUAKE_MODE_SHORTCUT_KEY] = combo;
+      });
+      // Quake first, so a combo it releases is free when Mini Chat re-applies.
+      applyDesktopQuakeModeShortcut();
+      applyDesktopMiniChatGlobalShortcut();
+      return readDesktopQuakeModeStatus();
+    }
+
+    case 'desktop_set_quake_mode_height': {
+      const heightFraction = parseQuakeHeightFraction(args.heightFraction);
+      await mutateSettingsRoot((root) => {
+        root[QUAKE_MODE_HEIGHT_KEY] = heightFraction;
+      });
+      return readDesktopQuakeModeStatus();
+    }
+
     // Dev-server tunnels: bind a loopback port here and pipe it to a dev server
     // on the remote OpenChamber host, so the browser panel loads a real origin
     // instead of a rewritten page. Deliberately absent from
     // COMMANDS_SAFE_FOR_REMOTE — a remote page must never open local listeners.
+    // A space's dev server comes through the same tunnel, under the space's
+    // prefix on the host, and its local port goes into the space's session
+    // before the renderer learns it, so the page loads behind the proxy.
     case 'desktop_dev_tunnel_open': {
       const baseUrl = typeof args.baseUrl === 'string' ? args.baseUrl.trim() : '';
       const port = Number.isFinite(args.port) ? Math.trunc(args.port) : 0;
       if (!baseUrl) throw new Error('baseUrl is required');
       if (!(port > 0 && port <= 65535)) throw new Error('A valid port is required');
+      const spaceId = args.spaceId ?? null;
+      if (spaceId !== null && !isSpaceId(spaceId)) throw new Error('A valid space id is required');
 
       if (args.relay === true) {
         const targetKey = typeof args.targetKey === 'string' ? args.targetKey.trim() : '';
-        return relayDevTunnelBridge.open({ targetKey, remotePort: port, webContents: browserWindow?.webContents });
+        const opened = await relayDevTunnelBridge.open({ targetKey, remotePort: port, spaceId, webContents: browserWindow?.webContents });
+        if (spaceId) await openSpacePreviewPort(spaceId, opened.localPort);
+        return opened;
       }
 
       const headers = {};
@@ -3877,7 +4610,8 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
       }
 
       const client = await getDevTunnelClient();
-      const result = await client.open({ baseUrl, port, headers });
+      const result = await client.open({ baseUrl, port, headers, spaceId });
+      if (spaceId) await openSpacePreviewPort(spaceId, result.localPort);
       return { localPort: result.localPort, reused: result.reused, url: `http://openchamber-preview.localhost:${result.localPort}/` };
     }
 
@@ -3885,12 +4619,25 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
       const baseUrl = typeof args.baseUrl === 'string' ? args.baseUrl.trim() : '';
       const port = Number.isFinite(args.port) ? Math.trunc(args.port) : 0;
       if (!baseUrl || !(port > 0)) return { closed: false };
+      const spaceId = isSpaceId(args.spaceId) ? args.spaceId : null;
       const client = await getDevTunnelClient();
-      return { closed: client.close({ baseUrl, port }) };
+      const tunnel = client.list().find((entry) => entry.baseUrl === baseUrl && entry.remotePort === port && entry.spaceId === spaceId);
+      const closed = client.close({ baseUrl, port, spaceId });
+      if (closed && spaceId && tunnel) await closeSpacePreviewPort(spaceId, tunnel.localPort);
+      return { closed };
     }
 
     case 'desktop_relay_dev_tunnel_close_all':
+      // The bridge reports each closed tunnel, and its port leaves the space's session with it.
       return { closed: relayDevTunnelBridge.closeForWebContents(browserWindow?.webContents.id) };
+
+    // A space's view is attached only after its session has the proxy, so no
+    // page of the space, a saved public address included, loads before it.
+    case 'desktop_space_preview_prepare': {
+      if (!isSpaceId(args.spaceId)) throw new Error('A valid space id is required');
+      await applySpacePreviewProxy(args.spaceId);
+      return { ready: true };
+    }
 
     /**
      * Forces prefers-color-scheme for one previewed page.
@@ -3917,11 +4664,41 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
         ? { features: [] }
         : { features: [{ name: 'prefers-color-scheme', value: scheme }] });
 
-      if (scheme === 'system') {
+      if (scheme === 'system' && !focusEmulatedPanelContents.has(target)) {
         // Nothing left to emulate; give the session back so DevTools can attach.
         try { target.debugger.detach(); } catch { /* already gone */ }
       }
       return { scheme };
+    }
+
+    /**
+     * Keeps a page the agent works in believing it has focus.
+     *
+     * Keyboard focus stays with the user while the agent clicks and types, and
+     * a page that sees itself blurred closes what the click opened (custom
+     * selects shut on blur) and is refused the clipboard. With focus emulated
+     * the page keeps its own focus while the user's keystrokes still go to the
+     * app; the pane gives the page real focus only when this fails. Sent before every
+     * focusing action, so a page that navigated since gets it again; emulation
+     * lives in the debugger session, which therefore stays attached.
+     */
+    case 'desktop_browser_keep_page_focused': {
+      const target = resolveBrowserPanelContents(args.webContentsId);
+      if (!target.debugger.isAttached()) {
+        try {
+          target.debugger.attach('1.3');
+        } catch {
+          // DevTools holds the session; the page then behaves as it always did.
+          return { focused: false };
+        }
+      }
+      await target.debugger.sendCommand('Emulation.setFocusEmulationEnabled', { enabled: true });
+      if (!focusEmulatedPanelContents.has(target)) {
+        focusEmulatedPanelContents.add(target);
+        // DevTools taking the session ends the emulation with it.
+        target.debugger.once('detach', () => focusEmulatedPanelContents.delete(target));
+      }
+      return { focused: true };
     }
 
     /**
@@ -3934,6 +4711,13 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
      * data URL so nothing else has to fetch anything.
      */
     case 'desktop_browser_fetch_favicon': {
+      // Only the user's own panel session may have an icon fetched for it. A space's view has a
+      // session of its own, so its page, whose icon URL the agent chose, gets none: the fetch is
+      // the shell's own request and must reach nothing of the user's on the space's behalf.
+      const view = resolveBrowserPanelContents(args.webContentsId);
+      if (view.session !== session.fromPartition(BROWSER_PANEL_PARTITION)) {
+        throw new Error('A space page has no favicon to fetch');
+      }
       const target = typeof args.url === 'string' ? args.url.trim() : '';
       let parsed;
       try {
@@ -3965,11 +4749,11 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
     // Scoped to the browser panel's own partition, so clearing it can never
     // touch OpenChamber's session or any other window's storage.
     case 'desktop_browser_clear_data': {
-      // Exact match, not a prefix: a prefix would also accept a partition that
-      // merely starts with this name, which is not what the comment above
-      // promises and would quietly stop being true if one were ever added.
+      // Exact names only: the panel's own partition, or a space's, whose shape
+      // is checked whole. A prefix would also accept a partition that merely
+      // starts with one of these names.
       const partition = typeof args.partition === 'string' ? args.partition.trim() : '';
-      if (partition !== BROWSER_PANEL_PARTITION) {
+      if (partition !== BROWSER_PANEL_PARTITION && spaceIdOfPreviewPartition(partition) === null) {
         throw new Error('Unsupported browser partition');
       }
       const storages = [];
@@ -4101,9 +4885,21 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
       return { mime, base64: bytes.toString('base64'), size: bytes.length };
     }
 
-    case 'desktop_notify':
-      maybeShowNativeNotification(args);
+    case 'desktop_notify': {
+      // Stamp the forwarding window's own host identity: the renderer of a
+      // direct host window cannot name its host (it sees only the API URL).
+      const senderHostId = browserWindow && !browserWindow.isDestroyed()
+        ? readTrimmedString(browserWindow.__ocHostWindowId) || null
+        : null;
+      maybeShowNativeNotification(stampForwardedNotification(args, senderHostId));
       return null;
+    }
+
+    case 'desktop_clear_session_notifications': {
+      const sessionId = readTrimmedString(args?.sessionId);
+      if (sessionId) clearSessionNotifications(sessionId);
+      return null;
+    }
 
     case 'desktop_tray_update':
       if (state.trayController) {
@@ -4114,23 +4910,19 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
         }
       }
       // Dock badge: count of chats with unseen activity (0 = cleared, also when
-      // the user disabled the badge). setBadgeCount drives the macOS dock badge.
+      // the user disabled the badge). A dev copy on a numbered branch shows
+      // that number instead (dev-dock-identity.mjs).
       try {
         const rawCount = args && typeof args.dockBadgeCount === 'number' ? args.dockBadgeCount : 0;
         const badgeCount = Number.isFinite(rawCount) ? Math.max(0, Math.floor(rawCount)) : 0;
-        if (typeof app.setBadgeCount === 'function') {
-          app.setBadgeCount(badgeCount);
-        }
+        applyDockBadge(app, badgeCount);
       } catch (error) {
         log.warn('[electron] dock badge update failed', error);
       }
       return null;
 
     case 'desktop_clear_cache':
-      await session.defaultSession.clearStorageData();
-      for (const browserWindow of BrowserWindow.getAllWindows()) {
-        browserWindow.webContents.reload();
-      }
+      await clearAppCache({ session: session.defaultSession, windows: BrowserWindow.getAllWindows() });
       return null;
 
     case 'desktop_open_path': {
@@ -4156,10 +4948,7 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
       const target = typeof args.url === 'string' ? args.url.trim() : '';
       if (!target) throw new Error('URL is required');
 
-      const parsed = new URL(target);
-      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-        throw new Error('Only HTTP URLs can be opened externally');
-      }
+      const parsed = parseExternalUrl(target);
 
       // A saved instance opens in the app, like the window.open path above.
       const host = findConfiguredHostForUrl(parsed.toString());
@@ -4230,6 +5019,11 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
       }
       const validated = await validateLocalPath(filePath, 'File path');
       if (process.platform === 'win32') {
+        // The shell's own reveal, so a replacement file manager handles it too.
+        if (appId === 'finder') {
+          shell.showItemInFolder(validated.path);
+          return null;
+        }
         runSpecChain(buildWindowsOpenFileSpecs({ filePath: validated.path, appId, appName }), appName);
         return null;
       }
@@ -4328,11 +5122,16 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
       return { apps: cachedApps, hasCache, isCacheStale };
     }
 
-    case 'desktop_hosts_get':
+    case 'desktop_hosts_get': {
+      const config = readDesktopHostsConfig();
       return {
-        ...readDesktopHostsConfig(),
+        ...config,
+        hosts: config.hosts.map((host) => sshManager.isForwardedApiUrl(host.apiUrl || host.url, host.id)
+          ? { ...host, sshForwarded: true }
+          : host),
         localOrigin: state.localOrigin || state.sidecarUrl || null,
       };
+    }
 
     case 'desktop_hosts_set': {
       const nextConfigInput = args.input || args.config || {};
@@ -4356,6 +5155,21 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
     case 'desktop_local_client_token_get':
       return readDesktopLocalClientToken();
 
+    // A page that another instance served cannot switch to Local in place. The
+    // local server answers only this app's own origins, and the local token
+    // stays with local pages. For such a page the main window loads the Local
+    // UI, the same way openchamber://host/local does. The app's own pages get
+    // false and switch in place.
+    case 'desktop_switch_to_local': {
+      if (!browserWindow || browserWindow.id !== state.mainWindow?.id) return false;
+      if (!state.sidecarUrl || isLocalSender(browserWindow.webContents)) return false;
+      // Not awaited, because the navigation replaces the page that waits for this answer.
+      void switchToHostById(LOCAL_HOST_ID).catch((error) => {
+        log.warn('[electron] failed to switch the main window to Local:', error);
+      });
+      return true;
+    }
+
     case 'desktop_install_id_get':
       return getOrCreateDesktopInstallId();
 
@@ -4367,6 +5181,21 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
         args.requestHeaders || {},
         String(args.expectedServerId || ''),
       ));
+
+    // A saved host only: the address and token come from the hosts file, never
+    // from the caller, so a page cannot aim the token at another server.
+    case 'desktop_host_update_server': {
+      const hostId = String(args.hostId || '');
+      const host = (readDesktopHostsConfig().hosts || []).find((entry) => entry?.id === hostId);
+      const url = normalizeHostUrl(host?.apiUrl || host?.url || '');
+      if (!host || !url) return { status: 'failed', error: null };
+      return requestRemoteHostUpdate({
+        url,
+        clientToken: sanitizeClientTokenForStorage(host.clientToken) || '',
+        requestHeaders: host.requestHeaders || {},
+        chromiumFetch: (requestUrl, options) => electronNet.fetch(requestUrl, options),
+      });
+    }
 
     case 'desktop_remote_password_login':
       return loginRemoteAndIssueClientToken({
@@ -4486,7 +5315,11 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
             // event left this promise pending and its listeners attached on
             // every retry.
             Promise.resolve(autoUpdater.downloadUpdate())
-              .then(() => finish(resolve, null))
+              .then((files) => {
+                // The installer comes first; Linux packages install from it.
+                if (state.pendingUpdate && files?.[0]) state.pendingUpdate.downloadedFile = files[0];
+                finish(resolve, null);
+              })
               .catch((error) => finish(reject, error));
           });
         }
@@ -4603,7 +5436,7 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
       if (shouldUsePackagedUi()) {
         windowUrl = buildPackagedUiUrl('/index.html');
       }
-      await createAdditionalWindow(windowUrl, runtimeConfig);
+      await createAdditionalWindow(windowUrl, { ...runtimeConfig, explicitRuntime: true });
       return null;
     }
 
@@ -4628,10 +5461,35 @@ const handleInvoke = async (browserWindow, command, args = {}) => {
     case 'desktop_get_window_pinned':
       return { pinned: Boolean(browserWindow?.__ocPinned) };
 
+    case 'desktop_take_pending_host_actions':
+      // Pairing links and relay host activations run in the main window only.
+      if (!browserWindow || !state.mainWindow || browserWindow.id !== state.mainWindow.id) return [];
+      return pendingHostActions.splice(0, pendingHostActions.length);
+
     case 'desktop_take_pending_session_links':
       // Session links open in the main window only.
       if (!browserWindow || !state.mainWindow || browserWindow.id !== state.mainWindow.id) return [];
       return takePendingSessionDeepLinks();
+
+    case 'desktop_open_host_session': {
+      const runtimeKey = readTrimmedString(args.runtimeKey);
+      const sessionId = readTrimmedString(args.sessionId);
+      const messageId = readTrimmedString(args.messageId);
+      if (!runtimeKey || !sessionId) throw new Error('runtimeKey and sessionId are required');
+      // The session belongs to another instance than the one the calling
+      // window shows: open it in a window for that instance instead.
+      const host = resolveHostEntryForRuntimeKey(runtimeKey, {
+        hosts: readDesktopHostsConfig()?.hosts || [],
+        localUrl: state.sidecarUrl || null,
+        localClientToken: readDesktopLocalClientToken(),
+      });
+      if (!host) {
+        log.warn('[electron] open-host-session: no host for runtime key', { runtimeKey });
+        return { opened: false };
+      }
+      await openHostWindow(host, parseSessionRoute(sessionId, messageId || null), { reuseOpenWindow: true });
+      return { opened: true };
+    }
 
     case 'desktop_focus_main_window': {
       const sessionId = typeof args.sessionId === 'string' ? args.sessionId.trim() : '';
@@ -4798,7 +5656,7 @@ const buildMacMenu = (locale = 'en') => {
         { type: 'separator' },
         { label: t('addWorkspace'), click: () => dispatchAction('change-workspace') },
         { type: 'separator' },
-        roleItem('close', 'close'),
+        { label: t('close'), accelerator: 'CmdOrCtrl+W', click: closeTabOrWindow },
       ],
     },
     {
@@ -4844,7 +5702,7 @@ const buildMacMenu = (locale = 'en') => {
         { label: t('zoomOut'), accelerator: 'CmdOrCtrl+-', click: () => dispatchAction('zoom-out') },
         { label: t('resetZoom'), accelerator: 'CmdOrCtrl+0', click: () => dispatchAction('zoom-reset') },
         { type: 'separator' },
-        roleItem('close', 'close'),
+        { label: t('close'), accelerator: 'CmdOrCtrl+W', click: closeTabOrWindow },
       ],
     },
     {
@@ -4948,8 +5806,10 @@ const buildAutoHiddenMenu = (locale = 'en') => {
         { label: t('back'), accelerator: 'Ctrl+[', click: () => dispatchAction('go-back') },
         { label: t('forward'), accelerator: 'Ctrl+]', click: () => dispatchAction('go-forward') },
         { type: 'separator' },
-        { label: t('previousSession'), accelerator: 'Alt+Up', click: () => dispatchAction('previous-session') },
-        { label: t('nextSession'), accelerator: 'Alt+Down', click: () => dispatchAction('next-session') },
+        // No accelerator: Alt+Up/Down duplicated the customizable Ctrl+Alt+Left/Right
+        // session shortcuts and leaked out of views that use Alt+arrows themselves.
+        { label: t('previousSession'), click: () => dispatchAction('previous-session') },
+        { label: t('nextSession'), click: () => dispatchAction('next-session') },
         { type: 'separator' },
         { label: t('previousProject'), accelerator: 'Ctrl+Alt+Up', click: () => dispatchAction('previous-project') },
         { label: t('nextProject'), accelerator: 'Ctrl+Alt+Down', click: () => dispatchAction('next-project') },
@@ -4964,7 +5824,7 @@ const buildAutoHiddenMenu = (locale = 'en') => {
         { label: t('resetZoom'), accelerator: 'Ctrl+0', click: () => dispatchAction('zoom-reset') },
         roleItem('togglefullscreen', 'toggleFullScreen'),
         { type: 'separator' },
-        roleItem('close', 'close'),
+        { label: t('close'), accelerator: 'CmdOrCtrl+W', click: closeTabOrWindow },
       ],
     },
     {
@@ -4988,6 +5848,11 @@ const { labels: contextMenuLabels, apply: setContextMenuLocale } = createContext
 
 contextMenu({
   labels: contextMenuLabels,
+  prepend: createCopyLinkMenuHook({
+    clipboard,
+    ClipboardItem,
+    onError: () => log.warn('[context-menu] Failed to copy link to clipboard'),
+  }),
   showInspectElement: isDev,
   showSaveImageAs: true,
   showCopyImage: true,
@@ -5008,12 +5873,88 @@ const loadUrlInsideWebContents = (contents, rawUrl) => {
   }
 };
 
+/**
+ * Sign-in popups opened by pages of the user's browser panel. They are app
+ * windows to Electron, so the checks that decide whether the app still has a
+ * window of its own leave them out, and they close with the window that holds
+ * the panel.
+ */
+const browserPanelPopups = new WeakSet();
+const isBrowserPanelPopup = (browserWindow) => browserPanelPopups.has(browserWindow);
+
+const BROWSER_PANEL_POPUP_WEB_PREFERENCES = {
+  sandbox: true,
+  contextIsolation: true,
+  nodeIntegration: false,
+};
+
+const openBrowserPanelTab = (contents, url, background) => {
+  const host = contents.hostWebContents;
+  if (!host || host.isDestroyed()) {
+    loadUrlInsideWebContents(contents, url);
+    return;
+  }
+  host.send('openchamber:emit', {
+    event: 'openchamber:browser-panel-open-tab',
+    detail: { webContentsId: contents.id, url, background },
+  });
+};
+
+const trackBrowserPanelPopup = (contents, popup) => {
+  browserPanelPopups.add(popup);
+  // The popup may open nothing of its own: a page asking for one more window
+  // gets it in place.
+  popup.webContents.setWindowOpenHandler(({ url }) => {
+    loadUrlInsideWebContents(popup.webContents, url);
+    return { action: 'deny' };
+  });
+  const hostWindow = contents.hostWebContents ? BrowserWindow.fromWebContents(contents.hostWebContents) : null;
+  if (!hostWindow) return;
+  const closePopup = () => {
+    if (!popup.isDestroyed()) popup.close();
+  };
+  hostWindow.once('closed', closePopup);
+  popup.once('closed', () => {
+    if (!hostWindow.isDestroyed()) hostWindow.removeListener('closed', closePopup);
+  });
+};
+
 app.on('web-contents-created', (_event, contents) => {
+  if (contents.getType() === 'window') {
+    guardAttachedWebviews(contents);
+    return;
+  }
   if (contents.getType() !== 'webview') return;
 
-  contents.setWindowOpenHandler(({ url }) => {
-    loadUrlInsideWebContents(contents, url);
+  // Pages of a space keep everything in their own view: a window or tab of
+  // theirs would leave the space's session for the user's.
+  const isUserPanelPage = () => contents.session === session.fromPartition(BROWSER_PANEL_PARTITION);
+
+  contents.setWindowOpenHandler(({ url, disposition, postBody }) => {
+    const target = isUserPanelPage()
+      ? browserPanelWindowOpenTarget({ url, disposition, hasPostBody: Boolean(postBody) })
+      : 'in-place';
+    if (target === 'popup') {
+      const hostWindow = contents.hostWebContents ? BrowserWindow.fromWebContents(contents.hostWebContents) : null;
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          parent: hostWindow ?? undefined,
+          autoHideMenuBar: true,
+          webPreferences: BROWSER_PANEL_POPUP_WEB_PREFERENCES,
+        },
+      };
+    }
+    if (target === 'tab' || target === 'background-tab') {
+      openBrowserPanelTab(contents, url, target === 'background-tab');
+    } else if (target === 'in-place') {
+      loadUrlInsideWebContents(contents, url);
+    }
     return { action: 'deny' };
+  });
+
+  contents.on('did-create-window', (popup) => {
+    trackBrowserPanelPopup(contents, popup);
   });
 });
 
@@ -5062,11 +6003,13 @@ const isLocalSender = (webContents) => {
 const COMMANDS_SAFE_FOR_REMOTE = new Set([
   'desktop_hosts_get',
   'desktop_host_probe',
+  'desktop_switch_to_local',
   'desktop_new_window',
   'desktop_new_window_at_url',
   'desktop_new_window_for_host',
   'desktop_set_window_title',
   'desktop_set_window_theme',
+  'desktop_set_close_tab_target',
   'desktop_is_window_fullscreen',
   'desktop_start_window_drag',
   'desktop_minimize_current_window',
@@ -5077,6 +6020,8 @@ const COMMANDS_SAFE_FOR_REMOTE = new Set([
   'desktop_get_lan_address',
   'desktop_capture_page_rect',
   'desktop_tray_update',
+  // A remote page can only dismiss delivered notifications of a session id it names.
+  'desktop_clear_session_notifications',
 ]);
 
 ipcMain.handle('openchamber:invoke', async (event, command, args) => {
@@ -5088,6 +6033,12 @@ ipcMain.handle('openchamber:invoke', async (event, command, args) => {
   const browserWindow = BrowserWindow.fromWebContents(event.sender);
   const result = await handleInvoke(browserWindow, command, args);
   return !local && command === 'desktop_hosts_get' ? redactHostsConfigForRemote(result) : result;
+});
+
+// Sync, because preload must know before the page's scripts restore their
+// layout. The answer is about the asking page only, so any origin may ask.
+ipcMain.on('openchamber:take-safe-start', (event) => {
+  event.returnValue = takeSafeStart(event.sender);
 });
 
 ipcMain.handle('openchamber:dialog:open', async (event, options) => {
@@ -5166,7 +6117,9 @@ ipcMain.handle('openchamber:file:grant-existing', async (event, filePath) => {
 
 // Icon assets: a calm outline (idle), a statically filled cube (a finished
 // session left unread), and an eased sequence the busy state breathes through.
-const TRAY_BREATH_FRAME_COUNT = 16;
+// Six frames of the original sixteen keep the breath at about two seconds
+// while the icon changes five times a second instead of thirteen.
+const TRAY_BREATH_FRAMES = [0, 3, 6, 9, 12, 15];
 // The window the user is "on" for tray routing: the focused one, else the last
 // focused that is still alive.
 const resolveTraySurface = () => {
@@ -5202,7 +6155,7 @@ const trayIconAssets = () => {
   return {
     idleIconPath: path.join(dir, 'trayTemplate-idle.png'),
     unseenIconPath: path.join(dir, 'trayTemplate-unseen.png'),
-    breathIconPaths: Array.from({ length: TRAY_BREATH_FRAME_COUNT }, (_, i) =>
+    breathIconPaths: TRAY_BREATH_FRAMES.map((i) =>
       path.join(dir, `trayTemplate-breath-${String(i).padStart(2, '0')}.png`)),
     // Per-session status icons shown in the menu rows (left, vertically centred
     // across the title + sublabel). 'blank' reserves the gutter for idle rows.
@@ -5459,6 +6412,15 @@ app.on('activate', async () => {
   targetWindow.focus();
 });
 
+// Off the startup path: the flush writes the cache synchronously.
+const COMPILE_CACHE_SETTLE_DELAY_MS = 5_000;
+const scheduleCompileCacheSettle = () => {
+  const timer = setTimeout(() => {
+    void settleMainProcessCompileCache({ userDataDir: app.getPath('userData') });
+  }, COMPILE_CACHE_SETTLE_DELAY_MS);
+  timer.unref?.();
+};
+
 app.whenReady().then(async () => {
   if (wasEarlyWindowClosed()) return;
   const loginItemSettings = readLoginItemSettings();
@@ -5484,16 +6446,19 @@ app.whenReady().then(async () => {
 
   if (process.platform === 'darwin') {
     Menu.setApplicationMenu(buildMacMenu());
+    void applyDevDockIdentity({ app, electronDir: __dirname, log });
   } else {
     Menu.setApplicationMenu(buildAutoHiddenMenu());
   }
   setupTray();
+  applyDesktopMiniChatGlobalShortcut();
+  applyDesktopQuakeModeShortcut();
 
   if ((process.platform === 'darwin' || process.platform === 'win32') && app.isPackaged) {
     const openAtLogin = loginItemSettings?.openAtLogin === true;
     app.setLoginItemSettings({
       openAtLogin,
-      ...(process.platform === 'darwin' ? { openAsHidden: openAtLogin, args: openAtLogin ? [BACKGROUND_START_ARG] : [] } : {}),
+      ...(process.platform === 'darwin' ? { args: openAtLogin ? [BACKGROUND_START_ARG] : [] } : {}),
       ...(process.platform === 'win32' ? { ...getLoginItemOptions(), enabled: openAtLogin } : {}),
     });
   }
@@ -5511,6 +6476,9 @@ app.whenReady().then(async () => {
     } catch (error) {
       log.warn('[electron] failed to reconcile Linux autostart entry', error);
     }
+    void reconcileAppImageDesktopEntry()
+      .then((result) => log.info('[electron] AppImage launcher entry', result))
+      .catch((error) => log.warn('[electron] failed to reconcile AppImage launcher entry', error));
   }
 
   if (isBackgroundStart) {
@@ -5526,6 +6494,7 @@ app.whenReady().then(async () => {
     state.initScript = buildInitScript(localOrigin, state.bootOutcome, apiBaseUrl, clientToken, state.requestHeaders);
     log.info('[electron] started in background without window');
     replayDeferredAppEvents();
+    scheduleCompileCacheSettle();
     return;
   }
 
@@ -5533,9 +6502,12 @@ app.whenReady().then(async () => {
   if (initial.length > 0) handleDeepLinks(initial);
 
   await mainWindowShown;
-  const { initialUrl, localOrigin, bootOutcome, apiBaseUrl, clientToken, requestHeaders } = await resolveInitialUrl();
+  const { initialUrl, localOrigin, bootOutcome, apiBaseUrl, clientToken, requestHeaders } = await resolveInitialUrl({
+    onPlainLocalBoot: startEarlyMainNavigation,
+  });
   await activateMainWindow(initialUrl, localOrigin, bootOutcome, { apiBaseUrl, clientToken, requestHeaders });
   replayDeferredAppEvents();
+  scheduleCompileCacheSettle();
 
   // Notify renderer on OS wake-from-sleep so the SSE event pipeline can
   // reconnect immediately instead of waiting for the heartbeat watchdog.

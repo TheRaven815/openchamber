@@ -1,5 +1,5 @@
 import { MESSAGE_IMAGE_EXPORT_EXCLUDE_ATTRIBUTE } from '../message/imageExport';
-import { getMarkdownCodeText } from './codeText';
+import { cloneSelectionAncestor, cloneSelectionContent } from './selectionRange';
 
 // Turns a selection inside rendered chat markdown back into Markdown, so Cmd+C
 // on part of a response pastes the formatting the message copy button gives.
@@ -15,7 +15,7 @@ import { getMarkdownCodeText } from './codeText';
 // label, tables as tab-separated rows. Formulas stay as their TeX, the only
 // readable text form KaTeX keeps.
 
-export type RenderedCopyFormat = 'markdown' | 'plain';
+type RenderedCopyFormat = 'markdown' | 'plain';
 
 const ELEMENT_NODE = 1;
 const TEXT_NODE = 3;
@@ -25,14 +25,10 @@ const MARKDOWN_ROOT_SELECTOR = '[data-markdown-content]';
 // Renderer chrome that never belongs to the copied content. KaTeX draws each
 // formula twice; the formula is read from its TeX annotation instead.
 const SKIP_SELECTOR = [
-  'button',
-  '[data-md-action]',
-  '[data-md-menu]',
-  '[data-md-code-actions]',
-  '[data-markdown="mermaid-toolbar"]',
-  '[data-md-disclosure-icon]',
-  '[data-openchamber-markdown-image-label-icon]',
-  '[data-md-table-measure]',
+  'button:not([data-streamdown="link"]):not([data-oc-media-source])',
+  '[data-streamdown="code-block-header"]',
+  '[data-streamdown="code-block-actions"]',
+  '[data-streamdown="table-actions"]',
   `[${MESSAGE_IMAGE_EXPORT_EXCLUDE_ATTRIBUTE}]`,
   '.katex-mathml',
   'colgroup',
@@ -51,7 +47,8 @@ const isElement = (node: Node): node is Element => node.nodeType === ELEMENT_NOD
 
 const isBlockElement = (element: Element): boolean => {
   if (element.matches('.katex-display')) return true;
-  if (element.matches('[data-markdown="mermaid-block"], [data-component="markdown-code"], [data-markdown="table-wrapper"]')) return true;
+  if (element.matches('[data-streamdown="mermaid-block"], [data-streamdown="code-block"], [data-streamdown="table-wrapper"]')) return true;
+  if (element.hasAttribute('data-oc-media-source')) return false;
   return BLOCK_TAGS.has(element.tagName);
 };
 
@@ -91,15 +88,31 @@ const texOf = (katex: Element): string | null => {
 
 const codeLanguage = (element: Element): string => {
   const pre = element.tagName === 'PRE' ? element : element.querySelector('pre');
-  const explicit = pre?.getAttribute('data-md-lang');
+  const explicit = element.getAttribute('data-language')
+    ?? element.querySelector('[data-streamdown="code-block-body"]')?.getAttribute('data-language')
+    ?? pre?.parentElement?.getAttribute('data-language');
   if (explicit && explicit !== 'text') return explicit;
   const fromClass = pre?.querySelector('code')?.className.match(/language-([\w+#.-]+)/)?.[1];
   return fromClass && fromClass !== 'text' ? fromClass : '';
 };
 
 const codeBlockText = (element: Element): string => {
-  const code = element.querySelector<HTMLElement>('code');
-  return code ? getMarkdownCodeText(code) : element.textContent ?? '';
+  const body = element.matches('[data-streamdown="code-block"]')
+    ? Array.from(element.querySelectorAll('[data-streamdown="code-block-body"]'))
+      .find((body) => body.closest('[data-streamdown="code-block"]') === element) : null;
+  const source = element.getAttribute('data-oc-code-source')
+    ?? body?.getAttribute('data-oc-code-source')
+    ?? (element.matches('[data-streamdown="code-block"]') ? element.parentElement?.getAttribute('data-oc-code-source') : null);
+  if (source != null) return source;
+  const code = element.querySelector('code') ?? element;
+  if (!element.matches('[data-streamdown="code-block"]')
+    && !element.closest('[data-streamdown="code-block-body"]')) return code.textContent ?? '';
+  // Native rows carry their line breaks in layout. An empty row contains a
+  // newline placeholder, which contributes one empty line in the joined source.
+  return Array.from(code.childNodes).map((row) => {
+    const text = row.textContent ?? '';
+    return text === '\n' ? '' : text;
+  }).join('\n');
 };
 
 const escapeTableCell = (text: string): string => text.replace(/\|/g, '\\|').replace(/\n+/g, ' ').trim();
@@ -119,7 +132,13 @@ const serializeTable = (table: Element, format: RenderedCopyFormat): string => {
   const width = Math.max(...rows.map((cells) => cells.length));
   const line = (cells: string[]) => `| ${Array.from({ length: width }, (_, index) => cells[index] ?? '').join(' | ')} |`;
   const [head, ...body] = rows;
-  return [line(head), `| ${Array.from({ length: width }, () => '---').join(' | ')} |`, ...body.map(line)].join('\n');
+  const cells = table.querySelector('tr')?.children;
+  const alignment = Array.from({ length: width }, (_, index) => {
+    const cell = cells?.[index];
+    const align = cell?.getAttribute('align') ?? cell?.getAttribute('style')?.match(/text-align:\s*(left|right|center)/)?.[1];
+    return align === 'center' ? ':---:' : align === 'right' ? '---:' : align === 'left' ? ':---' : '---';
+  });
+  return [line(head), `| ${alignment.join(' | ')} |`, ...body.map(line)].join('\n');
 };
 
 const prefixLines = (text: string, first: string, rest: string): string =>
@@ -141,7 +160,8 @@ const serializeList = (list: Element, format: RenderedCopyFormat): string => {
     if (child.tagName !== 'LI') continue;
     const marker = ordered ? `${number}. ` : bulletMarker(format);
     number += 1;
-    const checkbox = child.querySelector(':scope > input[type="checkbox"], :scope > p > input[type="checkbox"]');
+    const checkbox = Array.from(child.children).flatMap((element) => element.tagName === 'P' ? Array.from(element.children) : [element])
+      .find((element) => element.matches('input[type="checkbox"]'));
     const task = checkbox ? taskMarker(checkbox.hasAttribute('checked'), format) : '';
     const body = serializeChildren(child, '\n', format);
     items.push(prefixLines(`${task}${body}`, marker, ' '.repeat(marker.length)));
@@ -151,8 +171,8 @@ const serializeList = (list: Element, format: RenderedCopyFormat): string => {
 
 const serializeBlockElement = (element: Element, format: RenderedCopyFormat): string => {
   const plain = format === 'plain';
-  if (element.matches('[data-markdown="mermaid-block"]')) {
-    const source = element.getAttribute('data-md-source') ?? '';
+  if (element.matches('[data-streamdown="mermaid-block"]')) {
+    const source = element.getAttribute('data-oc-mermaid-source') ?? '';
     return plain ? source : fence(source, 'mermaid');
   }
   if (element.matches('.katex-display')) {
@@ -160,11 +180,11 @@ const serializeBlockElement = (element: Element, format: RenderedCopyFormat): st
     if (!tex) return element.textContent ?? '';
     return plain ? tex : `$$\n${tex}\n$$`;
   }
-  if (element.matches('[data-component="markdown-code"]') || element.tagName === 'PRE') {
+  if (element.matches('[data-streamdown="code-block"]') || element.tagName === 'PRE') {
     const code = codeBlockText(element);
     return plain ? code.replace(/\n$/, '') : fence(code, codeLanguage(element));
   }
-  if (element.matches('[data-markdown="table-wrapper"]') || element.tagName === 'TABLE') {
+  if (element.matches('[data-streamdown="table-wrapper"]') || element.tagName === 'TABLE') {
     const table = element.tagName === 'TABLE' ? element : element.querySelector('table');
     return table ? serializeTable(table, format) : '';
   }
@@ -185,7 +205,7 @@ const serializeBlockElement = (element: Element, format: RenderedCopyFormat): st
       return plain ? text : text.split('\n').map((line) => (line ? `> ${line}` : '>')).join('\n');
     }
     case 'DETAILS': {
-      const summary = element.querySelector(':scope > summary');
+      const summary = Array.from(element.children).find((child) => child.tagName === 'SUMMARY');
       const rest = Array.from(element.childNodes).filter((node) => node !== summary);
       const summaryText = summary ? serializeInlineChildren(summary, format).trim() : '';
       const body = serializeNodes(rest, '\n\n', format);
@@ -208,6 +228,16 @@ const serializeInlineElement = (element: Element, format: RenderedCopyFormat): s
     return plain ? tex : `$${tex}$`;
   }
   const content = () => serializeInlineChildren(element, format);
+  // An assistant image, as its label or drawn in its place: the source the
+  // message wrote, never the authenticated URL the picture loaded from.
+  const imageSource = element.getAttribute('data-oc-media-source');
+  if (imageSource) {
+    const media = element.matches('img, video') ? element : element.querySelector('img, video');
+    const label = element.matches('[data-oc-media-label]') ? element : element.querySelector('[data-oc-media-label]');
+    const name = media?.getAttribute('alt') ?? media?.getAttribute('title') ?? label?.textContent?.trim() ?? element.textContent?.trim() ?? '';
+    return plain ? name : `![${name}](${imageSource})`;
+  }
+  if (element.matches('[data-streamdown="strong"]')) return plain ? content() : wrapInline(content(), '**');
   switch (element.tagName) {
     case 'STRONG': case 'B':
       return plain ? content() : wrapInline(content(), '**');
@@ -232,6 +262,9 @@ const serializeInlineElement = (element: Element, format: RenderedCopyFormat): s
     case 'A': {
       const text = content();
       const href = element.getAttribute('href') ?? '';
+      const media = element.querySelector('[data-oc-media-source]');
+      if (media?.getAttribute('data-oc-media-source') === href && Array.from(element.childNodes).every((node) =>
+        node === media || (isElement(node) && node.contains(media)) || !node.textContent?.trim())) return text;
       // File references were plain paths in the source; keep them as text.
       if (plain || !href || element.getAttribute('data-openchamber-file-link') === 'true') return text;
       if (text.trim() === href) return href;
@@ -293,6 +326,59 @@ export const renderedMarkdownHtmlToPlainText = (html: string, doc: Document): st
   return serializeRenderedMarkdown(template.content, 'plain');
 };
 
+/** Make a detached, already sanitized copy self-contained for rich clipboard recipients. */
+export const normalizeMarkdownCopyContent = (root: HTMLElement): void => {
+  if (root.isConnected) throw new Error('Markdown copy normalization requires a detached root');
+  const doc = root.ownerDocument;
+  // Read semantic source before removing application metadata or chrome.
+  for (const diagram of Array.from(root.querySelectorAll('[data-streamdown="mermaid-block"]'))) {
+    const pre = doc.createElement('pre');
+    const code = doc.createElement('code');
+    code.className = 'language-mermaid';
+    code.textContent = diagram.getAttribute('data-oc-mermaid-source') ?? '';
+    pre.append(code);
+    diagram.replaceWith(pre);
+  }
+  for (const card of Array.from(root.querySelectorAll('[data-streamdown="code-block"]'))) {
+    if (!root.contains(card)) continue;
+    const pre = doc.createElement('pre');
+    const code = doc.createElement('code');
+    const language = codeLanguage(card);
+    if (language) code.className = `language-${language}`;
+    code.textContent = codeBlockText(card);
+    pre.append(code);
+    card.replaceWith(pre);
+  }
+  root.querySelectorAll(`[${MESSAGE_IMAGE_EXPORT_EXCLUDE_ATTRIBUTE}], [data-export-ignore], [data-streamdown="code-block-header"], [data-streamdown="code-block-actions"], [data-streamdown="table-actions"]`)
+    .forEach((element) => element.remove());
+  for (const element of Array.from(root.querySelectorAll('[data-oc-media-source], img, video, picture, source'))) {
+    if (!root.contains(element)) continue;
+    const media = element.matches('img, video') ? element : element.querySelector('img, video');
+    const rawLabel = media?.getAttribute('alt') ?? media?.getAttribute('title') ?? element.textContent ?? '';
+    const label = /[?&]oc_(?:url|client)_token=/i.test(rawLabel) ? '' : rawLabel;
+    // Copy preserves labels without introducing image or video requests in the
+    // receiving document. Loaded URLs and source-set metadata stay out of HTML.
+    element.replaceWith(doc.createTextNode(label));
+  }
+  // Media controls and link preview actions may wrap the now-safe content.
+  root.querySelectorAll('button').forEach((button) => {
+    if (button.matches('[data-streamdown="link"]') || button.querySelector('img')) button.replaceWith(...Array.from(button.childNodes));
+    else button.remove();
+  });
+  root.querySelectorAll('span[data-streamdown="strong"]').forEach((span) => {
+    const strong = doc.createElement('strong');
+    strong.append(...Array.from(span.childNodes));
+    span.replaceWith(strong);
+  });
+  for (const element of [root, ...Array.from(root.querySelectorAll('*'))]) {
+    for (const attribute of Array.from(element.attributes)) {
+      if (attribute.name.startsWith('data-oc-') || attribute.name.startsWith('data-openchamber-')
+        || attribute.name.startsWith('data-streamdown') || attribute.name.startsWith('data-message-image-export-')
+        || attribute.name === 'data-markdown-content') element.removeAttribute(attribute.name);
+    }
+  }
+};
+
 const getMarkdownRoot = (node: Node): Element | null => {
   const element = isElement(node) ? node : node.parentElement;
   return element?.closest(MARKDOWN_ROOT_SELECTOR) ?? null;
@@ -316,15 +402,22 @@ export const getMarkdownSelectionText = (range: Range, format: RenderedCopyForma
   const root = getMarkdownRoot(range.startContainer);
   if (!root || root !== getMarkdownRoot(range.endContainer)) return null;
 
-  let content: Node = range.cloneContents();
+  const fragment = cloneSelectionContent(range);
+  let content: Node = fragment;
   let ancestor: Node | null = range.commonAncestorContainer;
   if (ancestor.nodeType === TEXT_NODE) ancestor = ancestor.parentNode;
+  // A code-only range needs its row and language shells even inside a list
+  // item or table cell. Stop at the code card so unselected enclosing markers
+  // cannot become part of the copied Markdown.
+  const codeBlock = ancestor && isElement(ancestor)
+    ? ancestor.closest('[data-streamdown="code-block"]') ?? ancestor.closest('pre') : null;
   const textBlock = ancestor && isElement(ancestor) ? ancestor.closest(TEXT_BLOCK_SELECTOR) : null;
-  if (textBlock && root.contains(textBlock) && textBlock !== root) ancestor = null;
+  if (!codeBlock && textBlock && root.contains(textBlock) && textBlock !== root) ancestor = null;
   while (ancestor && ancestor !== root && isElement(ancestor)) {
-    const shell = ancestor.cloneNode(false);
+    const shell = cloneSelectionAncestor(range, ancestor);
     shell.appendChild(content);
     content = shell;
+    if (ancestor === codeBlock) break;
     ancestor = ancestor.parentNode;
   }
 

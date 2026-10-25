@@ -1,19 +1,18 @@
+import { isPlainObject, isString } from '../shared/guards.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { constants as fsConstants } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { isProviderId } from '../source-control/provider-id.js';
+import { descriptorAllowsLoopbackHttp, isLoopbackHost } from './loopback-http.js';
 
 const REFERENCE_PREFIX = 'ocgit:v1';
 const VERSIONED_REFERENCE_PREFIX = 'ocgit:v2';
 const DEFAULT_PORTS = Object.freeze({ http: 80, https: 443, ssh: 22 });
 const MAX_SSH_PRIVATE_KEY_BYTES = 128 * 1024;
 const SSH_PRIVATE_KEY_MARKER = /-----BEGIN (?:OPENSSH |RSA |DSA |EC |ENCRYPTED )?PRIVATE KEY-----/;
-const isString = (value) => Object.prototype.toString.call(value) === '[object String]';
-const isPlainObject = (value) => value === Object(value)
-  && !Array.isArray(value)
-  && Object.getPrototypeOf(value) === Object.prototype;
 
 const requiredString = (value, name) => {
   if (!isString(value) || !value || value.trim() !== value || /[\0\r\n]/.test(value)) {
@@ -37,7 +36,7 @@ export function createHttpsCredentialReference({
   credentialRevision,
   providerUserId,
 }) {
-  if (!['github', 'gitlab'].includes(provider)) throw new Error('Invalid Git credential provider');
+  if (!isProviderId(provider)) throw new Error('Invalid Git credential provider');
   if (!Number.isSafeInteger(credentialRevision) || credentialRevision < 1) throw new Error('Invalid Git credential revision');
   return `${VERSIONED_REFERENCE_PREFIX}:https:${provider}:${encodePart(instance)}:${encodePart(credentialId)}:${credentialRevision}:${encodePart(providerUserId)}`;
 }
@@ -49,7 +48,7 @@ export function createSshCredentialReference(keyId) {
 export function parseGitCredentialReference(reference) {
   const parts = requiredString(reference, 'reference').split(':');
   if (parts[0] !== 'ocgit' || !['v1', 'v2'].includes(parts[1])) throw new Error('Invalid Git credential reference');
-  if (parts.length === 8 && parts[1] === 'v2' && parts[2] === 'https' && ['github', 'gitlab'].includes(parts[3])) {
+  if (parts.length === 8 && parts[1] === 'v2' && parts[2] === 'https' && isProviderId(parts[3])) {
     const credentialRevision = Number(parts[6]);
     if (!/^[1-9]\d*$/.test(parts[6]) || !Number.isSafeInteger(credentialRevision)) {
       throw new Error('Invalid Git credential reference');
@@ -360,26 +359,52 @@ export async function inspectManagedSshCredential(record, { snapshotRoot, fsImpl
   return { status: 'ready' };
 }
 
-const assertHttpsEndpoint = (reference, endpoint) => {
-  if (endpoint.protocol !== 'https') throw new Error('Managed HTTPS credentials require HTTPS');
-  if (reference.provider === 'github' && reference.instance !== 'github.com') {
+/**
+ * Whether a normalized Git endpoint is a provider instance's own origin: the
+ * same host and port over HTTPS, or over plain HTTP when the instance is a
+ * loopback origin of a provider that allows loopback HTTP
+ * (`loopback-http.js`). No other host is ever reached in the clear.
+ */
+export const endpointIsInstanceOrigin = (descriptor, origin, endpoint) => {
+  const https = origin.protocol === 'https:' && endpoint.protocol === 'https';
+  const loopbackHttp = origin.protocol === 'http:' && endpoint.protocol === 'http'
+    && isLoopbackHost(origin.hostname) && descriptorAllowsLoopbackHttp(descriptor);
+  return (https || loopbackHttp) && origin.hostname.toLowerCase() === endpoint.host
+    && Number(origin.port || (https ? 443 : 80)) === endpoint.port;
+};
+
+/**
+ * A managed HTTPS credential reaches only its own instance: the descriptor's
+ * origin, and only the default instances when the provider grants transport
+ * nowhere else (GitHub Enterprise tokens never clone or push).
+ */
+const assertHttpsEndpoint = (descriptor, reference, endpoint) => {
+  if (!['https', 'http'].includes(endpoint.protocol)) throw new Error('Managed HTTPS credentials require HTTPS');
+  if (descriptor.transport.managedHttpsInstances === 'default-only'
+    && !descriptor.instance.defaultInstances.includes(reference.instance)) {
     throw new Error('Invalid managed provider instance');
   }
   let instance;
   try {
-    instance = new URL(reference.provider === 'github' ? 'https://github.com' : reference.instance);
+    instance = descriptor.instance.origin(reference.instance);
   } catch {
     throw new Error('Invalid managed provider instance');
   }
-  const instancePort = instance.port ? Number(instance.port) : 443;
-  if (instance.protocol !== 'https:' || instance.hostname.toLowerCase() !== endpoint.host || instancePort !== endpoint.port) {
+  if (!endpointIsInstanceOrigin(descriptor, instance, endpoint)) {
     throw new Error('Git endpoint is outside the managed credential policy');
   }
 };
 
+/**
+ * `readTransportCredential({ provider, instance, credentialId, credentialRevision })`
+ * answers the provider's neutral transport credential (`secret`, `user`,
+ * identity and status) or null; `describeProvider(id)` answers the provider's
+ * descriptor or null. An id no provider answers for fails closed before any
+ * credential lookup or spawn.
+ */
 export function createGitCredentialResolver({
-  readGitHubAccount,
-  readGitLabAccount,
+  readTransportCredential,
+  describeProvider,
   lookupManagedSshKey,
   realpath = fs.realpath,
   executeFile = runFile,
@@ -417,15 +442,19 @@ export function createGitCredentialResolver({
         return Object.freeze({ mode: 'managed', transport: 'ssh', key, allowedEndpoint: endpoint });
       }
 
-      assertHttpsEndpoint(reference, endpoint);
-      const readAccount = reference.provider === 'github' ? readGitHubAccount : readGitLabAccount;
-      if (!(readAccount instanceof Function)) throw new Error('Managed HTTPS credentials are unavailable');
+      const descriptor = describeProvider instanceof Function ? describeProvider(reference.provider) : null;
+      if (!descriptor) throw new Error('Managed provider account is unavailable');
+      assertHttpsEndpoint(descriptor, reference, endpoint);
+      if (!(readTransportCredential instanceof Function)) throw new Error('Managed HTTPS credentials are unavailable');
       const resolvedCredentialId = reference.credentialId;
       const credentialRevision = reference.credentialRevision;
-      const account = reference.provider === 'github'
-        ? await readAccount(resolvedCredentialId, credentialRevision)
-        : await readAccount(reference.instance, resolvedCredentialId, credentialRevision);
-      const password = reference.provider === 'github' ? account?.accessToken : account?.token;
+      const account = await readTransportCredential({
+        provider: reference.provider,
+        instance: reference.instance,
+        credentialId: resolvedCredentialId,
+        credentialRevision,
+      });
+      const password = account?.secret;
       const storedId = account?.credentialId;
       const storedRevision = account?.credentialRevision;
       const providerUserId = account?.providerUserId;
@@ -434,15 +463,20 @@ export function createGitCredentialResolver({
         || (credentialRevision !== undefined && storedRevision !== credentialRevision)
         || (reference.version === 2 && reference.providerUserId !== undefined
           && reference.providerUserId !== providerUserId)
-        || !isString(providerUserId) || !providerUserId
+        || !isString(providerUserId) || !providerUserId.startsWith(`${reference.instance}#`)
         || !isString(password) || !password || /[\r\n\0]/.test(password)) {
         throw new Error('Managed provider account is unavailable');
       }
       const login = account?.user?.login ?? account?.user?.username;
+      const usernamePolicy = descriptor.transport.httpsUsername;
+      const username = usernamePolicy.kind === 'login' ? login : usernamePolicy.value;
+      if (!isString(username) || !username || /[\r\n\0:]/.test(username)) {
+        throw new Error('Managed provider account is unavailable');
+      }
       return Object.freeze({
         mode: 'managed',
         transport: 'https',
-        username: reference.provider === 'github' ? 'x-access-token' : 'oauth2',
+        username,
         password,
         actor: Object.freeze({
           provider: reference.provider,

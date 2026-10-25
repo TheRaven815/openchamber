@@ -13,12 +13,14 @@
  */
 
 import React from 'react';
+import { AnimatePresence } from 'motion/react';
 
 import { CommandAutocomplete, type CommandAutocompleteHandle, type CommandInfo } from '../../CommandAutocomplete';
 import { FileMentionAutocomplete, type FileMentionHandle } from '../../FileMentionAutocomplete';
 import { SkillAutocomplete, type SkillAutocompleteHandle } from '../../SkillAutocomplete';
 import { SnippetAutocomplete, type SnippetAutocompleteHandle } from '../../SnippetAutocomplete';
 import type { AutocompleteKind } from '../language/triggers';
+import { GlassPopupMotion } from './GlassPopupMotion';
 
 export interface AutocompleteOverlayPosition {
     top: number;
@@ -55,7 +57,7 @@ function caretStyle(
     };
 }
 
-export interface ComposerAutocompletePopupsProps {
+interface ComposerAutocompletePopupsProps {
     /** Which picker is open, if any. */
     open: AutocompleteKind | null;
     query: string;
@@ -73,9 +75,24 @@ export interface ComposerAutocompletePopupsProps {
     onClose: () => void;
 }
 
-export function ComposerAutocompletePopups(props: ComposerAutocompletePopupsProps) {
+function ComposerAutocompletePopupsView(props: ComposerAutocompletePopupsProps) {
+    const { open } = props;
+    // The wrapper is a zero-height box over the anchor's top edge, so the
+    // picker's `bottom-full` and caret offsets resolve exactly as they would
+    // against the anchor itself.
+    return (
+        <AnimatePresence>
+            {open ? (
+                <GlassPopupMotion key={open} className="absolute inset-x-0 top-0 z-[100] h-0 origin-top-left rtl:origin-top-right">
+                    <AutocompletePopup {...props} open={open} />
+                </GlassPopupMotion>
+            ) : null}
+        </AnimatePresence>
+    );
+}
+
+function AutocompletePopup(props: ComposerAutocompletePopupsProps & { open: AutocompleteKind }) {
     const { open, query, overlayPosition, onClose } = props;
-    if (!open) return null;
 
     const style = caretStyle(open, overlayPosition);
 
@@ -123,3 +140,6 @@ export function ComposerAutocompletePopups(props: ComposerAutocompletePopupsProp
             );
     }
 }
+
+/** Memoized: the composer re-renders on every keystroke, and nothing here depends on the draft text. */
+export const ComposerAutocompletePopups = React.memo(ComposerAutocompletePopupsView);

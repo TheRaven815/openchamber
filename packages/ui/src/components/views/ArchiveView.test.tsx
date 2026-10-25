@@ -109,7 +109,7 @@ test('the mobile layout names each row\'s project, offers Restore without Delete
   });
   let left = 0;
   await act(async () => root.render(
-    <I18nProvider><ArchiveSessionsView open layout="mobile" onLeave={() => { left += 1; }} /></I18nProvider>,
+    <I18nProvider><ArchiveSessionsView layout="mobile" onLeave={() => { left += 1; }} /></I18nProvider>,
   ));
   expect(document.querySelector('.group\\/dir')).toBeNull();
   expect(document.querySelector('[aria-label="Restore Phone chat"]')).not.toBeNull();
@@ -119,6 +119,59 @@ test('the mobile layout names each row\'s project, offers Restore without Delete
   expect(row.textContent).toContain('workspace');
   await act(async () => { row.click(); });
   expect(left).toBe(1);
+});
+
+test('the page opens with the query the sidebar handed over, and a plain open starts fresh', async () => {
+  useGlobalSessionsStore.setState({
+    archivedSessions: [session('ses_a', 'Release notes'), session('ses_b', 'Login fix')],
+    activeSessions: [],
+    status: 'ready',
+  });
+  const titles = () => [...document.querySelectorAll('[role="button"] > span:first-child')].map((row) => row.textContent);
+  useUIStore.getState().setArchivePageOpen(true, 'release');
+  await act(async () => root.render(<I18nProvider><ArchiveView /></I18nProvider>));
+  expect(browser.document.querySelector('input')?.value).toBe('release');
+  expect(titles()).toEqual(['Release notes']);
+
+  // A second handover while the page is already open replaces the query.
+  await act(async () => { useUIStore.getState().setArchivePageOpen(true, 'login'); });
+  expect(browser.document.querySelector('input')?.value).toBe('login');
+  expect(titles()).toEqual(['Login fix']);
+
+  await act(async () => { useUIStore.getState().setArchivePageOpen(false); });
+  expect(browser.document.querySelector('input')).toBeNull();
+  await act(async () => { useUIStore.getState().setArchivePageOpen(true); });
+  expect(browser.document.querySelector('input')?.value).toBe('');
+  expect(titles()).toHaveLength(2);
+});
+
+test('a subsession archived while its parent stays active is listed under the parent\'s title', async () => {
+  const boss = session('ses_boss', 'Boss', 0);
+  const archivedParent = session('ses_old', 'Old run', 5);
+  const sub = (id: string, title: string, parentID: string, archived: number): Session => ({ ...session(id, title, archived), parentID });
+  useGlobalSessionsStore.getState().applySnapshot(
+    [boss],
+    [
+      session('ses_plain', 'Plain chat', 3),
+      sub('ses_fix', 'Fix capture', 'ses_boss', 4),
+      sub('ses_review', 'Review fix', 'ses_boss', 1),
+      archivedParent,
+      sub('ses_old_child', 'Old child', 'ses_old', 5),
+    ],
+    'ready',
+  );
+  await act(async () => root.render(<I18nProvider><ArchiveView /></I18nProvider>));
+  // The search sits in a column of the same width, so match the list itself.
+  const list = document.querySelector('.max-w-3xl.space-y-0\\.5');
+  if (!list) throw new Error('Archive list missing');
+  const lines = [...list.children].map((element) => (element.tagName === 'P'
+    ? `# ${element.textContent}`
+    : element.querySelector('span')?.textContent));
+  // Both subsessions of the active parent sit together under its title, at the
+  // place of the newer one; a subsession of an archived parent stays hidden.
+  expect(lines).toEqual(['Old run', '# Boss', 'Fix capture', 'Review fix', 'Plain chat']);
+  expect(document.querySelector('[aria-label="Restore Fix capture"]')).not.toBeNull();
+  expect(document.querySelector('[aria-label="Restore Old child"]')).toBeNull();
 });
 
 test('an empty archive is not reported before the session list has loaded, or after it failed to load', async () => {

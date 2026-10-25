@@ -4,29 +4,40 @@ import crypto from 'node:crypto';
 import { createRelayService } from './service.js';
 
 const makeService = (options = {}) => {
-  // In-memory settings store with a pre-seeded relay identity so the service
-  // never regenerates a signing key during the test.
+  // In-memory key store with a pre-seeded signing key so the service never
+  // regenerates the serverId during the test.
   const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
-  let settings = {
-    relaySigningKey: {
+  const keySlots = {
+    signing: {
       privateJwk: privateKey.export({ format: 'jwk' }),
       publicJwk: publicKey.export({ format: 'jwk' }),
     },
+  };
+  let keyGeneration = 0;
+  const relayKeyStore = {
+    getOrCreate: async (slot, generate) => (keySlots[slot] ??= await generate()),
+    reset: async () => {
+      delete keySlots.signing;
+      delete keySlots.encryption;
+      keyGeneration += 1;
+    },
+    generation: () => keyGeneration,
+  };
+  let settings = {
     privateRelay: { enabled: true, relayUrl: 'wss://relay.example.test/ws' },
     ...options.settings,
   };
   const hostLock = {
     tryClaim: vi.fn(() => true),
     forceClaim: vi.fn(() => true),
-    holdsClaim: vi.fn(() => true),
-    liveClaimantPid: vi.fn(() => null),
+    otherLiveClaimant: vi.fn(() => null),
     release: vi.fn(),
   };
   const service = createRelayService({
     crypto,
     readSettingsFromDiskMigrated: async () => settings,
     writeSettingsToDisk: async (next) => { settings = next; },
-    readSettingsStrict: async () => settings,
+    relayKeyStore,
     getLocalPort: () => 0,
     hasRelayDemand: options.hasRelayDemand ?? (async () => true),
     hostLock,
@@ -35,6 +46,21 @@ const makeService = (options = {}) => {
   });
   return { service, hostLock, getSettings: () => settings };
 };
+
+describe('relay service identity reset', () => {
+  it('gives this copy a new server id', async () => {
+    const { service } = makeService();
+    try {
+      const before = await service.getServerId();
+      await service.resetIdentity();
+      const after = await service.getServerId();
+      expect(after).not.toBe(before);
+      expect((await service.getStatus()).serverId).toBe(after);
+    } finally {
+      service.stop();
+    }
+  });
+});
 
 describe('relay service passive hosting', () => {
   it('never claims or starts the host passively when passive hosting is disabled', async () => {

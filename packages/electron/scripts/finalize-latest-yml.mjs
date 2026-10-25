@@ -49,8 +49,18 @@ const parse = (content) => {
   return { version: parsedVersion, releaseDate, files };
 };
 
+// electron-updater compares a manifest's minimumSystemVersion with
+// os.release(), the Darwin kernel version. Darwin 22 is macOS 13, the oldest
+// macOS Electron 44 runs on, so an older Mac keeps the version it has instead
+// of updating into an app macOS refuses to open.
+const MAC_MINIMUM_DARWIN_VERSION = '22.0.0';
+
 const serialize = (data) => {
-  const lines = [`version: ${data.version}`, 'files:'];
+  const lines = [`version: ${data.version}`];
+  if (data.minimumSystemVersion) {
+    lines.push(`minimumSystemVersion: ${data.minimumSystemVersion}`);
+  }
+  lines.push('files:');
   for (const file of data.files) {
     lines.push(`  - url: ${file.url}`);
     lines.push(`    sha512: ${file.sha512}`);
@@ -88,19 +98,20 @@ if (!macOnly) {
   output['latest-arm64.yml'] = serialize(winArm64);
 }
 
+// One manifest serves both Mac architectures. The updater falls back to x64
+// files when it lists no arm64 ones, so a manifest missing an architecture
+// moves Apple Silicon users onto the Intel build under Rosetta.
 const macX64 = await read('latest-yml-x86_64-apple-darwin', 'latest-mac.yml');
 const macArm64 = await read('latest-yml-aarch64-apple-darwin', 'latest-mac.yml');
-if (macOnly && (!macX64 || !macArm64)) {
+if (!macX64 || !macArm64) {
   throw new Error('Both x64 and arm64 macOS update manifests are required');
 }
-if (macX64 || macArm64) {
-  const base = macArm64 || macX64;
-  output['latest-mac.yml'] = serialize({
-    version: base.version,
-    files: [...(macArm64?.files || []), ...(macX64?.files || [])],
-    releaseDate: base.releaseDate,
-  });
-}
+output['latest-mac.yml'] = serialize({
+  version: macArm64.version,
+  minimumSystemVersion: MAC_MINIMUM_DARWIN_VERSION,
+  files: [...macArm64.files, ...macX64.files],
+  releaseDate: macArm64.releaseDate,
+});
 
 const tag = `v${version}`;
 const tmp = process.env.RUNNER_TEMP || '/tmp';

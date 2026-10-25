@@ -3,24 +3,24 @@ import { create } from 'zustand';
 import { runBackgroundNetworkTask } from '@/lib/background-network';
 import { persist } from 'zustand/middleware';
 import { z } from 'zod';
+import { sourceControlProviderIdSchema } from '@/lib/source-control/providers/descriptor';
 import type {
   ChangeRequest,
   ChangeRequestStatus,
   CI,
   CISummary,
-  GitHubPullRequestLiveSummary,
+  ChangeRequestLiveSummary,
   Project,
   RuntimeAPIs,
   SourceControlIdentity,
-  SourceControlProvider,
   SourceControlReadContext,
 } from '@/lib/api/types';
 import { mapWithConcurrency } from '@/lib/concurrency';
-import { hasSameSourceControlReadContext } from '@/lib/source-control/identity';
+import { getSourceControlBaseUrl, hasSameSourceControlReadContext } from '@/lib/source-control/identity';
+import { prVisualStateOf } from '@/lib/source-control/prVisualState';
 import { createDeferredSafeJSONStorage } from './utils/safeStorage';
 import { getRuntimeKey } from '@/lib/runtime-switch';
 import { trackedItemKey, type TrackedItemState, type TrackedThread } from '@/lib/trackedItems/model';
-import type { LinkedGitHubPullRequest } from '@/lib/linkedIssues';
 
 const PR_REVALIDATE_TTL_MS = 90_000;
 const PR_BOOTSTRAP_RETRY_DELAYS_MS = [2_000, 5_000] as const;
@@ -34,8 +34,8 @@ const PR_MAX_ENTRIES = 200;
 
 const GITHUB_IDENTITY: SourceControlIdentity = { provider: 'github', instance: 'github.com' };
 const statusKeySchema = z.union([
-  z.tuple([z.string(), z.enum(['github', 'gitlab']), z.string(), z.string(), z.string(), z.number(), z.string(), z.string(), z.string()]),
-  z.tuple([z.string(), z.enum(['github', 'gitlab']), z.string(), z.string(), z.string(), z.string()]),
+  z.tuple([z.string(), sourceControlProviderIdSchema, z.string(), z.string(), z.string(), z.number(), z.string(), z.string(), z.string()]),
+  z.tuple([z.string(), sourceControlProviderIdSchema, z.string(), z.string(), z.string(), z.string()]),
   z.tuple([z.string(), z.string(), z.string(), z.string()]),
 ]);
 
@@ -55,6 +55,8 @@ export type SourceControlStatus = ChangeRequestStatus & {
   canMerge?: boolean;
   defaultBranch?: string | null;
   resolvedRemoteName?: string | null;
+  localRevision?: ChangeRequestStatus['localRevision'];
+  stack?: ChangeRequestStatus['stack'];
   pr?: {
     number: number;
     title: string;
@@ -715,7 +717,7 @@ const persistedPrStatusEntrySchema = z.object({
   lastDiscoveryPollAt: z.number(),
   identity: z.object({
     runtimeKey: z.string(),
-    provider: z.enum(['github', 'gitlab']),
+    provider: sourceControlProviderIdSchema,
     instance: z.string(),
     accountId: z.string(),
     repositoryId: z.string(),
@@ -789,10 +791,10 @@ export const getBranchTrackedPull = (entry: PrStatusEntry | undefined): TrackedT
   const project = entry?.status?.project;
   const owner = project?.owner ?? entry?.status?.repo?.owner;
   const repo = project?.name ?? entry?.status?.repo?.repo;
-  if (!entry || !identity?.accountId || !pr || pr.state !== 'open' || !owner || !repo) return null;
-  const thread = { kind: 'pull' as const, owner, repo, number: pr.number, accountId: identity.accountId };
-  if (identity.provider === 'gitlab') return identity.instance ? { provider: 'gitlab', instance: identity.instance, ...thread } : null;
-  return identity.provider === 'github' ? { provider: 'github', ...thread } : null;
+  const { provider, instance, accountId } = identity ?? {};
+  if (!entry || !provider || !instance || !accountId || !pr || pr.state !== 'open' || !owner || !repo) return null;
+  // The instance separates the same owner/repo/number on two instances of one provider.
+  return { provider, instance, kind: 'pull', owner, repo, number: pr.number, accountId };
 };
 
 const sameChecks = (left: CISummary | null | undefined, right: CISummary | null | undefined): boolean => (
@@ -813,7 +815,7 @@ const sameChecks = (left: CISummary | null | undefined, right: CISummary | null 
  */
 const applyLiveSummary = (
   status: SourceControlStatus,
-  summary: GitHubPullRequestLiveSummary,
+  summary: ChangeRequestLiveSummary,
   fetchedAt: number,
 ): SourceControlStatus | null => {
   const pr = getStatusChangeRequest(status);
@@ -827,6 +829,7 @@ const applyLiveSummary = (
     && (pr.mergeable ?? null) === summary.mergeable
     && (pr.mergeableState ?? null) === summary.mergeableState
     && (!summary.headSha || pr.headSha === summary.headSha)
+    && (!summary.base || pr.base === summary.base)
     && sameChecks(getStatusChecks(status), summary.checks);
   if (unchanged) {
     return null;
@@ -836,6 +839,7 @@ const applyLiveSummary = (
     draft: summary.draft,
     title: summary.title,
     headSha: summary.headSha ?? pr.headSha,
+    base: summary.base ?? pr.base,
     mergeable: summary.mergeable,
     mergeableState: summary.mergeableState,
   };
@@ -1384,7 +1388,7 @@ export const useGitHubPrStatusStore = create<SourceControlStatusStore>()(
       },
 
       applyTrackedPulls: (records) => {
-        const states = new Map<string, { state: GitHubPullRequestLiveSummary; fetchedAt: number }>();
+        const states = new Map<string, { state: ChangeRequestLiveSummary; fetchedAt: number }>();
         for (const { key, record } of records) {
           if (record.type === 'pull' && record.item.accountId && record.state) states.set(key, { state: record.state, fetchedAt: record.fetchedAt });
         }
@@ -1492,7 +1496,8 @@ export const useGitHubPrStatusStore = create<SourceControlStatusStore>()(
   ),
 );
 export type PrVisualSummary = {
-  provider: SourceControlProvider | null;
+  /** The source-control provider id; null for a status that names none. */
+  provider: string | null;
   number: number;
   visualState: string;
   prState: string;
@@ -1510,22 +1515,18 @@ export type PrVisualSummary = {
 const derivePrVisualState = (status: SourceControlStatus | null): string | null => {
   const pr = status?.pr;
   if (!pr) return null;
-  if (pr.state === 'merged') return 'merged';
-  if (pr.state === 'closed') return 'closed';
-  if (pr.draft) return 'draft';
-  const checksFailed = status?.checks?.state === 'failure';
-  const ms = typeof pr.mergeableState === 'string' ? pr.mergeableState : '';
-  // `blocked` merge state alone usually means a required review is missing:
-  // nothing to fix, so it keeps the open colour. Orange is for failed checks
-  // and conflicts.
-  const notMergeable = pr.mergeable === false || ms === 'dirty';
-  if (checksFailed || notMergeable) return 'blocked';
-  return 'open';
+  return prVisualStateOf({
+    state: pr.state,
+    draft: pr.draft,
+    checksState: status?.checks?.state,
+    mergeable: pr.mergeable,
+    mergeableState: pr.mergeableState,
+  });
 };
 
 const deriveSummary = (
   status: SourceControlStatus | null,
-  fallbackProvider: SourceControlProvider | null = null,
+  fallbackProvider: string | null = null,
 ): PrVisualSummary | null => {
   const vs = derivePrVisualState(status);
   const pr = getStatusChangeRequest(status);
@@ -1569,7 +1570,7 @@ const prSummaryCacheByKey = new Map<string, { sig: string; summary: PrVisualSumm
 const getCachedPrSummary = (
   cacheKey: string,
   status: SourceControlStatus | null | undefined,
-  fallbackProvider: SourceControlProvider | null = null,
+  fallbackProvider: string | null = null,
 ): PrVisualSummary | null => {
   const summary = status ? deriveSummary(status, fallbackProvider) : null;
   if (!summary) {
@@ -1589,6 +1590,12 @@ const getCachedPrSummary = (
   return summary;
 };
 
+/** The badge of one entry's change request, by its status key; stable while nothing changes. */
+export const selectEntryVisualSummary = (entries: Record<string, PrStatusEntry>, key: string): PrVisualSummary | null => {
+  const entry = entries[key];
+  return getCachedPrSummary(`entry:${key}`, entry?.status, entry?.identity?.provider ?? null);
+};
+
 export const useFreshestSourceControlVisualSummaryForBranch = (
   directory: string | null,
   branch: string | null,
@@ -1603,14 +1610,14 @@ export const useFreshestSourceControlVisualSummaryForBranch = (
   });
 };
 
-// A linked PR's live summary in the status shape the badge derivation reads.
-const linkedPrStatus = (
-  link: LinkedGitHubPullRequest,
-  summary: GitHubPullRequestLiveSummary,
-  identity: SourceControlIdentity = GITHUB_IDENTITY,
-): SourceControlStatus => ({
+/** A change request linked to a session, as its badge names it. */
+type LinkedChangeRequest = { owner: string; repo: string; number: number; url: string; title: string };
+
+// A linked change request's live summary in the status shape the badge
+// derivation reads. The provider is passed beside it rather than as the
+// status identity: a linked item's provider is any registered id.
+const linkedPrStatus = (link: LinkedChangeRequest, summary: ChangeRequestLiveSummary): SourceControlStatus => ({
   connected: true,
-  identity,
   repo: { owner: link.owner, repo: link.repo, url: '' },
   pr: {
     number: summary.number,
@@ -1628,16 +1635,53 @@ const linkedPrStatus = (
 });
 
 /**
- * The badge of a change request linked from another host (a GitLab merge
- * request), from its live summary: the same colour and status rule GitHub
- * PRs follow, so orange means the same thing everywhere.
+ * The canonical URL of a linked change request. Hosts treat owner/repo case
+ * insensitively and links may be shared with a fragment, a query (a review
+ * anchor like `#pullrequestreview-…`, a notification query) or a trailing
+ * tab (`/files`, `/diffs`); all such spellings name the same thread. The
+ * summary cache below is shared per tracked item (whose key is already
+ * lower-cased), so any spelling that flips the cache signature yields a fresh
+ * object on every read, the selector result is never referentially stable,
+ * and useSyncExternalStore loops until React throws "Maximum update depth
+ * exceeded" (#185). Every summary therefore uses the instance's origin and
+ * the case-folded path up to the change request's number.
+ */
+const canonicalChangeRequestUrl = (link: LinkedChangeRequest, instance: string): string => {
+  let segments: string[];
+  try {
+    segments = new URL(link.url).pathname.toLowerCase().split('/').filter(Boolean);
+  } catch {
+    return link.url;
+  }
+  // The number comes after the owner (or namespace path), the repo and at least one route segment.
+  const after = link.owner.split('/').length + 1;
+  const end = segments.findIndex((segment, index) => index > after && segment === String(link.number));
+  const path = end >= 0 ? segments.slice(0, end + 1) : segments;
+  return `${getSourceControlBaseUrl({ instance }).toLowerCase()}/${path.join('/')}`;
+};
+
+/**
+ * The badge of a change request linked to a session, from its live summary:
+ * the same colour and status rule a branch's change request follows, so
+ * orange means the same thing everywhere.
  */
 export const getLinkedChangeRequestVisualSummary = (
   cacheKey: string,
-  link: LinkedGitHubPullRequest,
-  summary: GitHubPullRequestLiveSummary,
-  identity: SourceControlIdentity,
-): PrVisualSummary | null => getCachedPrSummary(`linked:${cacheKey}`, linkedPrStatus(link, summary, identity));
+  link: LinkedChangeRequest,
+  summary: ChangeRequestLiveSummary,
+  identity: { provider: string; instance: string },
+): PrVisualSummary | null => {
+  // Hosts resolve owner/repo case insensitively and the tracked item key
+  // already lower-cases them: fold the link the same way, or two sessions
+  // linking one PR with different casing would flip the shared cache entry's
+  // signature (via both the repo fields and the URL) on every read.
+  const folded = { ...link, owner: link.owner.toLowerCase(), repo: link.repo.toLowerCase() };
+  return getCachedPrSummary(
+    `linked:${cacheKey}`,
+    linkedPrStatus({ ...folded, url: canonicalChangeRequestUrl(folded, identity.instance) }, summary),
+    identity.provider,
+  );
+};
 
 
 /**
@@ -1652,6 +1696,6 @@ export const useBranchTrackedPulls = (keys: readonly string[]): TrackedThread<'p
   });
   const signature = useGitHubPrStatusStore((state) => followed(state.entries).map(trackedItemKey).join('\n'));
   // `signature` names exactly what `followed` returns for the current entries.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // oxlint-disable-next-line react-hooks/exhaustive-deps
   return React.useMemo(() => followed(useGitHubPrStatusStore.getState().entries), [keys, signature]);
 };

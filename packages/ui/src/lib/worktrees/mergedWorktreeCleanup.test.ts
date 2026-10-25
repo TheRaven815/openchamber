@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { Session } from '@/lib/opencode/model';
 import {
-  decideMergedWorktreeCleanup,
+  hasUnmergedCommits,
   runMergedWorktreeCleanup,
   type MergedWorktreeCandidate,
   type MergedWorktreeOutcome,
@@ -32,15 +32,16 @@ const setup = (options: {
   busy?: string[];
   open?: string[];
   worktreeOpen?: boolean;
-  isDirty?: boolean | null;
-  headCommit?: string | null;
-  gitFails?: boolean;
+  handled?: boolean;
   archiveFails?: boolean;
+  removing?: boolean;
+  restored?: boolean;
 }) => {
-  const handled = new Set<string>();
+  let restored = options.restored ?? false;
+  const handled = new Set<string>(options.handled ? [WORKTREE] : []);
   const archived: string[][] = [];
   const reports: MergedWorktreeOutcome[] = [];
-  const calls = { archived, removed: 0, reports };
+  const calls = { archived, reports };
   const deps = {
     listCandidates: () => [candidate],
     isHandled: (entry: MergedWorktreeCandidate) => handled.has(entry.worktree.path),
@@ -49,52 +50,44 @@ const setup = (options: {
     isSessionIdle: (id: string) => !(options.busy ?? []).includes(id),
     isSessionOpen: (id: string) => (options.open ?? []).includes(id),
     isWorktreeOpen: () => options.worktreeOpen ?? false,
-    readWorktreeState: async () => {
-      if (options.gitFails) throw new Error('git unavailable');
-      return { isDirty: options.isDirty ?? false, headCommit: options.headCommit === undefined ? SHA : options.headCommit };
+    isWorktreeRemoving: () => options.removing ?? false,
+    takeRestored: () => {
+      const answer = restored;
+      restored = false;
+      return answer;
     },
-    archiveSessions: async (ids: string[]) => {
-      calls.archived.push(ids);
-      return { failedIds: options.archiveFails ? ids : [] };
+    archiveWorktree: async (_entry: MergedWorktreeCandidate, sessions: readonly Session[]) => {
+      if (options.archiveFails) throw new Error('archive failed');
+      calls.archived.push(sessions.map((entry) => entry.id));
     },
-    removeWorktree: async () => { calls.removed += 1; },
     report: (outcome: MergedWorktreeOutcome) => { calls.reports.push(outcome); },
   };
   return { deps, calls, handled };
 };
 
-describe('decideMergedWorktreeCleanup', () => {
-  const base = { sessionsBusyOrUnknown: false, sessionOpen: false, isDirty: false, headCommit: SHA, mergedHeadSha: SHA };
+describe('hasUnmergedCommits', () => {
+  const pushed = { tracking: 'origin/feature', ahead: 0 };
 
-  test('removes only when the checkout is clean and sits on the merged commit', () => {
-    expect(decideMergedWorktreeCleanup(base)).toEqual({ action: 'remove' });
-    expect(decideMergedWorktreeCleanup({ ...base, isDirty: true })).toEqual({ action: 'archive-only' });
-    expect(decideMergedWorktreeCleanup({ ...base, isDirty: null })).toEqual({ action: 'archive-only' });
-    expect(decideMergedWorktreeCleanup({ ...base, headCommit: 'later' })).toEqual({ action: 'archive-only' });
-    expect(decideMergedWorktreeCleanup({ ...base, mergedHeadSha: null })).toEqual({ action: 'archive-only' });
+  test('the PR head answers when this clone has it, including a checkout behind it', async () => {
+    expect(await hasUnmergedCommits({ mergedHeadSha: SHA, status: pushed, hasCommitsAfter: async () => false })).toBe(false);
+    expect(await hasUnmergedCommits({ mergedHeadSha: SHA, status: pushed, hasCommitsAfter: async () => true })).toBe(true);
   });
 
-  test('waits while an agent runs or a session is open', () => {
-    expect(decideMergedWorktreeCleanup({ ...base, sessionsBusyOrUnknown: true })).toEqual({ action: 'wait' });
-    expect(decideMergedWorktreeCleanup({ ...base, sessionOpen: true })).toEqual({ action: 'wait' });
+  test('without the PR head, only a branch with nothing left to push has lost nothing', async () => {
+    const missing = async (): Promise<boolean> => { throw new Error('unknown revision'); };
+    expect(await hasUnmergedCommits({ mergedHeadSha: SHA, status: pushed, hasCommitsAfter: missing })).toBe(false);
+    expect(await hasUnmergedCommits({ mergedHeadSha: SHA, status: { ...pushed, ahead: 2 }, hasCommitsAfter: missing })).toBe(true);
+    expect(await hasUnmergedCommits({ mergedHeadSha: SHA, status: { tracking: null, ahead: 0 }, hasCommitsAfter: missing })).toBeNull();
+    expect(await hasUnmergedCommits({ mergedHeadSha: null, status: { tracking: null, ahead: 0 }, hasCommitsAfter: missing })).toBeNull();
   });
 });
 
 describe('runMergedWorktreeCleanup', () => {
-  test('archives the worktree sessions, then removes the worktree', async () => {
+  test('archives the worktree with its own sessions, once', async () => {
     const { deps, calls } = setup({});
     await runMergedWorktreeCleanup(deps);
-    expect(calls.archived).toEqual([['a']]);
-    expect(calls.removed).toBe(1);
-    expect(calls.reports.map((entry) => entry.kind)).toEqual(['removed']);
-  });
-
-  test('keeps a worktree with commits after the merge, archives its sessions once', async () => {
-    const { deps, calls } = setup({ headCommit: 'later' });
-    await runMergedWorktreeCleanup(deps);
     await runMergedWorktreeCleanup(deps);
     expect(calls.archived).toEqual([['a']]);
-    expect(calls.removed).toBe(0);
     expect(calls.reports.map((entry) => entry.kind)).toEqual(['archived']);
   });
 
@@ -107,23 +100,31 @@ describe('runMergedWorktreeCleanup', () => {
     }
   });
 
-  test('git that cannot answer decides nothing', async () => {
-    const { deps, calls, handled } = setup({ gitFails: true });
+  test('a worktree without sessions is archived too', async () => {
+    const { deps, calls } = setup({ sessions: [] });
+    await runMergedWorktreeCleanup(deps);
+    expect(calls.archived).toEqual([[]]);
+  });
+
+  test('leaves alone a worktree something else is archiving or removing', async () => {
+    const { deps, calls, handled } = setup({ removing: true });
     await runMergedWorktreeCleanup(deps);
     expect(calls.archived).toEqual([]);
     expect(handled.size).toBe(0);
   });
 
-  test('a failed archive keeps the worktree and is reported', async () => {
-    const { deps, calls } = setup({ archiveFails: true });
+  test('a worktree restored after its PR merged is the user taking it back: never archived for that PR', async () => {
+    const { deps, calls, handled } = setup({ restored: true });
     await runMergedWorktreeCleanup(deps);
-    expect(calls.removed).toBe(0);
-    expect(calls.reports.map((entry) => entry.kind)).toEqual(['failed']);
+    await runMergedWorktreeCleanup(deps);
+    expect(calls.archived).toEqual([]);
+    expect(handled.size).toBe(1);
   });
 
-  test('a kept worktree without sessions stays quiet', async () => {
-    const { deps, calls } = setup({ sessions: [], isDirty: true });
+  test('a failed archive is reported and not tried again on every pass', async () => {
+    const { deps, calls } = setup({ archiveFails: true });
     await runMergedWorktreeCleanup(deps);
-    expect(calls.reports).toEqual([]);
+    await runMergedWorktreeCleanup(deps);
+    expect(calls.reports.map((entry) => entry.kind)).toEqual(['failed']);
   });
 });

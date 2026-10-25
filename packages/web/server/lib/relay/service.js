@@ -14,7 +14,7 @@
 import express from 'express';
 
 import { createRelayIdentityRuntime } from './identity.js';
-import { startRelayHost } from './host-client.js';
+import { describeRelayError, startRelayHost } from './host-client.js';
 import { isEnterpriseMode, readEnterprisePolicy } from '../enterprise-mode.js';
 
 export const DEFAULT_RELAY_URL = 'wss://relay.openchamber.dev/ws';
@@ -59,6 +59,7 @@ export const relayBlockedByEnterprise = () => isEnterpriseMode() && pinnedRelayU
  *   crypto: typeof import('node:crypto'),
  *   readSettingsFromDiskMigrated: () => Promise<object>,
  *   writeSettingsToDisk: (settings: object) => Promise<void>,
+ *   relayKeyStore: ReturnType<typeof import('./key-store.js').createRelayKeyStore>,
  *   getLocalPort: () => number,
  *   logger?: Pick<Console, 'warn'>,
  * }} deps
@@ -67,9 +68,8 @@ export const createRelayService = ({
   crypto,
   readSettingsFromDiskMigrated,
   writeSettingsToDisk,
-  // Strict settings reader (throws on corrupt/unreadable) gating identity
-  // regeneration — see identity.js/signing-key.js.
-  readSettingsStrict,
+  // Host relay identity keys, shared with the push relay (key-store.js).
+  relayKeyStore,
   getLocalPort,
   // Returns true when any paired device or pending pairing session uses the
   // relay transport. The relay lifecycle is driven purely by this demand.
@@ -86,7 +86,7 @@ export const createRelayService = ({
   allowPassiveHost = true,
   logger = console,
 }) => {
-  const identityRuntime = createRelayIdentityRuntime({ crypto, readSettingsFromDiskMigrated, writeSettingsToDisk, readSettingsStrict });
+  const identityRuntime = createRelayIdentityRuntime({ crypto, relayKeyStore });
 
   let hostClient = null;
   let status = { state: 'disabled', lastError: null, connectedClients: 0 };
@@ -129,15 +129,19 @@ export const createRelayService = ({
     hostClient = null;
   };
 
-  const standbyStatus = (holderPid) => ({
+  const standbyStatus = (holder) => ({
     state: 'standby',
-    lastError: `relay host is owned by another local OpenChamber process (pid ${holderPid})`,
+    lastError: holder?.host
+      ? `relay host is owned by another OpenChamber process sharing this data dir (pid ${holder.pid} on ${holder.host})`
+      : 'relay host is owned by another OpenChamber process sharing this data dir',
     connectedClients: 0,
   });
 
   // Claim watcher, active while the relay is enabled:
   //   - standby → claimant died → take over (start our host);
-  //   - running → another live process claimed → stand down (stop, standby).
+  //   - running → another live process claimed → stand down (stop, standby);
+  //     otherwise refresh the claim, which keeps it live for instances on
+  //     other hosts or containers that cannot probe our pid.
   // This back-off is what actually ends the mutual-eviction fight: the loser
   // must STOP reconnecting, otherwise both keep replacing each other forever.
   const ensureClaimWatch = (relayUrl) => {
@@ -146,16 +150,15 @@ export const createRelayService = ({
       void (async () => {
         try {
           if (hostClient) {
-            if (!hostLock.holdsClaim() && hostLock.liveClaimantPid() !== null) {
-              logger.warn('[Relay] host claim taken by another local instance — standing down');
-              const holder = hostLock.liveClaimantPid();
+            if (!hostLock.tryClaim()) {
+              logger.warn('[Relay] host claim taken by another instance — standing down');
               stopHostClient();
-              status = standbyStatus(holder);
+              status = standbyStatus(hostLock.otherLiveClaimant());
             }
             return;
           }
           if (status.state !== 'standby' || !allowPassiveHost) return;
-          if (hostLock.liveClaimantPid() !== null) {
+          if (hostLock.otherLiveClaimant() !== null) {
             claimFreeSinceMs = null;
             return;
           }
@@ -170,7 +173,7 @@ export const createRelayService = ({
             await start(relayUrl);
           }
         } catch (error) {
-          logger.warn(`[Relay] claim watch failed: ${error?.message ?? error}`);
+          logger.warn(`[Relay] claim watch failed: ${describeRelayError(error)}`);
         }
       })();
     }, CLAIM_WATCH_INTERVAL_MS);
@@ -202,7 +205,7 @@ export const createRelayService = ({
     if (hostLock) {
       const claimed = claim === 'force' ? hostLock.forceClaim() : hostLock.tryClaim();
       if (!claimed) {
-        status = standbyStatus(hostLock.liveClaimantPid());
+        status = standbyStatus(hostLock.otherLiveClaimant());
         ensureClaimWatch(relayUrl);
         return;
       }
@@ -235,7 +238,7 @@ export const createRelayService = ({
         await start(config.relayUrl);
       }
     } catch (error) {
-      logger.warn(`[Relay] startup failed: ${error?.message ?? error}`);
+      logger.warn(`[Relay] startup failed: ${describeRelayError(error)}`);
     }
   };
 
@@ -257,7 +260,7 @@ export const createRelayService = ({
         stop();
       }
     } catch (error) {
-      logger.warn(`[Relay] reconcile failed: ${error?.message ?? error}`);
+      logger.warn(`[Relay] reconcile failed: ${describeRelayError(error)}`);
     }
   };
 
@@ -284,6 +287,9 @@ export const createRelayService = ({
       relayUrl: config.relayUrl,
       relayUrlLocked: config.relayUrlLocked,
       blockedByEnterprise: relayBlockedByEnterprise(),
+      // Another host with this identity keeps taking the relay slot: usually
+      // the data dir was copied to a second machine (host-client.js).
+      identityConflict: hostClient ? live.identityConflict : false,
       ...(live.lastError ? { lastError: live.lastError } : {}),
     };
   };
@@ -334,6 +340,16 @@ export const createRelayService = ({
     return buildPairingCandidate();
   };
 
+  // Gives this copy its own identity. Both copies of a copied data dir hold the
+  // same keys and evict each other at the relay; after the reset, devices that
+  // know the old identity keep reaching the other copy until they pair here again.
+  const resetIdentity = async () => {
+    const wasHosting = hostClient !== null;
+    stopHostClient();
+    await relayKeyStore.reset();
+    if (wasHosting) await start((await readConfig()).relayUrl);
+  };
+
   const registerRoutes = (app) => {
     app.get('/api/openchamber/relay/status', async (_req, res) => {
       try {
@@ -360,6 +376,15 @@ export const createRelayService = ({
       }
     });
 
+    app.post('/api/openchamber/relay/reset-identity', async (_req, res) => {
+      try {
+        await resetIdentity();
+        res.json(await getStatus());
+      } catch (error) {
+        res.status(500).json({ error: error?.message ?? 'Failed to reset relay identity' });
+      }
+    });
+
     app.post('/api/openchamber/relay/disable', async (_req, res) => {
       try {
         const current = await readConfig();
@@ -380,6 +405,7 @@ export const createRelayService = ({
     stop,
     getStatus,
     getServerId,
+    resetIdentity,
     getPairingCandidate,
     ensureEnabledForPairing,
   };

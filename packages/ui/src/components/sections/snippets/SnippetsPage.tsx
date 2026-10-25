@@ -13,7 +13,6 @@ import {
   SettingsSection,
   SettingsFieldRow,
   SettingsStackedField,
-  SETTINGS_SELECT_SIZE,
 } from '@/components/sections/shared/SettingsSection';
 import { SettingsInfoHint } from '@/components/sections/shared/SettingsInfoHint';
 
@@ -116,7 +115,7 @@ export const SnippetsPage: React.FC = () => {
       <div className="flex h-full items-center justify-center">
         <div className="text-center text-muted-foreground">
           <Icon name="file-text" className="mx-auto mb-3 h-12 w-12 opacity-50" />
-          <p className="typography-body">{t('settings.snippets.page.empty.title')}</p>
+          <p className="typography-ui-label">{t('settings.snippets.page.empty.title')}</p>
           <p className="typography-meta mt-1 opacity-75">{t('settings.snippets.page.empty.description')}</p>
         </div>
       </div>
@@ -139,7 +138,7 @@ export const SnippetsPage: React.FC = () => {
               className="h-7 w-44 px-2"
             />
             <Select value={draftScope} onValueChange={(value) => setDraftScope(value as SnippetScope)}>
-              <SelectTrigger size={SETTINGS_SELECT_SIZE} className="w-fit min-w-[100px]">
+              <SelectTrigger className="w-fit min-w-[100px]">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent align="end">

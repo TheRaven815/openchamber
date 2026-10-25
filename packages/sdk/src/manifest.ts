@@ -1,5 +1,6 @@
 import type { OpenChamberManifestApiVersion } from './api-version.ts';
 import type { FileEditorContribution } from './file-editor.ts';
+import { GUEST_STATUS_SOURCE_INTERVAL_DEFAULT, type StatusSectionSource } from './status-view.ts';
 
 export const PANEL_ID = /^[a-z][a-z0-9-]*$/;
 
@@ -61,9 +62,15 @@ export type PageContribution = true | { entry: string; title?: string };
  * this section and no rail panel. `title` replaces `panel.name` on the section
  * header; `height` is the starting frame height in CSS px before the guest
  * reports its own through `setHeight`.
+ *
+ * `source` makes the host draw the section itself from the service's answers
+ * (`status-view.ts`), without a frame. The object form needs `entry`,
+ * `source`, or both: a host that knows `source` uses it, an older one loads
+ * `entry`.
  */
 export type StatusSectionContribution = true | {
-  entry: string;
+  entry?: string;
+  source?: StatusSectionSource;
   title?: string;
   height?: number;
   defaultExpanded?: boolean;
@@ -319,12 +326,173 @@ export type PublicSocketBinding = {
 
 /**
  * Host roles a service can stand in for. `browser` answers the agent's
- * `browser.*` actions in place of the in-app browser view; the contract is in
- * `service-providers.ts`. A service that provides a role needs no panel or
- * background entry: the host starts it on the first action.
+ * `browser.*` actions in place of the in-app browser view. `source-control`
+ * makes the extension a Git host next to GitHub, GitLab and Gitea, described
+ * by `contributes.sourceControl`. Both contracts are in `service-providers.ts`.
+ * A service that provides a role needs no panel or background entry: the host
+ * starts it on the first call.
  */
-export const GUEST_SERVICE_PROVIDES = ['browser'] as const;
+export const GUEST_SERVICE_PROVIDES = ['browser', 'source-control'] as const;
 export type GuestServiceProvides = (typeof GUEST_SERVICE_PROVIDES)[number];
+
+/**
+ * The host names an extension's Git host `ext-<panel.id>`, and provider ids
+ * are at most 32 characters, so a guest taking the role has an id of at most
+ * this many.
+ */
+export const SOURCE_CONTROL_GUEST_ID_MAX = 28;
+/** The provider id OpenChamber gives the Git host an extension provides. */
+export const sourceControlProviderIdOf = (guestId: string): string => `ext-${guestId}`;
+
+/** Default instances a Git host extension may name. */
+export const SOURCE_CONTROL_DEFAULT_INSTANCES_MAX = 4;
+/** URL templates per kind (`presentation.urls.changeRequest` / `.issue`). */
+export const SOURCE_CONTROL_URL_TEMPLATES_MAX = 8;
+/** Characters in one URL template. */
+export const SOURCE_CONTROL_URL_TEMPLATE_MAX = 256;
+/**
+ * The placeholders a URL template may use, each a whole path segment.
+ * `{namespace+}` is one or more segments (GitLab groups); `{owner}` exactly one.
+ */
+export const SOURCE_CONTROL_URL_TOKENS = ['{owner}', '{namespace+}', '{repo}', '{number}'] as const;
+
+/** `submit` is a change-based host's own merge (Gerrit's): when declared it is the only method. */
+export type SourceControlMergeMethod = 'merge' | 'squash' | 'rebase' | 'submit';
+
+/**
+ * What the Git host can do. A capability left out is off. `merge` lists the
+ * methods it offers, or is `false`. Review threads, uploads, stacks, the
+ * reference picker and multiple accounts are not declared: the host fixes them
+ * for every extension.
+ */
+export type SourceControlCapabilities = {
+  projects: boolean;
+  issues: boolean;
+  changeRequests: boolean;
+  draftChangeRequests: boolean;
+  merge: false | { methods: SourceControlMergeMethod[] };
+  ci: boolean;
+  comments: boolean;
+  reviews: boolean;
+  state: boolean;
+  labels: boolean;
+  reviewers: boolean;
+  changeRequestPatch: boolean;
+  liveSummaries: boolean;
+  /**
+   * How a review is given. `verdict` (the default when left out): approve or
+   * request changes. `votes`: per-label scores, such as Code-Review -2..+2;
+   * the labels and their ranges come with each change request's context.
+   */
+  reviewModel?: 'verdict' | 'votes';
+  /**
+   * Whether a change request has numbered revisions (patchsets) that can be
+   * read one at a time: reads then may carry `revision`, a commit sha.
+   */
+  revisions?: boolean;
+};
+
+/**
+ * `contributes.sourceControl`: the Git host an extension with
+ * `service.provides: ["source-control"]` adds, declared in the manifest so
+ * OpenChamber can draw and route it without starting the service. The
+ * provider id is not declared: OpenChamber names it `ext-<panel.id>`.
+ */
+export type SourceControlContribution = {
+  /** Wire version of the role's service contract; `1`. */
+  wire: 1;
+  /** The product name, shown untranslated. 1 to 64 characters. */
+  label: string;
+  /** `change` names a change-based host's unit of review (Gerrit's change). */
+  terminology: { changeRequest: 'pullRequest' | 'mergeRequest' | 'change'; ci: 'checks' | 'pipeline' };
+  /** `#`, `!`: what precedes a number. 1 to 4 characters. */
+  referencePrefix: { changeRequest: string; issue: string };
+  /** `owner/name`: two segments. `namespace/name`: nested groups before the name. */
+  repositoryPath: 'owner/name' | 'namespace/name';
+  instances: {
+    /** Up to 4 https origins offered without typing one. */
+    defaultInstances: string[];
+    /** Whether the user may add an instance outside `defaultInstances`. */
+    custom: boolean;
+    /** Whether a typed instance may be `http://` on a loopback address. */
+    allowLoopbackHttp: boolean;
+    /** Whether a typed instance may carry a port. */
+    allowPort: boolean;
+    /** Example text in the instance field. */
+    placeholder: string;
+  };
+  capabilities: SourceControlCapabilities;
+  /** How OpenChamber sends the token: which header, with which prefix. */
+  token: {
+    header: 'authorization' | 'private-token';
+    /**
+     * `bearer` → `Bearer <token>`, `token` → `token <token>`, `basic` →
+     * `Basic base64(<login>:<token>)`, `none` → the bare token (only with `private-token`).
+     */
+    scheme: 'bearer' | 'token' | 'basic' | 'none';
+    /** Settings asks for the account's username beside the token. Required with, and only with, `basic`. */
+    username?: boolean;
+    /** Scopes the Settings card asks the user to grant. */
+    scopes: string[];
+    /** Path on the instance where tokens are created, linked from Settings. */
+    createPath?: string;
+  };
+  /** How Git over HTTPS signs in with the stored token. */
+  transport: {
+    httpsUsername: { kind: 'login' } | { kind: 'fixed'; value: string };
+    appendDotGitToHttpsClone: boolean;
+  };
+  limits: {
+    commentMaxLength: number;
+    /** How a reviewer is named in a reviewer mutation: a numeric user id or a login. */
+    reviewerId: 'numeric' | 'login';
+    labelsMax: number;
+    reviewersMax: number;
+  };
+  /** Pull requests and issues read in one `liveSummaries` call. */
+  trackedItems: { batchLimit: number };
+  presentation: {
+    /** `PR`, `MR`: shown untranslated. 1 to 8 characters. */
+    abbreviation: string;
+    /** English noun for generation prompts, such as `pull request`. */
+    promptNoun: string;
+    /** Whether issues and change requests share one number sequence. */
+    sharedNumberSpace: boolean;
+    /** A 24×24 SVG path `d`, the mark drawn for the Git host. */
+    iconPath?: string;
+    /**
+     * Web paths of a change request and an issue on the instance, made of
+     * literal segments and the `SOURCE_CONTROL_URL_TOKENS` placeholders, such
+     * as `/{owner}/{repo}/pulls/{number}`. OpenChamber compiles them; an
+     * extension never supplies a regular expression.
+     */
+    urls: { changeRequest: string[]; issue: string[] };
+    /**
+     * Review threads are not part of the role: OpenChamber keeps starting one
+     * off for an extension's Git host, so there is no `startThread` here.
+     */
+    /**
+     * `submitRequirements`: each change request's context lists what must
+     * hold before it can be submitted, and the UI shows them by the Submit button.
+     */
+    features: { authorCanReview: boolean; issueCloseReason: boolean; submitRequirements?: boolean };
+    /** Repository paths read as the change request template, first match wins. */
+    changeRequestTemplates: string[];
+  };
+};
+
+/** What the extension catalog and approval dialog show of the role; never a token. */
+export type PublicSourceControl = {
+  label: string;
+  defaultInstances: string[];
+  custom: boolean;
+};
+
+export const toPublicSourceControl = (contribution: SourceControlContribution): PublicSourceControl => ({
+  label: contribution.label,
+  defaultInstances: [...contribution.instances.defaultInstances],
+  custom: contribution.instances.custom,
+});
 
 export type ServiceContribution = {
   entry: string;
@@ -358,17 +526,17 @@ export const serviceProvides = (
 /**
  * What a guest may do beyond drawing its own panel. The user approves the
  * full list once, when the package is installed; a later package that asks
- * for more is re-approved. `prompt`, `sessions`, `files`, and `model` are
- * declared under `contributes.capabilities`; `service`, `network`,
+ * for more is re-approved. `prompt`, `sessions`, `files`, `model`, and
+ * `shells` are declared under `contributes.capabilities`; `service`, `network`,
  * `filesystem` and `origins` follow from `contributes.service`,
  * `contributes.integration`, `contributes.filesystem` and `contributes.origins`. `model` is one-off text generation with the
  * user's Small Model (`host.generate`), outside any session.
  */
-export const GUEST_CAPABILITIES = ['prompt', 'sessions', 'files', 'model', 'conversation', 'service', 'network', 'filesystem', 'origins'] as const;
+export const GUEST_CAPABILITIES = ['prompt', 'sessions', 'files', 'model', 'shells', 'conversation', 'service', 'network', 'filesystem', 'origins'] as const;
 
 export type GuestCapability = (typeof GUEST_CAPABILITIES)[number];
 
-export const DECLARED_GUEST_CAPABILITIES = ['prompt', 'sessions', 'files', 'model'] as const;
+export const DECLARED_GUEST_CAPABILITIES = ['prompt', 'sessions', 'files', 'model', 'shells'] as const;
 
 /** The capabilities a manifest may ask for directly. */
 export type DeclaredGuestCapability = (typeof DECLARED_GUEST_CAPABILITIES)[number];
@@ -425,6 +593,8 @@ export type OpenChamberContributes = {
   tools?: GuestToolContribution[];
   /** Editors the Files view opens matching files in. */
   fileEditors?: FileEditorContribution[];
+  /** The Git host a `source-control` service provides; present exactly when it does. */
+  sourceControl?: SourceControlContribution;
 };
 
 /** Whether any declared action asks for a session's messages, which needs `conversation`. */
@@ -507,7 +677,16 @@ export const resolveStatusSectionEntry = (
 ): string | null => {
   const section = contributes.statusSection;
   if (!section) return null;
-  return section === true ? contributes.panel.entry ?? null : section.entry;
+  return section === true ? contributes.panel.entry ?? null : section.entry ?? null;
+};
+
+/** Where the host reads a source-backed section, with the interval resolved; `null` for a frame-only section. */
+export const resolveStatusSectionSource = (
+  contributes: Pick<OpenChamberContributes, 'statusSection'>,
+): Required<StatusSectionSource> | null => {
+  const section = contributes.statusSection;
+  if (!section || section === true || !section.source) return null;
+  return { path: section.source.path, interval: section.source.interval ?? GUEST_STATUS_SOURCE_INTERVAL_DEFAULT };
 };
 
 /** Clamp a requested status section height to what the host allows. */

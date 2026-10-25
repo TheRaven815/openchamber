@@ -1,49 +1,67 @@
 /**
- * What a session must be told about the project's knowledge, and whether it has
- * been told yet.
+ * What a session must be told about the project's knowledge.
  *
- * One owner, three moments. The block is attached to an outgoing prompt when
- * there is one (a message from the UI, a scheduled task, a session the agent
- * dispatched) and re-sent on its own after compaction, when there is no message
- * to attach it to. The decision is the same in every case, so it lives here
- * rather than in each sender — the client used to own it, which meant sessions
- * started without a UI got nothing at all.
+ * The text lives in OpenCode as the session's instruction entries
+ * (`/api/experimental/session/:id/instructions/entries/:key`). OpenCode keeps
+ * them with the session: the first values go into the system prompt, a value
+ * that changes or goes away is announced to the agent at its next step, and
+ * compaction, revert and fork keep them. So OpenChamber holds no record of what
+ * a session was told; every sender writes what the session should carry now,
+ * right before its message, and OpenCode tells the agent only what changed.
  *
- * What was delivered is recorded in the session's own metadata rather than in
- * the browser. A signature held in a tab is lost when the tab closes, and worse,
- * it survives compaction: the tab goes on believing the agent still has context
- * that has just been summarised away.
+ * One owner for every sender (a message from the UI, the queue, a scheduled
+ * task, a session the agent dispatched): sessions started without a UI must
+ * carry the same context as the ones a tab sends to.
  */
+import { isRecord } from '../shared/guards.js';
 
-const KNOWLEDGE_METADATA_KEY = 'knowledge_context_delivered';
 const PINS_METADATA_KEY = 'project_context_pins';
 
-/** Total budget for the assembled block; anything past it is cut, loudly. */
+/**
+ * One entry per source, so a memory saved mid-session re-sends the memory
+ * index and nothing else. OpenCode orders entries by key.
+ */
+export const KNOWLEDGE_ENTRY_KEYS = {
+  checkout: 'openchamber.checkout',
+  pinned: 'openchamber.pinned',
+  memory: 'openchamber.memory',
+  guidance: 'openchamber.guidance',
+};
+
+/** Budget for each entry; anything past it is cut, loudly. */
 const KNOWLEDGE_MAX_LENGTH = 8000;
 
-const isRecord = (value) => Boolean(value && typeof value === 'object' && !Array.isArray(value));
-
-const truncate = (value, budget) => (
-  value.length <= budget ? value : `${value.slice(0, Math.max(0, budget - 1))}…`
+const truncate = (value) => (
+  value.length <= KNOWLEDGE_MAX_LENGTH
+    ? value
+    : `${value.slice(0, KNOWLEDGE_MAX_LENGTH - 1)}…\n\n(truncated)`
 );
 
 /**
- * Identity of everything the session should be carrying, content revisions
- * included: editing a pinned note must re-send it, not merely renaming one.
+ * Where the session works, as the agent cannot see it for itself between two
+ * messages: another session sharing the checkout may have switched the branch,
+ * and the agent would go on editing that session's work. The directory is
+ * named too, so a session moved to another worktree reads as a move.
  */
-export const buildKnowledgeSignature = ({ notes, plans, memory, linking = false }) => {
-  const parts = [
-    ...notes.map((note) => `n:${note.id}:${note.updatedAt}`),
-    ...plans.map((plan) => `p:${plan.id}:${plan.title}`),
-    ...memory.global.map((entry) => `mg:${entry.id}:${entry.updatedAt}`),
-    ...memory.project.map((entry) => `mp:${entry.id}:${entry.updatedAt}`),
-    // Memory being on is itself worth telling a session: without it an empty
-    // store sends nothing, and an agent never told when to save never does.
-    ...(memory.enabled ? [`m:on:${memory.complete ? 'c' : 'p'}`] : []),
-    ...(linking ? ['l:on'] : []),
-  ];
-  return parts.length === 0 ? '' : parts.sort().join('|');
+const describeCheckout = ({ directory, branch, placeholder = false }) => {
+  if (!branch) return `This session works in \`${directory}\`, with no branch checked out.`;
+  const where = `This session works in \`${directory}\`, on branch \`${branch}\`.`;
+  return placeholder ? `${where} ${placeholderBranchGuidance(branch)}` : where;
 };
+
+/**
+ * A branch OpenChamber named with a placeholder (Quick worktree's
+ * `agile-chipmunk`) and never pushed is renamed after the task by the agent,
+ * at the moment it names the task. Said here, with the branch, and only while
+ * it holds: once renamed, the entry changes and OpenCode tells the agent so.
+ * `work.name` does the rename (its `branch`) and refuses to name the task
+ * without it, so the two cannot drift apart; a separate `git branch -m` step
+ * was the one weaker models dropped.
+ */
+const placeholderBranchGuidance = (branch) => `Its name \`${branch}\` is a placeholder OpenChamber generated, not one the user chose,`
+  + ' and it is not pushed yet. Name the task with work.name, passing branch too: work.name renames the branch to it.'
+  + " Follow the naming the repository's other branches use (`git branch -a`); with none, `<type>/<short-kebab-case>`"
+  + ' with the conventional commit types, such as `fix/login-timeout`. No tool or app prefix.';
 
 const renderMemorySection = (entries) => entries
   .slice()
@@ -52,29 +70,69 @@ const renderMemorySection = (entries) => entries
   .join('\n');
 
 /**
- * When to save, stated in every session where memory is on. The tool
- * description alone is read only when the agent already means to call it, so
- * agents told nothing here saved only when the user said "remember".
+ * When to save, stated in every session where memory is on, and only here. The
+ * tool description alone is read only when the agent already means to call it,
+ * so agents told nothing here saved only when the user said "remember".
  */
-const MEMORY_SAVE_GUIDANCE = 'You have memory that persists across sessions, through the'
-  + ' openchamber_memory tool. Save to it in the moment, without asking first, when:'
-  + ' the user corrects how you work or states a preference; the user confirms that'
-  + ' a non-obvious approach worked; or you learn a project fact that took real'
-  + ' effort to find and is not in the code or docs. One fact per entry. The user'
-  + ' can review and remove what you save, so save when it fits and mention it'
-  + ' briefly.';
+const MEMORY_SAVE_GUIDANCE = 'The openchamber_memory tool keeps memory across sessions. Save to it in the'
+  + ' moment, without asking, when the user corrects how you work or states a'
+  + ' preference, confirms a non-obvious approach worked, or you learn a project fact'
+  + ' that took real effort to find. A project fact an agent would learn from the code,'
+  + ' docs and skills, including why and whether it may change, needs no entry; the'
+  + ' user\'s corrections and preferences always do. Save before your final reply and'
+  + ' mention the save there briefly: the app shows only the text after a turn\'s last'
+  + ' tool call as the reply.';
 
 /**
- * When to link, stated in every session that has the `openchamber` tool. The
- * same rule leads that tool's description; stated only there, an agent given
- * an issue to investigate never opened the tool and so never linked it.
- * The tool description states the same rule; change both together.
+ * When to link, stated in every session that has the `openchamber` tool, and
+ * only here. Stated only in the action's description, an agent given an issue
+ * to investigate never opened the tool and so never linked it.
  */
-export const SESSION_LINK_GUIDANCE = "When the user gives you an issue or a change under"
-  + " review (a pull or merge request) to work on, fix, investigate or review, when you"
-  + " open one for this work, and when the work resolves one, link it to this session"
-  + " with the openchamber tool's session.link as soon as you know it, so the user"
-  + " sees it with the session. Not one merely mentioned in passing.";
+export const SESSION_LINK_GUIDANCE = "Link to this session with the openchamber tool's session.link,"
+  + " as soon as you know it, each issue or pull or merge request the user gives you to"
+  + " work on, fix, investigate or review, that you open for this work, or that the work"
+  + " resolves. One merely mentioned in passing stays unlinked. The reply need not say you linked it.";
+
+/**
+ * When to name the task, stated with the linking guidance for the same reason:
+ * an action only its description mentions is never called. The sidebar lists
+ * a task under this name, so it is set early and changed only with the task.
+ */
+export const WORK_NAME_GUIDANCE = "Name the task with the openchamber tool's work.name as soon as it is clear what"
+  + " the task is: at most 4 words naming the task itself, such as \"Login timeout fix\" or \"Sidebar task rows\","
+  + " never a step of it. Rename it only when the work becomes a different task; finishing a step, fixing"
+  + " something on the way or a follow-up within the same task is no reason. A name the user gave stays.";
+
+/**
+ * Where the managed tools are called, stated while they are direct tools (the
+ * default; `agentToolsCodeMode` puts them in Code Mode's catalog instead).
+ * OpenCode's Code Mode teaches the model that tools live in `execute`'s
+ * catalog, and a model that called `tools.openchamber(...)` from a script got
+ * "Unknown tool", concluded the tool did not exist and never named its task.
+ */
+export const DIRECT_TOOLS_GUIDANCE = "The openchamber tools (openchamber, openchamber_render and the others) are direct tool calls:"
+  + " never call them from inside a Code Mode execute script, where they do not exist.";
+
+/**
+ * When to draw a page, stated in every session that has the
+ * `openchamber_render` tool, and only here. Stated only in the tool
+ * description, it went unread: asked for a breakdown of lines of code per
+ * package, an agent answered with a list and drew the chart only when asked.
+ * Interface mockups are named on their own: listed only as data, the cases
+ * read to a literal model as "charts only", while a proposed UI change is
+ * where a page helps most. The limits matter as much as the cases: a page for
+ * two numbers is worse than a sentence.
+ */
+export const RENDER_PAGE_GUIDANCE = "The openchamber_render tool draws a chart, table, diagram or interface mockup inline in the chat."
+  + " Use it when the answer is mostly data or structure the user would otherwise picture:"
+  + " numbers across several items (sizes, counts, timings, costs, test results), shares of a whole,"
+  + " a trend, options compared on several criteria, a timeline, how components connect;"
+  + " or how something looks: a proposed interface change, before and after, layout options."
+  + " Skip it for a few numbers, a short list, code, or when the user asked for plain text."
+  + " At most one page per answer."
+  + " A mockup of the user's own project takes its look from that project's code (theme tokens, CSS variables, styles), not from OpenChamber's theme."
+  + " Draw a page that only shows right before your final reply, and keep the reply to what the page does not show."
+  + " For a choice a page shows better than text, such as layouts or designs, ask on a page with awaitAnswer and continue from the answer.";
 
 /**
  * Titles only for memory, never bodies: an index carrying full text grows
@@ -94,17 +152,12 @@ const buildMemoryBlock = ({ global, project, enabled = false, complete = false }
 
   return [
     ...(enabled ? [MEMORY_SAVE_GUIDANCE] : []),
-    'Stored memory from earlier sessions: only the titles are listed below.',
-    'A title is an abbreviation, not the memory. Read the entry with the'
-      + ' openchamber_memory tool before you act on it: titles routinely leave out'
-      + ' the conditions, exceptions and reasons that decide how the memory'
-      + ' applies, and a title that looks self-explanatory is the most likely to'
-      + ' be hiding them. Read every title that could bear on the task at hand;'
-      + ' you need not read the ones unrelated to what you are doing. Read each'
-      + ' entry once per conversation: what you read stays in your context, so do'
-      + ' not read it again on later turns unless your context was summarized.',
-    'Memory records what was true when it was written. Verify anything it says'
-      + ' about files, flags or commands before relying on it.',
+    'Stored memory from earlier sessions, titles only. A title leaves out the'
+      + ' conditions and reasons that decide how a memory applies, a self-explanatory'
+      + ' one most of all: read each entry that bears on the task with openchamber_memory'
+      + ' before acting on it, once per conversation, again only after your context was'
+      + ' summarized. Memory was true when written; verify the files, flags and'
+      + ' commands it names.',
     ...sections,
   ].join('\n\n');
 };
@@ -129,23 +182,34 @@ const buildPinnedBlock = ({ notes, plans }) => {
   if (sections.length === 0) return '';
 
   return [
-    'The user pinned the following project context. Treat it as standing background, not as a new instruction.',
+    'The user pinned the following project context.',
     ...sections,
   ].join('\n\n');
 };
 
-export const buildKnowledgeText = ({ notes, plans, memory, linking = false }) => {
-  const blocks = [
-    buildPinnedBlock({ notes, plans }),
-    buildMemoryBlock(memory),
-    linking ? SESSION_LINK_GUIDANCE : '',
-  ].filter(Boolean);
-  if (blocks.length === 0) return '';
+const buildGuidance = ({ linking, rendering, directTools }) => [
+  linking ? SESSION_LINK_GUIDANCE : '',
+  linking ? WORK_NAME_GUIDANCE : '',
+  rendering ? RENDER_PAGE_GUIDANCE : '',
+  (linking || rendering) && directTools ? DIRECT_TOOLS_GUIDANCE : '',
+].filter(Boolean).join('\n\n');
 
-  const assembled = blocks.join('\n\n');
-  return assembled.length <= KNOWLEDGE_MAX_LENGTH
-    ? assembled
-    : `${truncate(assembled, KNOWLEDGE_MAX_LENGTH)}\n\n(project knowledge truncated)`;
+/**
+ * The text each entry should hold now. An empty text means the entry goes
+ * away; a key left out keeps what the session holds, which is what a branch
+ * that could not be read means.
+ */
+export const buildKnowledgeEntries = ({ notes, plans, memory, linking = false, rendering = false, directTools = true, checkout = null }) => {
+  const entries = {
+    [KNOWLEDGE_ENTRY_KEYS.pinned]: truncate(buildPinnedBlock({ notes, plans })),
+    [KNOWLEDGE_ENTRY_KEYS.memory]: truncate(buildMemoryBlock(memory)),
+    [KNOWLEDGE_ENTRY_KEYS.guidance]: buildGuidance({ linking, rendering, directTools }),
+  };
+  // The branch is told while the agent has the tool, whose worktree move is
+  // the one thing it can do about a busy branch.
+  if (!linking) entries[KNOWLEDGE_ENTRY_KEYS.checkout] = '';
+  else if (checkout) entries[KNOWLEDGE_ENTRY_KEYS.checkout] = describeCheckout(checkout);
+  return entries;
 };
 
 export const createSessionKnowledgeRuntime = (dependencies) => {
@@ -156,10 +220,24 @@ export const createSessionKnowledgeRuntime = (dependencies) => {
     isAgentMemoryEnabled,
     // Whether this session's agent has the `openchamber` tool to link with.
     isSessionLinkingAvailable = null,
-    // Pins and the delivered-signature cursor live in OpenChamber's own session
-    // metadata store: OpenCode 2.x accepts session metadata only at create time.
+    // The checked-out branch, or '' when none is checked out. Failures throw;
+    // read only while the agent has the tool.
+    readCheckoutBranch = null,
+    // `(directory, branch)`: that checked-out branch while its name is
+    // OpenChamber's placeholder and it was never pushed, else null.
+    readPlaceholderBranch = null,
+    // Whether this session's agent has the `openchamber_render` tool.
+    isPageRenderingAvailable = async () => false,
+    // Whether the managed tools run through Code Mode's catalog rather than
+    // as direct tools.
+    areAgentToolsInCodeMode = async () => false,
+    // Pins live in OpenChamber's own session metadata store.
     readSessionMetadata = null,
     persistSessionMetadata = null,
+    // The session's instruction entries in OpenCode: `put(sessionId,
+    // directory, key, text)` and `remove(sessionId, directory, key)`. Both are
+    // idempotent there, so writing an unchanged value tells the agent nothing.
+    instructionEntries = null,
   } = dependencies;
 
   const requireMetadataStore = () => {
@@ -171,11 +249,6 @@ export const createSessionKnowledgeRuntime = (dependencies) => {
   /** The session shape the readers below expect, built from our own store. */
   const readStoredSession = async (sessionId) => ({ metadata: await readSessionMetadata(sessionId) });
 
-  /**
-   * Everything the session should be carrying, read fresh. A failure in one
-   * source never blanks the rest: a memory store that will not load must not
-   * take the user's pinned notes down with it.
-   */
   const readPins = (session) => {
     const metadata = isRecord(session?.metadata) ? session.metadata : {};
     const openchamber = isRecord(metadata.openchamber) ? metadata.openchamber : {};
@@ -186,6 +259,11 @@ export const createSessionKnowledgeRuntime = (dependencies) => {
     return { notes: strings(pins.notes), plans: strings(pins.plans) };
   };
 
+  /**
+   * Everything the session should be carrying, read fresh. A failure in one
+   * source never blanks the rest: a memory store that will not load must not
+   * take the user's pinned notes down with it.
+   */
   const collect = async (directory, pins = { notes: [], plans: [] }) => {
     const projectId = directory ? await resolveProjectId(directory) : '';
 
@@ -240,8 +318,19 @@ export const createSessionKnowledgeRuntime = (dependencies) => {
     const linking = typeof isSessionLinkingAvailable === 'function'
       ? await Promise.resolve(isSessionLinkingAvailable()).catch(() => false)
       : false;
+    // The branch is read only while the tool that moves a session off it is there.
+    const branch = linking && directory && readCheckoutBranch
+      ? await Promise.resolve(readCheckoutBranch(directory)).catch(() => null)
+      : null;
+    const placeholder = Boolean(branch) && readPlaceholderBranch
+      ? await Promise.resolve(readPlaceholderBranch(directory, branch)).then((name) => name === branch, () => false)
+      : false;
+    const checkout = branch !== null ? { directory, branch, placeholder } : null;
 
-    return { notes, plans, memory, linking };
+    const rendering = await Promise.resolve(isPageRenderingAvailable()).catch(() => false);
+    const directTools = !(await Promise.resolve(areAgentToolsInCodeMode()).catch(() => false));
+
+    return { notes, plans, memory, linking, rendering, directTools, checkout };
   };
 
   /**
@@ -289,37 +378,33 @@ export const createSessionKnowledgeRuntime = (dependencies) => {
     return { notes, plans, memory };
   };
 
-  const readDeliveredSignature = (session) => {
-    const metadata = isRecord(session?.metadata) ? session.metadata : {};
-    const openchamber = isRecord(metadata.openchamber) ? metadata.openchamber : {};
-    const delivered = openchamber[KNOWLEDGE_METADATA_KEY];
-    return typeof delivered === 'string' ? delivered : '';
-  };
-
-  /**
-   * The text this session still owes, or an empty string when it is already
-   * carrying it. `deliveredSignature` comes from the session's metadata.
-   */
-  const resolvePending = async (directory, deliveredSignature, pins = { notes: [], plans: [] }) => {
-    const collected = await collect(directory, pins);
-    const signature = buildKnowledgeSignature(collected);
-    if (!signature || signature === deliveredSignature) {
-      return { text: '', signature };
-    }
-    return { text: buildKnowledgeText(collected), signature };
-  };
-
-  /**
-   * What this session still owes, read from its own stored signature.
-   */
-  const resolvePendingForSession = async (sessionId, directory) => {
-    const session = await readStoredSession(sessionId).catch(() => null);
-    return resolvePending(directory, readDeliveredSignature(session), readPins(session));
-  };
-
   const collectSummaryForSession = async (sessionId, directory) => {
     const session = await readStoredSession(sessionId).catch(() => null);
     return collectSummary(directory, readPins(session));
+  };
+
+  /**
+   * Writes what the session should carry now into its instruction entries.
+   * Called right before a message goes out, so the agent reads it with that
+   * message. Never throws: a message without its background costs the agent
+   * some context, a failed send costs the user their message. One entry that
+   * will not write does not hold back the others.
+   */
+  const sync = async (sessionId, directory) => {
+    if (!instructionEntries || !sessionId) return false;
+    try {
+      const session = await readStoredSession(sessionId).catch(() => null);
+      const entries = buildKnowledgeEntries(await collect(directory, readPins(session)));
+      const writes = await Promise.allSettled(Object.entries(entries).map(([key, text]) => (text
+        ? instructionEntries.put(sessionId, directory, key, text)
+        : instructionEntries.remove(sessionId, directory, key))));
+      const failed = writes.find((write) => write.status === 'rejected');
+      if (failed) console.warn('[session-knowledge] entry write failed:', failed.reason?.message || failed.reason);
+      return !failed;
+    } catch (error) {
+      console.warn('[session-knowledge] sync failed:', error?.message || error);
+      return false;
+    }
   };
 
   const setPin = async (sessionId, directory, kind, id, pinned) => {
@@ -329,44 +414,20 @@ export const createSessionKnowledgeRuntime = (dependencies) => {
     const next = new Set(pins[key]);
     if (pinned) next.add(id);
     else next.delete(id);
-    // Clearing the delivered signature is what makes the next send carry the
-    // changed pin set; the merge patch leaves neighbouring state alone.
+    // The next send writes the changed pin set; the merge patch leaves
+    // neighbouring state alone.
     await persistSessionMetadata(sessionId, directory, {
-      openchamber: {
-        [PINS_METADATA_KEY]: { ...pins, [key]: [...next] },
-        [KNOWLEDGE_METADATA_KEY]: '',
-      },
+      openchamber: { [PINS_METADATA_KEY]: { ...pins, [key]: [...next] } },
     });
     return { ...pins, [key]: [...next] };
-  };
-
-  /**
-   * Recorded only once the message carrying it has actually gone out. Writing
-   * it when the text is handed over would leave a failed send believing the
-   * agent had context it never received.
-   *
-   * Merged onto a fresh read, because the session's metadata holds other
-   * OpenChamber state — pinned messages among it — and a blind write would
-   * drop whatever changed in between.
-   */
-  const recordDelivered = async (sessionId, directory, signature) => {
-    requireMetadataStore();
-    await persistSessionMetadata(sessionId, directory, {
-      openchamber: { [KNOWLEDGE_METADATA_KEY]: signature },
-    });
   };
 
   return {
     collect,
     collectSummary,
     collectSummaryForSession,
-    resolvePending,
-    resolvePendingForSession,
-    recordDelivered,
-    readDeliveredSignature,
+    sync,
     readPins,
     setPin,
-    metadataKey: KNOWLEDGE_METADATA_KEY,
-    pinsMetadataKey: PINS_METADATA_KEY,
   };
 };

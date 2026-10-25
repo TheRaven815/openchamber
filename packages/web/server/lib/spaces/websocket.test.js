@@ -67,7 +67,9 @@ const transportTo = (inside) => {
   return {
     calls,
     ids: [ID],
-    listSpaceIds: async function () { return this.ids; },
+    // The failure of a place that could not be asked, as the host's list reports it.
+    failure: null,
+    listSpaceIds: async function () { return { ids: this.ids, failure: this.failure }; },
     connect: async function (spaceId) {
       calls.connect += 1;
       if (!this.ids.includes(spaceId)) throw new SpaceError('space_not_found', `Space ${spaceId} has no container`);
@@ -223,6 +225,51 @@ describe('the WebSocket forwarder', () => {
     expect(transport.calls.connect).toBe(0);
   });
 
+  it('takes a socket that names a space directory before the host\'s own handler for the same path, and leaves the host\'s sockets alone', async () => {
+    await start();
+    // The host's own terminal handler, as the server mounts it: after the space's, on its one exact path.
+    const hostTerminal = [];
+    host.server.on('upgrade', (req, socket) => {
+      if (new URL(req.url, 'http://localhost').pathname !== '/api/terminal/ws') return;
+      hostTerminal.push(req.url);
+      socket.end('HTTP/1.1 418 Host Terminal\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    });
+    const directory = encodeURIComponent(`/spaces/${ID}/repo`);
+    const { socket, first } = await open(host.url(`/api/terminal/ws?directory=${directory}&oc_url_token=secret-url`));
+    expect(first.hello).toBe(`/api/terminal/ws?directory=${directory}`);
+    expect(first.headers.origin).toBe('http://127.0.0.1:27600');
+    socket.close();
+    for (const [suffix, status, code] of [
+      [`/api/terminal/ws?directory=${directory}&directory=/home/me`, 400, 'directory_outside_space'],
+      [`/api/terminal/ws?directory=/home/me&directory=${directory}`, 400, 'directory_outside_space'],
+      [`/api/terminal/ws?directory=/spaces/${OTHER}/repo`, 404, 'space_not_found'],
+      ['/api/terminal/ws?directory=/spaces', 404, 'space_not_found'],
+      [`/api/dictation/ws?directory=${directory}`, 403, 'host_only_route'],
+    ]) {
+      const answer = await open(host.url(suffix));
+      expect(answer.status, suffix).toBe(status);
+      expect(answer.body, suffix).toMatchObject({ code });
+    }
+    expect(hostTerminal).toHaveLength(0);
+    const hostAnswer = await new Promise((resolve) => {
+      const plain = new WebSocket(host.url('/api/terminal/ws?directory=/home/me'), { headers: { origin: 'http://app.test' } });
+      plain.on('unexpected-response', (_request, response) => resolve(response.statusCode));
+      plain.on('error', () => {});
+    });
+    expect(hostAnswer).toBe(418);
+    expect(hostTerminal).toEqual(['/api/terminal/ws?directory=/home/me']);
+  });
+
+  it('never calls a space gone while a place could not be asked', async () => {
+    await start();
+    transport.failure = new SpaceError('docker_command_failed', 'Cannot connect to the Docker daemon');
+    const unknown = await open(host.url(`/api/spaces/${OTHER}/terminal/ws`));
+    expect(unknown.status).toBe(502);
+    expect(unknown.body).toMatchObject({ code: 'space_unreachable' });
+    expect(transport.calls.connect).toBe(0);
+    expect(inside.state.upgrades).toHaveLength(0);
+  });
+
   it('answers the place\'s refusal and the space\'s own refusal with their codes', async () => {
     await start();
     const stoppedConnect = transport.connect;
@@ -340,6 +387,7 @@ describe('the WebSocket forwarder', () => {
     const closes = Promise.all([waitForClose(a.socket), waitForClose(b.socket)]);
     forwarder.close();
     await closes;
-    expect(inside.state.sockets.size).toBe(0);
+    // The streams are destroyed at once; the server inside sees its ends close a moment later.
+    expect(await until(() => inside.state.sockets.size === 0)).toBe(true);
   });
 });

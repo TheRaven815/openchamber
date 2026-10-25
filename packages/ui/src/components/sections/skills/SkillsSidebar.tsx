@@ -18,7 +18,8 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu';
-import { selectSkillsForDirectory, useSkillsStore, type DiscoveredSkill } from '@/stores/useSkillsStore';
+import { selectSkillPoliciesForDirectory, selectSkillsForDirectory, useSkillsStore, type DiscoveredSkill } from '@/stores/useSkillsStore';
+import { getSkillSwitchState } from '@/stores/skillSwitch';
 import { useSettingsDirectory } from '@/hooks/useSettingsDirectory';
 import { useShallow } from 'zustand/react/shallow';
 import { cn } from '@/lib/utils';
@@ -29,7 +30,7 @@ import { matchesRankQuery } from '@/lib/search/fuzzySearch';
 import { SidebarGroup } from '@/components/sections/shared/SidebarGroup';
 import { Icon } from "@/components/icon/Icon";
 import { useI18n } from '@/lib/i18n';
-import { SETTINGS_PANEL_TITLE_CLASS } from '@/components/sections/shared/SettingsSection';
+import { SETTINGS_SECTION_TITLE_CLASS } from '@/components/sections/shared/SettingsSection';
 
 interface SkillsSidebarProps {
   onItemSelect?: () => void;
@@ -71,6 +72,15 @@ export const SkillsSidebar: React.FC<SkillsSidebarProps> = ({ onItemSelect }) =>
   // stays where it is.
   const settingsDirectory = useSettingsDirectory();
   const skills = useSkillsStore((state) => selectSkillsForDirectory(state, settingsDirectory));
+  const policies = useSkillsStore((state) => selectSkillPoliciesForDirectory(state, settingsDirectory));
+  // Why agents cannot use a skill: its switch is off, or a rule the switch
+  // cannot change (a wildcard) blocks it.
+  const offReason = (skill: DiscoveredSkill): SkillOffReason => {
+    if (!policies) return null;
+    const state = getSkillSwitchState(policies, skill.id);
+    if (state.enabled) return null;
+    return state.switchable ? 'switch' : 'policy';
+  };
   const loadSkills = useSkillsStore((state) => state.loadSkills);
 
   React.useEffect(() => {
@@ -227,7 +237,7 @@ export const SkillsSidebar: React.FC<SkillsSidebarProps> = ({ onItemSelect }) =>
   return (
     <div className={cn('flex h-full flex-col', bgClass)}>
       <div className="border-b px-3 pt-4 pb-3">
-        <h2 className={`${SETTINGS_PANEL_TITLE_CLASS} mb-3`}>{t('settings.skills.sidebar.title')}</h2>
+        <h2 className={`${SETTINGS_SECTION_TITLE_CLASS} mb-3`}>{t('settings.skills.sidebar.title')}</h2>
         <SettingsProjectSelector className="mb-3" />
         <div className="flex items-center justify-between gap-2">
           <span className="typography-meta text-muted-foreground">{t('settings.skills.sidebar.total', { count: skills.length })}</span>
@@ -270,6 +280,7 @@ export const SkillsSidebar: React.FC<SkillsSidebarProps> = ({ onItemSelect }) =>
                       <SkillListItem
                         key={skill.name}
                         skill={skill}
+                        off={offReason(skill)}
                         isSelected={selectedSkillName === skill.name}
                         onSelect={() => {
                           setSelectedSkill(skill.name);
@@ -289,6 +300,7 @@ export const SkillsSidebar: React.FC<SkillsSidebarProps> = ({ onItemSelect }) =>
                   <SkillListItem
                     key={skill.name}
                     skill={skill}
+                    off={offReason(skill)}
                     isSelected={selectedSkillName === skill.name}
                     onSelect={() => {
                       setSelectedSkill(skill.name);
@@ -321,6 +333,7 @@ export const SkillsSidebar: React.FC<SkillsSidebarProps> = ({ onItemSelect }) =>
                       <SkillListItem
                         key={skill.name}
                         skill={skill}
+                        off={offReason(skill)}
                         isSelected={selectedSkillName === skill.name}
                         onSelect={() => {
                           setSelectedSkill(skill.name);
@@ -340,6 +353,7 @@ export const SkillsSidebar: React.FC<SkillsSidebarProps> = ({ onItemSelect }) =>
                   <SkillListItem
                     key={skill.name}
                     skill={skill}
+                    off={offReason(skill)}
                     isSelected={selectedSkillName === skill.name}
                     onSelect={() => {
                       setSelectedSkill(skill.name);
@@ -430,8 +444,12 @@ export const SkillsSidebar: React.FC<SkillsSidebarProps> = ({ onItemSelect }) =>
   );
 };
 
+type SkillOffReason = 'switch' | 'policy' | null;
+
 interface SkillListItemProps {
   skill: DiscoveredSkill;
+  /** Why agents cannot use this skill, or null when they can. */
+  off: SkillOffReason;
   isSelected: boolean;
   onSelect: () => void;
   onDelete: () => void;
@@ -443,6 +461,7 @@ interface SkillListItemProps {
 
 const SkillListItem: React.FC<SkillListItemProps> = ({
   skill,
+  off,
   isSelected,
   onSelect,
   onDelete,
@@ -460,16 +479,16 @@ const SkillListItem: React.FC<SkillListItemProps> = ({
     <>
       {canRename ? (
         <Item onClick={(e: React.MouseEvent) => { e.stopPropagation(); onRename(); }}>
-          <Icon name="edit" className="h-4 w-4 mr-px" />
+          <Icon name="edit" className="h-4 w-4 me-px" />
           {t('settings.common.actions.rename')}
         </Item>
       ) : null}
       <Item onClick={(e: React.MouseEvent) => { e.stopPropagation(); onDuplicate(); }}>
-        <Icon name="file-copy" className="h-4 w-4 mr-px" />
+        <Icon name="file-copy" className="h-4 w-4 me-px" />
         {t('settings.common.actions.duplicate')}
       </Item>
       <Item onClick={(e: React.MouseEvent) => { e.stopPropagation(); onDelete(); }} className="text-destructive focus:text-destructive">
-        <Icon name="delete-bin" className="h-4 w-4 mr-px" />
+        <Icon name="delete-bin" className="h-4 w-4 me-px" />
         {t('settings.common.actions.delete')}
       </Item>
     </>
@@ -480,13 +499,26 @@ const SkillListItem: React.FC<SkillListItemProps> = ({
       <div className="flex min-w-0 flex-1 items-center">
         <button
           onClick={onSelect}
-          className="flex min-w-0 flex-1 flex-col gap-0 rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="flex min-w-0 flex-1 flex-col gap-0 rounded-sm text-start focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           tabIndex={0}
         >
           <div className="flex items-center gap-1.5">
-            <span className="typography-ui-label font-normal truncate text-foreground">
+            <span className={cn('typography-ui-label font-normal truncate', off ? 'text-muted-foreground' : 'text-foreground')}>
               {skill.name}
             </span>
+            {off === 'switch' ? (
+              <span className="typography-micro shrink-0 text-muted-foreground" title={t('settings.skills.sidebar.switchedOffHint')}>
+                {t('settings.skills.sidebar.switchedOff')}
+              </span>
+            ) : null}
+            {off === 'policy' ? (
+              <span
+                className="typography-micro shrink-0 text-[var(--status-warning)]"
+                title={t('settings.skills.sidebar.blockedByPolicyHint')}
+              >
+                {t('settings.skills.sidebar.blockedByPolicy')}
+              </span>
+            ) : null}
           </div>
         </button>
 
@@ -494,7 +526,7 @@ const SkillListItem: React.FC<SkillListItemProps> = ({
           <DropdownMenuTrigger asChild>
             <Button size="sm"
               variant="ghost"
-              className="h-6 w-6 px-0 flex-shrink-0 -mr-1 opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100"
+              className="h-6 w-6 px-0 flex-shrink-0 -me-1 opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100"
             >
               <Icon name="more-2" className="h-3.5 w-3.5" />
             </Button>

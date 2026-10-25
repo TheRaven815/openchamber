@@ -1,4 +1,6 @@
 import { appendManagedPlugin } from './managed-plugin-config.js';
+import { isLimitFailoverConfigured } from '../limit-failover/policy.js';
+import { materializeSessionTitlePlugin } from './session-title-plugin.js';
 
 export const MANAGED_CONFIG_FILE_NAME = 'opencode.managed.json';
 
@@ -36,28 +38,30 @@ const DISABLED_BUILTIN_PLUGINS = ['-opencode.browser'];
  * @param {object} dependencies
  * @param {typeof import('node:fs/promises')} dependencies.fsPromises
  * @param {typeof import('node:path')} dependencies.path
- * @param {string} dependencies.dataDir OpenChamber data directory
+ * @param {string} dependencies.instanceDir this server's own directory (`instance-dir.js`)
  * @param {NodeJS.ProcessEnv} [dependencies.env] environment the managed child inherits
  * @param {object|null} [dependencies.agentToolRuntime]
+ * @param {object|null} [dependencies.limitFailoverRuntime] `../limit-failover/runtime.js`; its plugin calls back through the agent tool's address
  * @param {() => Promise<object|null>} dependencies.readSettings
  * @param {() => boolean} dependencies.isAgentMemoryAvailable
  */
 export const createManagedConfigRuntime = ({
   fsPromises,
   path,
-  dataDir,
+  instanceDir,
   env = process.env,
   agentToolRuntime = null,
+  limitFailoverRuntime = null,
   readSettings,
   isAgentMemoryAvailable,
 }) => {
-  const filePath = path.join(dataDir, MANAGED_CONFIG_FILE_NAME);
+  const filePath = path.join(instanceDir, MANAGED_CONFIG_FILE_NAME);
 
   /** The user owns `OPENCODE_CONFIG` when their environment already set it. */
   const ownsConfigFile = () => (env.OPENCODE_CONFIG ?? '').trim().length === 0;
 
   const writeConfigFile = async (pluginDirectories) => {
-    await fsPromises.mkdir(dataDir, { recursive: true });
+    await fsPromises.mkdir(instanceDir, { recursive: true });
     const text = `${JSON.stringify({ plugins: [...DISABLED_BUILTIN_PLUGINS, ...pluginDirectories] }, null, 2)}\n`;
     // Temp + rename: OpenCode reacts to the write immediately, and a partial
     // read would make it drop every managed plugin until the next change.
@@ -79,15 +83,24 @@ export const createManagedConfigRuntime = ({
   const materializeEnabledPlugins = async () => {
     const settings = await Promise.resolve(readSettings()).catch(() => null);
     const includeControl = settings?.agentControlToolEnabled !== false;
+    const includeSchedule = settings?.agentScheduleToolEnabled !== false;
     const includeWeb = settings?.agentWebToolEnabled !== false;
     const includeMemory = isAgentMemoryAvailable() && settings?.agentMemoryToolEnabled === true;
+    const includeKnowledge = settings?.agentKnowledgeToolEnabled !== false;
     const includeNotify = settings?.agentNotifyToolEnabled === true;
+    const includeRender = settings?.agentRenderToolEnabled !== false;
     const codeMode = settings?.agentToolsCodeMode === true;
 
     const directories = [];
-    if (agentToolRuntime && (includeControl || includeWeb || includeMemory || includeNotify)) {
-      directories.push(await agentToolRuntime.materializePlugin({ includeControl, includeWeb, includeMemory, includeNotify, codeMode }));
+    if (agentToolRuntime && (includeControl || includeSchedule || includeWeb || includeMemory || includeKnowledge || includeNotify || includeRender)) {
+      directories.push(await agentToolRuntime.materializePlugin({ includeControl, includeSchedule, includeWeb, includeMemory, includeKnowledge, includeNotify, includeRender, codeMode }));
     }
+    // Only while an option is on: otherwise every limit error would cost the
+    // plugin a round trip to hear "do nothing".
+    if (agentToolRuntime && limitFailoverRuntime && isLimitFailoverConfigured(settings)) {
+      directories.push(await limitFailoverRuntime.materializePlugin());
+    }
+    directories.push(await materializeSessionTitlePlugin({ fsPromises, path, instanceDir }));
     return directories;
   };
 

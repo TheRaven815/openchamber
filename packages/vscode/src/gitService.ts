@@ -12,8 +12,10 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { execGit as executeGit } from './bridge-git-process-runtime';
 import { readConfig } from './opencodeConfig';
+import { readProjectStartCommand } from '../../web/server/lib/opencode/project-start-command.js';
 import { resolveWorktreeDirectory } from './worktree-directory';
 import { readSubmoduleState, resolveGitPathTarget, type GitPathUnavailable, type GitSubmoduleState } from './gitPathDiff';
+import { parseGitRemoteListing, type GitRemote } from './gitRemoteListing';
 import type { API as GitAPI, Repository, GitExtension, Status } from './git.d';
 
 let gitApi: GitAPI | null = null;
@@ -346,8 +348,14 @@ function extractGitNumstatDestinationPath(filePath: string): string {
  * Check if a directory is a git repository
  */
 export async function checkIsGitRepository(directory: string): Promise<boolean> {
-  const result = await execGit(['rev-parse', '--is-inside-work-tree'], directory);
-  return result.exitCode === 0 && result.stdout.trim() === 'true';
+  const result = await execGit(['rev-parse', '--is-inside-work-tree', '--is-bare-repository'], directory);
+  if (result.exitCode !== 0) {
+    return false;
+  }
+  // A bare repository is not inside a work tree but is still a repository:
+  // its linked worktrees are the checkouts a user works in.
+  const [insideWorkTree, bare] = result.stdout.split('\n').map((line) => line.trim());
+  return insideWorkTree === 'true' || bare === 'true';
 }
 
 /**
@@ -571,7 +579,9 @@ async function getGitStatusRaw(directory: string): Promise<GitStatusResult> {
   // Deliberately `-uall`: the web server lists a large untracked directory as
   // one `dir/` entry (readStatus in web/server/lib/git/service.js) and the
   // shared UI explains such an entry; this runtime has not adopted that bound.
-  const statusResult = await execGit(['status', '--porcelain=v1', '-b', '-uall'], directory);
+  // `--no-optional-locks`: a status that refreshes the index holds
+  // `.git/index.lock`, and a terminal `git commit` then fails (#2229).
+  const statusResult = await execGit(['--no-optional-locks', 'status', '--porcelain=v1', '-b', '-uall'], directory);
   
   if (statusResult.exitCode !== 0) {
     return {
@@ -846,6 +856,7 @@ type WorktreeListEntry = {
   head?: string;
   branchRef?: string;
   branch?: string;
+  bare?: boolean;
 };
 
 interface GitWorktreeValidationError {
@@ -961,6 +972,14 @@ const parseWorktreePorcelain = (raw: string): WorktreeListEntry[] => {
       const branchRef = line.substring('branch '.length).trim();
       current.branchRef = branchRef;
       current.branch = cleanBranchName(branchRef);
+      continue;
+    }
+
+    // A bare repository lists itself as a worktree with a `bare` attribute
+    // and no HEAD or branch; without a working tree it is not a checkout a
+    // session can run in.
+    if (line === 'bare') {
+      current.bare = true;
     }
   }
 
@@ -1282,6 +1301,18 @@ const ensureOpenCodeProjectId = async (primaryWorktree: string): Promise<string>
   return projectId;
 };
 
+/**
+ * The primary checkout of a repository from its common git dir: `<root>/.git`
+ * for the checkout itself. Null for any other layout (a bare repository, a
+ * separate git dir).
+ */
+const primaryWorktreeRootFromGitDir = (gitDir: string): string | null => {
+  if (gitDir.replace(/\\/g, '/').endsWith('/.git')) {
+    return gitDir.slice(0, -'/.git'.length) || null;
+  }
+  return null;
+};
+
 const resolveWorktreeProjectContext = async (
   directory: string,
   options: { tolerateWorktreeRootConfigError?: boolean } = {},
@@ -1292,12 +1323,13 @@ const resolveWorktreeProjectContext = async (
     throw new Error('Directory is required');
   }
 
-  const topResult = await runGitCommandOrThrow(
-    directoryPath,
-    ['rev-parse', '--show-toplevel'],
-    'Failed to resolve git top-level directory'
-  );
-  const sandbox = path.resolve(directoryPath, topResult.stdout.trim());
+  const topResult = await runGitCommand(directoryPath, ['rev-parse', '--show-toplevel']);
+  // A bare repository has no work tree, so `--show-toplevel` fails there; the
+  // bare directory itself still answers the object-level commands worktree
+  // creation runs against it.
+  const sandbox = topResult.success
+    ? path.resolve(directoryPath, topResult.stdout.trim())
+    : directoryPath;
 
   const commonResult = await runGitCommandOrThrow(
     sandbox,
@@ -1305,7 +1337,10 @@ const resolveWorktreeProjectContext = async (
     'Failed to resolve git common directory'
   );
   const commonDir = path.resolve(sandbox, commonResult.stdout.trim());
-  const primaryWorktree = path.dirname(commonDir);
+  // `<root>/.git` resolves to the primary checkout; any other layout (a bare
+  // repository, a separate git dir) has no primary worktree, and the sandbox
+  // directory is the closest thing to one.
+  const primaryWorktree = primaryWorktreeRootFromGitDir(commonDir) || sandbox;
   const projectID = await ensureOpenCodeProjectId(primaryWorktree);
   // OpenCode's `worktree.directory` is read from the canonical checkout so a
   // linked worktree still sees the project's saved configuration. When unset,
@@ -1328,7 +1363,7 @@ const resolveWorktreeProjectContext = async (
   }
   const worktreeRoot = configuredWorktreeRoot || legacyWorktreeRoot;
 
-  return { projectID, sandbox, primaryWorktree, worktreeRoot, legacyWorktreeRoot };
+  return { projectID, requestedDirectory: directoryPath, sandbox, primaryWorktree, worktreeRoot, legacyWorktreeRoot };
 };
 
 const listWorktreeEntries = async (directory: string): Promise<WorktreeListEntry[]> => {
@@ -1497,18 +1532,6 @@ const runWorktreeStartCommand = async (directory: string, command: string): Prom
   }
 };
 
-const loadProjectStartCommand = async (projectID: string): Promise<string> => {
-  const storagePath = path.join(getOpenCodeDataPath(), 'storage', 'project', `${projectID}.json`);
-  try {
-    const raw = await fs.promises.readFile(storagePath, 'utf8');
-    const parsed = JSON.parse(raw) as { commands?: { start?: string } };
-    const start = typeof parsed?.commands?.start === 'string' ? parsed.commands.start.trim() : '';
-    return start || '';
-  } catch {
-    return '';
-  }
-};
-
 // OpenCode owns its own project/sandbox registry and records a worktree as a
 // sandbox itself when an instance boots for that directory. OpenChamber used to
 // write that state into OpenCode's storage JSON directly, behind the back of the
@@ -1555,8 +1578,10 @@ const cleanupFailedFastWorktreeCreate = async (
   }
 };
 
-const runWorktreeStartScripts = async (directory: string, projectID: string, startCommand: string | undefined) => {
-  const projectStart = await loadProjectStartCommand(projectID);
+// `projectDirectory` is the directory the worktree was requested from: the user
+// already works there, so OpenCode answers without starting another location.
+const runWorktreeStartScripts = async (directory: string, projectDirectory: string, startCommand: string | undefined) => {
+  const projectStart = await readProjectStartCommand(projectDirectory);
   if (projectStart) {
     const projectResult = await runWorktreeStartCommand(directory, projectStart);
     if (!projectResult.success) {
@@ -1577,7 +1602,7 @@ const runWorktreeStartScripts = async (directory: string, projectID: string, sta
 
 const queueWorktreeBootstrap = (args: {
   directory: string;
-  projectID: string;
+  projectDirectory: string;
   primaryWorktree: string;
   localBranch: string;
   setUpstream: boolean;
@@ -1589,7 +1614,7 @@ const queueWorktreeBootstrap = (args: {
 }) => {
   const {
     directory,
-    projectID,
+    projectDirectory,
     primaryWorktree,
     localBranch,
     setUpstream,
@@ -1618,7 +1643,7 @@ const queueWorktreeBootstrap = (args: {
         });
       }
       setWorktreeBootstrapState(directory, WORKTREE_BOOTSTRAP_PENDING, WORKTREE_PHASE_GIT_READY);
-      await runWorktreeStartScripts(directory, projectID, startCommand).catch((error) => {
+      await runWorktreeStartScripts(directory, projectDirectory, startCommand).catch((error) => {
         console.warn('[GitService] Worktree start script task failed:', error instanceof Error ? error.message : String(error));
       });
       setWorktreeBootstrapState(directory, WORKTREE_BOOTSTRAP_READY, WORKTREE_PHASE_SETUP_READY);
@@ -1724,18 +1749,23 @@ const applyUpstreamConfiguration = async (args: {
  */
 export async function listGitWorktrees(directory: string): Promise<GitWorktreeInfo[]> {
   const directoryPath = normalizeDirectoryPath(directory);
-  if (!directoryPath || !fs.existsSync(directoryPath) || !fs.existsSync(path.join(directoryPath, '.git'))) {
+  // No `.git` path check here: a bare repository's git dir is the directory
+  // itself, and git still lists its worktrees from there. A non-repository
+  // fails the git command below and reads as an empty list all the same.
+  if (!directoryPath || !fs.existsSync(directoryPath)) {
     return [];
   }
 
   try {
     const result = await runGitCommandOrThrow(directoryPath, ['worktree', 'list', '--porcelain'], 'Failed to list git worktrees');
-    return parseWorktreePorcelain(result.stdout).map((entry) => ({
-      head: entry.head || '',
-      name: path.basename(entry.worktree || ''),
-      branch: entry.branch || '',
-      path: entry.worktree,
-    }));
+    return parseWorktreePorcelain(result.stdout)
+      .filter((entry) => entry.bare !== true)
+      .map((entry) => ({
+        head: entry.head || '',
+        name: path.basename(entry.worktree || ''),
+        branch: entry.branch || '',
+        path: entry.worktree,
+      }));
   } catch (error) {
     console.warn('[GitService] Failed to list worktrees, returning empty list:', error instanceof Error ? error.message : String(error));
     return [];
@@ -2011,7 +2041,7 @@ async function attachGitWorktreeToCandidate(
 
   queueWorktreeBootstrap({
     directory: candidate.directory,
-    projectID: context.projectID,
+    projectDirectory: context.requestedDirectory,
     primaryWorktree: context.primaryWorktree,
     localBranch,
     setUpstream: shouldSetUpstream,
@@ -2258,6 +2288,52 @@ const disposeWorktreeInstanceBestEffort = async (
   }
 };
 
+// Mirrors packages/web/server/lib/git/service.js: any directory-scoped OpenCode
+// request for a folder of a worktree that is being removed starts that
+// folder's location again, local MCP servers included, and on Windows their
+// working directory keeps the folder from being deleted. The bridge proxy
+// holds such requests until the removal settles.
+type WorktreeRemoval = { root: string; settled: Promise<void> };
+const worktreeRemovalsInProgress = new Set<WorktreeRemoval>();
+
+// A requested folder need not exist; its nearest existing parent is resolved,
+// so a worktree reached through a symlink still matches.
+const canonicalPathOfExistingAncestor = async (input: string): Promise<string> => {
+  const absolutePath = path.resolve(input);
+  for (let current = absolutePath; ; current = path.dirname(current)) {
+    const realPath = await fs.promises.realpath(current).catch(() => null);
+    if (realPath !== null || path.dirname(current) === current) {
+      const normalized = path.normalize(path.join(realPath ?? current, path.relative(current, absolutePath)));
+      return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+    }
+  }
+};
+
+const trackWorktreeRemoval = (canonicalDirectory: string): (() => void) => {
+  let settle = () => {};
+  const removal = { root: canonicalDirectory, settled: new Promise<void>((resolve) => { settle = resolve; }) };
+  worktreeRemovalsInProgress.add(removal);
+  return () => {
+    worktreeRemovalsInProgress.delete(removal);
+    settle();
+  };
+};
+
+/**
+ * Resolves once no removal of a worktree holding `directory` is in progress;
+ * at once when none is.
+ */
+export async function waitForWorktreeRemoval(directory: string): Promise<void> {
+  if (worktreeRemovalsInProgress.size === 0) return;
+  const key = toBootstrapStateKey(directory);
+  if (!key) return;
+  const target = await canonicalPathOfExistingAncestor(key);
+  const pending = [...worktreeRemovalsInProgress]
+    .filter((removal) => isInsideOrSameDirectory(removal.root, target))
+    .map((removal) => removal.settled);
+  await Promise.all(pending);
+}
+
 // Mirrors packages/web/server/lib/git/service.js: Windows refuses to delete a
 // folder another process still holds (a session's shell, a file watcher, an
 // editor); those handles are usually released moments later, so a busy
@@ -2284,7 +2360,15 @@ const removeBusyDirectory = async (targetDirectory: string): Promise<void> => {
 
 // Resolves true when git removed the worktree, false when git dropped the
 // registration but left the folder behind (the caller removes it as an orphan).
-const removeGitWorktreeWhenFree = async (primaryWorktree: string, worktreePath: string, targetCanonical: string): Promise<boolean> => {
+// A busy folder is released again before the next attempt, git's or the
+// orphan removal's: a request that reached OpenCode after the first release
+// has started the folder again.
+const removeGitWorktreeWhenFree = async (
+  primaryWorktree: string,
+  worktreePath: string,
+  targetCanonical: string,
+  releaseInstance: () => Promise<void>,
+): Promise<boolean> => {
   for (let attempt = 0; ; attempt += 1) {
     const result = await runGitCommand(primaryWorktree, ['worktree', 'remove', '--force', worktreePath]);
     if (result.success) return true;
@@ -2298,9 +2382,13 @@ const removeGitWorktreeWhenFree = async (primaryWorktree: string, worktreePath: 
         break;
       }
     }
-    if (!stillRegistered) return false;
+    if (!stillRegistered) {
+      await releaseInstance();
+      return false;
+    }
     const delay = WORKTREE_BUSY_RETRY_DELAYS_MS[attempt];
     if (delay === undefined) throw new Error(WORKTREE_BUSY_MESSAGE);
+    await releaseInstance();
     await wait(delay);
   }
 };
@@ -2368,14 +2456,20 @@ export async function removeWorktree(directory: string, input: RemoveGitWorktree
     return true;
   }
 
+  const settleRemoval = trackWorktreeRemoval(targetCanonical);
   // The directory is a registered linked worktree and still exists here, which
   // is the only point where its OpenCode instance can be released by path.
-  await disposeWorktreeInstanceBestEffort(input?.disposeInstance, matchedEntry.worktree);
+  const releaseInstance = () => disposeWorktreeInstanceBestEffort(input?.disposeInstance, matchedEntry.worktree);
+  try {
+    await releaseInstance();
 
-  const removedByGit = await removeGitWorktreeWhenFree(context.primaryWorktree, matchedEntry.worktree, targetCanonical);
-  if (!removedByGit) {
-    // Git deleted its registration but not the still-locked folder.
-    await removeManagedOrphan({ registered: true });
+    const removedByGit = await removeGitWorktreeWhenFree(context.primaryWorktree, matchedEntry.worktree, targetCanonical, releaseInstance);
+    if (!removedByGit) {
+      // Git deleted its registration but not the still-locked folder.
+      await removeManagedOrphan({ registered: true });
+    }
+  } finally {
+    settleRemoval();
   }
 
   if (deleteLocalBranch) {
@@ -3709,12 +3803,6 @@ export async function setGitIdentity(
 
 // ============== Remote Operations ==============
 
-export interface GitRemote {
-  name: string;
-  fetchUrl: string;
-  pushUrl: string;
-}
-
 /**
  * Get list of remotes
  */
@@ -3723,27 +3811,7 @@ export async function getRemotes(directory: string): Promise<GitRemote[]> {
   if (result.exitCode !== 0) {
     return [];
   }
-
-  const remoteMap = new Map<string, GitRemote>();
-  const lines = result.stdout.split('\n').filter(Boolean);
-
-  for (const line of lines) {
-    const match = line.match(/^(\S+)\s+(\S+)\s+\((fetch|push)\)$/);
-    if (match) {
-      const [, name, url, type] = match;
-      if (!remoteMap.has(name)) {
-        remoteMap.set(name, { name, fetchUrl: '', pushUrl: '' });
-      }
-      const remote = remoteMap.get(name)!;
-      if (type === 'fetch') {
-        remote.fetchUrl = url;
-      } else {
-        remote.pushUrl = url;
-      }
-    }
-  }
-
-  return Array.from(remoteMap.values());
+  return parseGitRemoteListing(result.stdout);
 }
 
 export async function removeRemote(directory: string, remote: string): Promise<{ success: boolean }> {
@@ -4021,6 +4089,23 @@ async function canonicalizePath(filePath: string): Promise<string> {
   } catch {
     return path.resolve(filePath);
   }
+}
+
+/**
+ * Where `directory` sits inside its checkout: `ai` for `<checkout>/ai`, an empty
+ * string at the root. Git resolves symlinks for it, so the answer holds for a
+ * directory reached through one. Rejects when git cannot tell.
+ */
+export async function resolveRepositoryPrefix(directory: string): Promise<string> {
+  const directoryPath = normalizeDirectoryPath(directory);
+  if (!directoryPath) {
+    throw new Error('Directory is required');
+  }
+  const result = await runGitCommand(directoryPath, ['rev-parse', '--show-prefix']);
+  if (!result.success) {
+    throw new Error(result.stderr || 'Failed to resolve the repository folder');
+  }
+  return result.stdout.trim().replace(/\/+$/, '');
 }
 
 /**

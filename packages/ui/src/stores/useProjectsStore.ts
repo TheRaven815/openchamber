@@ -11,16 +11,18 @@ import { parseNonEmptyTrimmedString } from '@/lib/settings/parsers';
 import { getDeferredSafeStorage } from './utils/safeStorage';
 import { useDirectoryStore } from './useDirectoryStore';
 import { streamDebugEnabled } from '@/stores/utils/streamDebug';
-import { PROJECT_COLORS } from '@/lib/projectMeta';
+import { COLOR_PRESETS } from '@/lib/colorPresets';
 import { useSessionUIStore } from '@/sync/session-ui-store';
+import { getArchivedScopeKey } from '@/lib/sessionFolders/folderScopes';
+import { useSessionFoldersStore } from './useSessionFoldersStore';
 import { runtimeFetch } from '@/lib/runtime-fetch';
 import { getRuntimeApiBaseUrl } from '@/lib/runtime-switch';
 import { getVSCodeBootstrapConfig } from '@/lib/vscodeBootstrap';
 import { isVSCodeRuntime } from './utils/vscodeRuntime';
 
-/** Pick a color key that's least used among existing projects */
+/** Pick the preset colour least used among existing projects */
 const pickAutoColor = (projects: ProjectEntry[]): string => {
-  const colorKeys = PROJECT_COLORS.map((c) => c.key);
+  const colorKeys: string[] = [...COLOR_PRESETS];
   const usageCounts = new Map<string, number>();
   for (const key of colorKeys) {
     usageCounts.set(key, 0);
@@ -739,6 +741,14 @@ export const useProjectsStore = create<ProjectsStore>()(
       // Clean up worktree entries for the removed project
       if (project) {
         const normalizedPath = project.path.replace(/\\/g, '/').replace(/\/+$/, '') || '/';
+        // Its chat folders go for every client of the server: those of the
+        // project root, its archive and each of its worktrees.
+        const folderRoot = normalizePath(project.path);
+        if (folderRoot) {
+          const worktreeScopes = (useSessionUIStore.getState().availableWorktreesByProject.get(normalizedPath) ?? [])
+            .flatMap((worktree) => normalizePath(worktree.path) ?? []);
+          useSessionFoldersStore.getState().forgetScopes([folderRoot, getArchivedScopeKey(folderRoot), ...worktreeScopes]);
+        }
         useSessionUIStore.setState((s) => {
           const next = new Map(s.availableWorktreesByProject);
           next.delete(normalizedPath);
@@ -757,7 +767,7 @@ export const useProjectsStore = create<ProjectsStore>()(
           useDirectoryStore.getState().setDirectory(nextActive.path, { showOverlay: false });
         }
       } else {
-        void useDirectoryStore.getState().goHome();
+        void useDirectoryStore.getState().goToNoProjectDirectory();
       }
     },
 

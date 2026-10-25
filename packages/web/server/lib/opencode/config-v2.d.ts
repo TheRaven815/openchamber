@@ -1,3 +1,5 @@
+import type { z } from 'zod';
+
 export type PermissionEffect = 'allow' | 'deny' | 'ask';
 
 export interface PermissionRule {
@@ -173,6 +175,30 @@ export type WebSearchSelection = false | string | null;
 export function parseWebSearchSelection(value: unknown): WebSearchSelection | undefined;
 export function writeWebSearchSelection(config: Record<string, unknown>, selection: WebSearchSelection): boolean;
 export function writeWarmingEnabled(config: Record<string, unknown>, enabled: boolean): boolean;
+/** OpenCode's `warming` key: on with defaults, or tuned. */
+export interface OpenCodeWarmingConfig {
+  warming?: boolean | { prompt?: string; interval?: string; duration?: string };
+}
+export function writeWarmingDuration(config: OpenCodeWarmingConfig, minutes: number): boolean;
+/** A skill switch request: an OpenCode skill id (no wildcards, no path separators), on or off, and the skill's scope. */
+export const skillSwitchRequestSchema: z.ZodObject<{
+  id: z.ZodString;
+  enabled: z.ZodBoolean;
+  scope: z.ZodEnum<{ user: 'user'; project: 'project' }>;
+}>;
+/** One OpenCode policy statement as a config file holds it. */
+export interface OpenCodePolicyStatement {
+  action?: string;
+  resource?: string;
+  effect?: string;
+}
+/** The keys of an OpenCode config file a skill switch edits. */
+export interface OpenCodePolicyConfig {
+  policies?: OpenCodePolicyStatement[];
+  experimental?: { policies?: OpenCodePolicyStatement[] };
+}
+/** Adds (`disabled`) or removes the exact `skill:<id>` deny in one config object; returns whether it changed. */
+export function writeSkillDisabled(config: OpenCodePolicyConfig, id: string, disabled: boolean): boolean;
 export interface WebSearchConfigLayers {
   userConfig: object | null;
   projectConfig: object | null;

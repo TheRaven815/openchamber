@@ -1,5 +1,6 @@
 import type { Message, Part } from "@/lib/opencode/model"
-import type { MessagePage } from "@/lib/opencode/client"
+import type { MessagePage, PendingInboxMessage } from "@/lib/opencode/client"
+import { olderMessagesCursor } from "@/lib/opencode/messageCursor"
 import type { ChildStoreManager, DirectoryStore } from "./child-store"
 import { retry } from "./retry"
 import { mergeOptimisticPage, type OptimisticItem } from "./optimistic"
@@ -30,11 +31,20 @@ const HISTORY_TURN_ALIGNMENT_EXTRA_PAGES = 2
 // Cold navigation aims for this many user-led turns within the expansion bounds.
 const INITIAL_USER_TURNS = 10
 const CONSTRAINED_SESSION_CACHE_LIMIT = 6
-// Cold navigation extends the first page backward through the cursor, one
-// page at a time, until INITIAL_USER_TURNS prompts are present or this many
-// records are held. Nothing already downloaded is requested again.
+// Cold navigation extends the first page backward through the cursor until
+// INITIAL_USER_TURNS prompts are present or this many records are held. The
+// ceiling never stops it before the newest prompt. Nothing already downloaded
+// is requested again.
 const INITIAL_WINDOW_MAX_RECORDS = 300
 const CONSTRAINED_INITIAL_WINDOW_MAX_RECORDS = 200
+// OpenCode rejects a message page larger than this.
+const MAX_MESSAGE_PAGE_SIZE = 200
+// An extension page is sized from the turn density already fetched, with this
+// headroom so uneven turns rarely need one more round trip.
+const EXTENSION_ESTIMATE_HEADROOM = 1.2
+// Tail read that confirms a cached transcript after a stream gap. It usually
+// overlaps the cache; when it does not, the window is read back further.
+const STALE_HISTORY_TAIL_LIMIT = 30
 
 export type SessionMessageTarget = {
   directory: string
@@ -57,6 +67,7 @@ export type SessionMessageLoadState = {
 }
 
 type LoaderEntry = {
+  target: SessionMessageTarget
   snapshot: SessionMessageLoadState
   listeners: Set<() => void>
   inflight: Promise<void> | null
@@ -65,6 +76,23 @@ type LoaderEntry = {
   optimistic: Map<string, OptimisticItem>
   /** History was dropped by retention; events since then are not coverage. */
   evicted: boolean
+  /**
+   * The loader's history epoch at the start of the last authoritative read
+   * that confirmed this transcript. Older than the current epoch means a
+   * stream gap may have hidden changes from it.
+   */
+  verifiedEpoch: number
+  /**
+   * The newest cached record when the first stream gap after the last
+   * confirmation happened. Records before it are known contiguous; records
+   * after it may have arrived by live events with a hole behind them, so a
+   * stale tail refresh joins the cache only through this record.
+   */
+  gapAnchorID: string | null
+  /** The session's pending inbox was read into this entry since it was opened. */
+  inboxSeeded: boolean
+  /** Ids painted from the inbox; a replacing window must not drop them. */
+  inboxSeededIDs: Set<string>
 }
 
 type FetchedPage = {
@@ -87,14 +115,32 @@ type LoadPerformanceDetails = {
 export type SessionMessagePageSource = {
   getSessionMessages(
     id: string,
-    options?: { limit?: number; cursor?: string; order?: "asc" | "desc" },
+    options?: { limit?: number; cursor?: string; order?: "asc" | "desc"; partShells?: boolean },
     directory?: string | null,
   ): Promise<MessagePage>
+  /**
+   * Pending inbox items for one session, when the runtime can read them. A
+   * cold load uses this to repaint messages the live `session.inbox.*` events
+   * added while the client was open.
+   */
+  getSessionInbox?(id: string, directory?: string | null): Promise<readonly PendingInboxMessage[]>
 }
 
 type LoaderConfiguration = {
   sdk: SessionMessagePageSource
   runtimeKey: string
+}
+
+/** OpenCode's first connection of the page (`openCodeStartupSignal`). */
+type OpenCodeStartupSignal = {
+  isStarting(): boolean
+  /** Resolves on the first connection; rejects when OpenCode does not come up. */
+  waitForConnection(): Promise<void>
+}
+
+const NO_OPENCODE_STARTUP: OpenCodeStartupSignal = {
+  isStarting: () => false,
+  waitForConnection: () => Promise.resolve(),
 }
 
 const isConstrainedRuntime = () => isVSCodeRuntime() || isMobileSurfaceRuntime()
@@ -109,12 +155,67 @@ const isUserMessage = (message: Message): boolean => message.role === "user"
 
 const hasUserMessage = (messages: Message[]): boolean => messages.some(isUserMessage)
 
-const hasInitialTurns = (messages: Message[]): boolean => {
+const countUserMessages = (messages: Message[]): number => {
   let turns = 0
-  for (const message of messages) {
-    if (isUserMessage(message) && ++turns === INITIAL_USER_TURNS) return true
+  for (const message of messages) if (isUserMessage(message)) turns += 1
+  return turns
+}
+
+const hasInitialTurns = (messages: Message[]): boolean => countUserMessages(messages) >= INITIAL_USER_TURNS
+
+/**
+ * Where a transcript that outgrew the cold-navigation window is cut back to
+ * it: the index of the prompt the kept records start with, or -1 when
+ * nothing goes. The kept window follows the cold-navigation rule (ten
+ * prompts, or the record ceiling once at least the newest prompt is in), so a
+ * cut always falls on a turn boundary, and only the window is walked. The
+ * prompt's context carriers (the `synthetic` records sent right before it)
+ * stay with it: its chips, and a revert or fork that cuts at the first
+ * carrier, need them.
+ */
+const findHistoryTrimIndex = (messages: Message[]): number => {
+  const maxRecords = getInitialWindowMaxRecords()
+  let prompts = 0
+  let cut = -1
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (!isUserMessage(messages[index])) continue
+    prompts += 1
+    if (prompts >= INITIAL_USER_TURNS || messages.length - index >= maxRecords) {
+      cut = index
+      break
+    }
   }
-  return false
+  while (cut > 0 && messages[cut - 1].role === "synthetic") cut -= 1
+  return cut > 0 ? cut : -1
+}
+
+/**
+ * Drops the cached records a replacing window no longer covers, so older
+ * cached history cannot sit behind a hole. Kept: records the window carries,
+ * optimistic records, and records newer than the window, which arrived live
+ * while it was read.
+ */
+const withoutHistoryOutsideWindow = (
+  state: DirectoryStore,
+  sessionID: string,
+  page: FetchedPage,
+  optimistic: ReadonlyMap<string, OptimisticItem>,
+  preserved: ReadonlySet<string>,
+): DirectoryStore => {
+  const messages = state.message[sessionID]
+  if (!messages) return state
+  const pageIDs = new Set(page.session.map((message) => message.id))
+  const newestWindowTime = page.session.at(-1)?.time.created ?? Number.NEGATIVE_INFINITY
+  const dropped: string[] = []
+  const kept = messages.filter((message) => {
+    if (pageIDs.has(message.id) || optimistic.has(message.id) || preserved.has(message.id) || message.time.created > newestWindowTime) return true
+    dropped.push(message.id)
+    return false
+  })
+  if (dropped.length === 0) return state
+  const part = { ...state.part }
+  for (const messageID of dropped) delete part[messageID]
+  return { ...state, message: { ...state.message, [sessionID]: kept }, part }
 }
 
 /**
@@ -164,16 +265,21 @@ export class SessionMessageLoader {
   private sdk: SessionMessagePageSource
   private runtimeKey: string
   private sdkEpoch = 0
+  /** Advances on every stream gap; see `markHistoryStale`. */
+  private historyEpoch = 0
   private disposed = false
   private readonly entries = new Map<string, LoaderEntry>()
   private retention: SessionCacheRetention | null = null
   private releaseDerivedCache: (target: SessionMessageTarget) => void = () => undefined
   private readonly historyReaders = new Map<string, number>()
   private readonly renderedSessions = new Map<string, number>()
+  /** Timelines scrolled away from the end; they keep `trimHistory` off. */
+  private readonly historyBrowsers = new Map<string, number>()
 
   constructor(
     private readonly childStores: ChildStoreManager,
     configuration: LoaderConfiguration,
+    private readonly openCodeStartup: OpenCodeStartupSignal = NO_OPENCODE_STARTUP,
   ) {
     this.sdk = configuration.sdk
     this.runtimeKey = configuration.runtimeKey
@@ -255,12 +361,18 @@ export class SessionMessageLoader {
     if (normalized) this.retention?.schedule(normalized)
   }
 
-  /** Hold history for an imperative reader or a transcript still on screen. */
-  retainSessionHistory(target: SessionMessageTarget, reason: "read" | "rendered" = "read"): () => void {
+  /**
+   * Hold history for an imperative reader, a transcript still on screen, or a
+   * timeline whose reader is away from its end (`browsing`, which only keeps
+   * `trimHistory` from cutting what that reader may be looking at).
+   */
+  retainSessionHistory(target: SessionMessageTarget, reason: "read" | "rendered" | "browsing" = "read"): () => void {
     const normalized = this.normalizeTarget(target)
     if (!normalized) return () => undefined
     const key = this.keyFor(normalized)
-    const holders = reason === "rendered" ? this.renderedSessions : this.historyReaders
+    const holders = reason === "rendered"
+      ? this.renderedSessions
+      : reason === "browsing" ? this.historyBrowsers : this.historyReaders
     holders.set(key, (holders.get(key) ?? 0) + 1)
     let released = false
     return () => {
@@ -271,6 +383,48 @@ export class SessionMessageLoader {
       else holders.delete(key)
       this.scheduleCacheRetention(normalized.directory)
     }
+  }
+
+  /**
+   * Cuts a transcript that outgrew the cold-navigation window back to that
+   * window, the way it would open cold. The dropped turns stay reachable:
+   * coverage moves to a cursor below the oldest kept prompt, so loading older
+   * history reads them again. The caller decides when the reader cannot see
+   * the cut (`ChatContainer` asks after a turn starts or ends, with the reader
+   * at the end). Nothing is cut while a load runs, while a history reader
+   * holds the transcript or another timeline browses it, while a revert is
+   * pending, after a stream gap the transcript was not confirmed since (it
+   * may hold a hole the cursor would hide), or at a record the server has not
+   * confirmed. Returns whether anything was cut.
+   */
+  trimHistory(target: SessionMessageTarget): boolean {
+    const normalized = this.normalizeTarget(target)
+    if (!normalized || this.disposed) return false
+    const key = this.keyFor(normalized)
+    const entry = this.entries.get(key)
+    if (!entry || entry.snapshot.status !== "ready" || !entry.snapshot.resolved || entry.inflight || entry.evicted) return false
+    if (this.historyReaders.get(key) || this.historyBrowsers.get(key) || entry.verifiedEpoch < this.historyEpoch) return false
+    const store = this.childStores.getChild(normalized.directory)
+    if (!store) return false
+    const current = store.getState()
+    const messages = current.message[normalized.sessionID]
+    if (!messages) return false
+    // A pending revert hides the transcript's tail behind its marker; a cut
+    // counted over the hidden turns could drop the marker and show them again.
+    if (current.session.find((session) => session.id === normalized.sessionID)?.revert) return false
+    const cut = findHistoryTrimIndex(messages)
+    if (cut < 0 || entry.optimistic.has(messages[cut].id)) return false
+    const part = { ...current.part }
+    for (let index = 0; index < cut; index += 1) delete part[messages[index].id]
+    store.setState({ message: { ...current.message, [normalized.sessionID]: messages.slice(cut) }, part })
+    this.patchEntry(entry, {
+      limit: messages.length - cut,
+      cursor: olderMessagesCursor(messages[cut].id),
+      complete: false,
+      updatedAt: Date.now(),
+    })
+    this.persistCoverage(normalized, entry.snapshot)
+    return true
   }
 
   private evictSessionHistory(target: SessionMessageTarget): void {
@@ -301,6 +455,7 @@ export class SessionMessageLoader {
     const entry = this.getEntry(normalized)
     this.bumpGeneration(entry)
     entry.inflight = null
+    entry.verifiedEpoch = this.historyEpoch
     store.setState({ message: { ...current.message, [normalized.sessionID]: [] } })
     this.patchEntry(entry, {
       status: "ready",
@@ -335,19 +490,90 @@ export class SessionMessageLoader {
           limit: Math.max(entry.snapshot.limit, store.getState().message[normalized.sessionID]?.length ?? 0),
         })
       }
+      // A prefetched transcript renders without this open reading history, so
+      // the first real open still has to restore the pending inbox.
+      if (options?.reason !== "prefetch" && !entry.inboxSeeded) {
+        const generation = entry.snapshot.generation
+        const sdkEpoch = this.sdkEpoch
+        void this.seedPendingInbox(normalized, entry, store, () => (
+          !this.disposed
+          && this.sdkEpoch === sdkEpoch
+          && entry.snapshot.generation === generation
+          && this.childStores.getChild(normalized.directory) === store
+        ))
+      }
+      // The cached transcript renders now; a gap-stale one refreshes behind it.
+      if (options?.reason !== "prefetch" && this.revalidateIfStale(normalized)) return Promise.resolve()
       return entry.inflight ?? Promise.resolve()
     }
     if (entry.inflight) {
-      if (options?.reason !== "prefetch" && entry.snapshot.loadingKind === "prefetch") {
-        this.patchEntry(entry, { loadingKind: "initial" })
-      }
-      return entry.inflight
+      const promoting = options?.reason !== "prefetch" && entry.snapshot.loadingKind === "prefetch"
+      if (!promoting) return entry.inflight
+      this.patchEntry(entry, { loadingKind: "initial" })
+      const generation = entry.snapshot.generation
+      const sdkEpoch = this.sdkEpoch
+      const inflight = entry.inflight
+      // The prefetch ran loadInitial with the inbox read disabled; the open
+      // that promoted it still has to restore the pending items once it lands.
+      return inflight.then(async () => {
+        if (this.disposed || this.sdkEpoch !== sdkEpoch || entry.snapshot.generation !== generation) return
+        if (this.childStores.getChild(normalized.directory) !== store || entry.inboxSeeded) return
+        await this.seedPendingInbox(normalized, entry, store, () => (
+          !this.disposed
+          && this.sdkEpoch === sdkEpoch
+          && entry.snapshot.generation === generation
+        ))
+      })
     }
     if (options?.force) this.bumpGeneration(entry)
     const kind: SessionMessageLoadKind = options?.reason === "prefetch" ? "prefetch" : "initial"
+    // A session opened before OpenCode is ready (the launch reopening the
+    // last session, a link) reads at once: OpenCode may already answer. If
+    // that read fails, the failure says nothing about the session, so the
+    // load stays loading and reads once more when OpenCode connects. Only a
+    // failure after that, or OpenCode not starting at all, becomes an error.
+    // A prefetch does not wait, unless a foreground caller joined it since.
+    const startedBeforeOpenCode = this.openCodeStartup.isStarting()
     return this.startLoad(normalized, entry, store, kind, async (isCurrent, performance) => {
-      await this.loadInitial(normalized, entry, store, isCurrent, performance)
+      try {
+        await this.loadInitial(normalized, entry, store, isCurrent, performance, kind !== "prefetch")
+      } catch (error) {
+        if (!startedBeforeOpenCode || entry.snapshot.loadingKind === "prefetch" || !isCurrent()) throw error
+        await this.openCodeStartup.waitForConnection()
+        if (!isCurrent()) return
+        await this.loadInitial(normalized, entry, store, isCurrent, performance, kind !== "prefetch")
+      }
     })
+  }
+
+  /**
+   * The event stream had a gap: any cached transcript may have missed
+   * changes. Each one refreshes its tail the next time it is opened.
+   */
+  markHistoryStale(): void {
+    for (const entry of this.entries.values()) {
+      // An entry already stale keeps the anchor of its first gap: an older
+      // anchor only makes the tail read back further.
+      if (!entry.snapshot.resolved || entry.verifiedEpoch < this.historyEpoch) continue
+      const messages = this.childStores.getChild(entry.target.directory)?.getState().message[entry.target.sessionID] ?? []
+      const confirmed = messages.filter((message) => !entry.optimistic.has(message.id))
+      entry.gapAnchorID = confirmed.at(-1)?.id ?? null
+    }
+    this.historyEpoch += 1
+  }
+
+  /**
+   * Refreshes a cached transcript in the background when a stream gap
+   * happened after it was last confirmed. Returns whether a refresh started.
+   * A failed refresh keeps the cached records and the stale mark.
+   */
+  revalidateIfStale(target: SessionMessageTarget): boolean {
+    const normalized = this.normalizeTarget(target)
+    if (!normalized || this.disposed) return false
+    const entry = this.entries.get(this.keyFor(normalized))
+    if (!entry?.snapshot.resolved || entry.inflight || entry.verifiedEpoch >= this.historyEpoch) return false
+    void this.refreshTail(normalized, STALE_HISTORY_TAIL_LIMIT)
+    return true
   }
 
   prefetch(target: SessionMessageTarget): Promise<void> {
@@ -379,9 +605,12 @@ export class SessionMessageLoader {
       const visited = new Set([cursor])
       // An interactive batch tries to start on a user prompt so the oldest
       // visible turn is whole. Every fetched record is kept, and the server
-      // cursor stays authoritative; the extra reads are bounded.
-      for (let extra = 0; mode === "interactive" && extra < HISTORY_TURN_ALIGNMENT_EXTRA_PAGES; extra += 1) {
+      // cursor stays authoritative. Alignment reads are bounded, except that a
+      // batch holding no prompt at all would add nothing visible: it keeps
+      // reading until the turn's prompt arrives.
+      for (let extra = 0; mode === "interactive"; extra += 1) {
         if (page.complete || !page.session[0] || isUserMessage(page.session[0])) break
+        if (extra >= HISTORY_TURN_ALIGNMENT_EXTRA_PAGES && hasUserMessage(page.session)) break
         if (!page.cursor || visited.has(page.cursor)) throw new Error("Session history pagination made no progress")
         visited.add(page.cursor)
         const older = await this.fetchPage(normalized, HISTORY_MESSAGE_PAGE_SIZE, page.cursor, "older", performance)
@@ -474,28 +703,54 @@ export class SessionMessageLoader {
     const store = this.childStores.ensureChild(normalized.directory, { bootstrap: false })
     this.bumpGeneration(entry)
     return this.startLoad(normalized, entry, store, "refresh", async (isCurrent, performance) => {
+      const epoch = this.historyEpoch
       const previousCoverage = entry.snapshot.resolved
         ? { cursor: entry.snapshot.cursor, complete: entry.snapshot.complete }
         : null
-      const page = await this.fetchPage(normalized, Math.max(1, limit), undefined, "refresh", performance)
+      // The tail must join the cached history. When more records arrived
+      // than the tail holds, merging it would leave a hole behind it: read
+      // back until it joins, or replace the cache with a fresh window.
+      // Without a gap the cache is contiguous, so any record cached before
+      // this read is a join point. After a gap, records that arrived by live
+      // events may sit past a hole, so only the gap anchor is; a stale entry
+      // without one cannot prove a join and takes a fresh window.
+      const joinIDs = entry.verifiedEpoch < epoch
+        ? new Set(entry.gapAnchorID ? [entry.gapAnchorID] : [])
+        : new Set((store.getState().message[normalized.sessionID] ?? [])
+          .filter((message) => !entry.optimistic.has(message.id))
+          .map((message) => message.id))
+      let page = await this.fetchPage(normalized, Math.max(1, limit), undefined, "refresh", performance)
       if (!isCurrent()) return
-      const committed = this.commitPage(normalized, entry, store, page, "merge", isCurrent)
+      let replacesCache = false
+      if (previousCoverage) {
+        const joinsCache = (window: FetchedPage) => window.session.some((message) => joinIDs.has(message.id))
+        const window = await this.extendWindow(normalized, page, {
+          isSatisfied: (candidate) => joinsCache(candidate) || hasInitialTurns(candidate.session),
+          targetTurns: INITIAL_USER_TURNS,
+        }, isCurrent, performance)
+        if (!window) return
+        page = window
+        replacesCache = !page.complete && !joinsCache(page)
+      }
+      const committed = this.commitPage(normalized, entry, store, page, replacesCache ? "replace" : "merge", isCurrent)
       if (!committed || !isCurrent()) return
-      const coverage = previousCoverage ?? page
+      entry.verifiedEpoch = Math.max(entry.verifiedEpoch, epoch)
+      // A tail that joins the cache uses a deliberately small window: its
+      // cursor describes only that window and must not replace the
+      // established coverage, unless the tail holds the whole history.
+      const coverage = replacesCache || page.complete || !previousCoverage ? page : previousCoverage
       this.patchEntry(entry, {
         status: "ready",
         loadingKind: null,
         error: null,
         resolved: true,
-        limit: Math.max(entry.snapshot.limit, committed.messages.length),
-        // A tail refresh uses a deliberately small window. Its cursor only
-        // describes that window, so it must not replace the established
-        // history coverage and spuriously expose "load older".
+        limit: replacesCache ? committed.messages.length : Math.max(entry.snapshot.limit, committed.messages.length),
         cursor: coverage.cursor,
         complete: coverage.complete,
         updatedAt: Date.now(),
       })
       this.persistCoverage(normalized, entry.snapshot)
+      await this.seedPendingInbox(normalized, entry, store, isCurrent)
     })
   }
 
@@ -552,7 +807,14 @@ export class SessionMessageLoader {
     this.getEntry(target).optimistic.delete(input.messageID)
   }
 
-  /** Revert commits preserve only the optimistic records still in the reduced transcript. */
+  /**
+   * Revert commits preserve only the optimistic records still in the reduced
+   * transcript. A revert cuts the tail, so when a confirmed record survives
+   * the cut, the window still starts where it did and its older-history
+   * coverage (cursor, complete) still holds: a reset would read as "nothing
+   * older" and take away the way to it. A cut that took every confirmed
+   * record leaves no window to describe, and coverage starts over.
+   */
   invalidateSession(target: SessionMessageTarget, preservedMessages: readonly Message[] = []): void {
     const normalized = this.normalizeTarget(target)
     if (!normalized) return
@@ -565,7 +827,11 @@ export class SessionMessageLoader {
     for (const messageID of entry.optimistic.keys()) {
       if (!preservedIDs.has(messageID)) entry.optimistic.delete(messageID)
     }
-    entry.snapshot = createDefaultState(entry.snapshot.generation)
+    const windowSurvives = entry.snapshot.resolved
+      && preservedMessages.some((message) => !entry.optimistic.has(message.id))
+    entry.snapshot = windowSurvives
+      ? { ...entry.snapshot, status: "ready", loadingKind: null, error: null }
+      : createDefaultState(entry.snapshot.generation)
     this.notify(entry)
   }
 
@@ -615,6 +881,7 @@ export class SessionMessageLoader {
     if (existing) return existing
     const prefetched = getSessionPrefetch(target.directory, target.sessionID, this.runtimeKey)
     const entry: LoaderEntry = {
+      target: { directory: target.directory, sessionID: target.sessionID },
       snapshot: prefetched
         ? {
             ...createDefaultState(),
@@ -632,6 +899,11 @@ export class SessionMessageLoader {
       queuedRefreshLimit: 0,
       optimistic: new Map(),
       evicted: false,
+      // Unknown provenance: confirmed only as of the loader's first epoch.
+      verifiedEpoch: 0,
+      gapAnchorID: null,
+      inboxSeeded: false,
+      inboxSeededIDs: new Set(),
     }
     this.entries.set(key, entry)
     return entry
@@ -707,39 +979,26 @@ export class SessionMessageLoader {
     store: { getState: () => DirectoryStore; setState: DirectoryStoreSetter },
     isCurrent: () => boolean,
     performance?: LoadPerformanceDetails,
+    seedInbox = true,
   ): Promise<void> {
+    const epoch = this.historyEpoch
     const storeMessageCount = store.getState().message[target.sessionID]?.length ?? 0
     // Cold navigation aims for several whole turns; history readers and
     // sessions that already hold messages only need one user boundary.
     const coldNavigation = (storeMessageCount === 0 || entry.evicted) && !this.historyReaders.get(this.keyFor(target))
-    const hasBoundary = coldNavigation ? hasInitialTurns : hasUserMessage
     const firstLimit = Math.max(entry.snapshot.limit, storeMessageCount, getInitialPageSize())
     const firstPage = await this.fetchPage(target, firstLimit, undefined, "initial-page", performance)
     if (!isCurrent()) return
-    let acceptedPage = firstPage
-
-    const visited = new Set<string>()
-    while (!acceptedPage.complete && !hasBoundary(acceptedPage.session)
-      && acceptedPage.session.length < getInitialWindowMaxRecords()) {
-      const cursor = acceptedPage.cursor
-      if (!cursor || visited.has(cursor)) break
-      visited.add(cursor)
-      const remaining = getInitialWindowMaxRecords() - acceptedPage.session.length
-      const older = await this.fetchPage(target, Math.min(HISTORY_MESSAGE_PAGE_SIZE, remaining), cursor, "initial-page", performance)
-      if (!isCurrent()) return
-      if (older.session.length === 0 && !older.complete) break
-      acceptedPage = {
-        session: [...older.session, ...acceptedPage.session],
-        partsByMessageID: new Map([...acceptedPage.partsByMessageID, ...older.partsByMessageID]),
-        cursor: older.cursor,
-        complete: older.complete,
-      }
-    }
+    const acceptedPage = await this.extendWindow(target, firstPage, coldNavigation
+      ? { isSatisfied: (window) => hasInitialTurns(window.session), targetTurns: INITIAL_USER_TURNS }
+      : { isSatisfied: (window) => hasUserMessage(window.session), targetTurns: 1 }, isCurrent, performance)
+    if (!acceptedPage) return
 
     // Publish the chosen window once.
     const committed = this.commitPage(target, entry, store, acceptedPage, "merge", isCurrent)
     if (!committed || !isCurrent()) return
     entry.evicted = false
+    entry.verifiedEpoch = Math.max(entry.verifiedEpoch, epoch)
     this.patchEntry(entry, {
       status: "ready",
       loadingKind: null,
@@ -751,6 +1010,102 @@ export class SessionMessageLoader {
       updatedAt: Date.now(),
     })
     this.persistCoverage(target, entry.snapshot)
+    if (seedInbox) await this.seedPendingInbox(target, entry, store, isCurrent)
+  }
+
+  /**
+   * Extends a newest-first window backward through the server cursor until
+   * `isSatisfied` holds, history is complete, or the window reaches the record
+   * ceiling. The ceiling never stops it before the newest prompt: a window
+   * without one has no turn to render. Each extension page is sized from the
+   * turn density fetched so far, so a long session needs one more round trip,
+   * not one per hundred records. Returns null when the read went stale.
+   */
+  private async extendWindow(
+    target: SessionMessageTarget,
+    firstPage: FetchedPage,
+    goal: { isSatisfied: (window: FetchedPage) => boolean; targetTurns: number },
+    isCurrent: () => boolean,
+    performance?: LoadPerformanceDetails,
+  ): Promise<FetchedPage | null> {
+    let window = firstPage
+    const visited = new Set<string>()
+    while (!window.complete && !goal.isSatisfied(window)) {
+      const held = window.session.length
+      const turns = countUserMessages(window.session)
+      const remaining = getInitialWindowMaxRecords() - held
+      if (turns > 0 && remaining <= 0) break
+      const cursor = window.cursor
+      if (!cursor || visited.has(cursor)) break
+      visited.add(cursor)
+      const estimate = turns > 0
+        ? Math.ceil((held * goal.targetTurns * EXTENSION_ESTIMATE_HEADROOM) / turns) - held
+        : MAX_MESSAGE_PAGE_SIZE
+      const limit = turns > 0 ? Math.max(1, Math.min(estimate, remaining)) : estimate
+      const older = await this.fetchPage(target, limit, cursor, "initial-page", performance)
+      if (!isCurrent()) return null
+      if (older.session.length === 0 && !older.complete) break
+      window = {
+        session: [...older.session, ...window.session],
+        partsByMessageID: new Map([...window.partsByMessageID, ...older.partsByMessageID]),
+        cursor: older.cursor,
+        complete: older.complete,
+      }
+    }
+    return window
+  }
+
+  /**
+   * Repaints the messages that a session's pending OpenCode inbox items stand
+   * for.
+   *
+   * `session.inbox.enqueued` adds them live, but the inbox is not part of the
+   * message history: a cold load (a refresh, another device, a remounted
+   * route) showed nothing while OpenCode still held the items, and later
+   * admitted every one at once. Best effort — a failed read leaves the loaded
+   * transcript exactly as it was.
+   */
+  private async seedPendingInbox(
+    target: SessionMessageTarget,
+    entry: LoaderEntry,
+    store: { getState: () => DirectoryStore; setState: DirectoryStoreSetter },
+    isCurrent: () => boolean,
+  ): Promise<void> {
+    const read = this.sdk.getSessionInbox?.bind(this.sdk)
+    if (!read) return
+    let items: readonly PendingInboxMessage[]
+    try {
+      items = await read(target.sessionID, target.directory)
+    } catch {
+      return
+    }
+    if (!isCurrent()) return
+    entry.inboxSeeded = true
+    if (items.length === 0) return
+    try {
+      const current = store.getState()
+      const messages = [...(current.message[target.sessionID] ?? [])]
+      const held = new Set(messages.map((message) => message.id))
+      const parts = { ...current.part }
+      let changed = false
+      for (const { info, parts: itemParts } of items) {
+        // A live event (or an earlier seed) already painted this item.
+        if (held.has(info.id)) continue
+        messages.push(info)
+        if (itemParts) parts[info.id] = itemParts
+        entry.inboxSeededIDs.add(info.id)
+        held.add(info.id)
+        changed = true
+      }
+      if (!changed) return
+      store.setState({
+        message: { ...current.message, [target.sessionID]: sortMessagesChronologically(messages) },
+        part: parts,
+      })
+    } catch {
+      // A malformed item must not turn an already loaded transcript into an
+      // error; the read succeeded, so this open does not retry it.
+    }
   }
 
   /**
@@ -760,11 +1115,12 @@ export class SessionMessageLoader {
    */
   private async fetchPage(
     target: SessionMessageTarget,
-    limit: number,
+    requestedLimit: number,
     cursor?: string,
     caller: "initial-page" | "older" | "refresh" = "initial-page",
     performance?: LoadPerformanceDetails,
   ): Promise<FetchedPage> {
+    const limit = Math.min(Math.max(1, requestedLimit), MAX_MESSAGE_PAGE_SIZE)
     const finishPagePerformance = startSessionLoadPerformanceEvent({
       operation: "session-messages.page",
       caller,
@@ -776,7 +1132,9 @@ export class SessionMessageLoader {
     try {
       const page = await retry(async () => {
         attempts += 1
-        return this.sdk.getSessionMessages(target.sessionID, { limit, cursor }, target.directory)
+        // Finished tool results arrive as shells; a row that shows one
+        // completes its message (`tool-content-completion.ts`).
+        return this.sdk.getSessionMessages(target.sessionID, { limit, cursor, partShells: true }, target.directory)
       })
       const records = page.items.filter((record) => Boolean(record?.info?.id))
       recordCount = records.length
@@ -802,11 +1160,13 @@ export class SessionMessageLoader {
     entry: LoaderEntry,
     store: { getState: () => DirectoryStore; setState: DirectoryStoreSetter },
     page: FetchedPage,
-    mode: "merge" | "prepend",
+    mode: "merge" | "prepend" | "replace",
     isCurrent: () => boolean,
   ): { messages: Message[] } | null {
     if (!isCurrent()) return null
-    const state = withoutEchoedOptimisticRecords(store.getState(), target.sessionID, page, entry.optimistic)
+    const current = store.getState()
+    const echoed = withoutEchoedOptimisticRecords(current, target.sessionID, page, entry.optimistic)
+    const state = mode === "replace" ? withoutHistoryOutsideWindow(echoed, target.sessionID, page, entry.optimistic, entry.inboxSeededIDs) : echoed
     const merged = mergeOptimisticPage({
       session: page.session,
       part: [...page.partsByMessageID].map(([id, part]) => ({ id, part })),
@@ -824,13 +1184,17 @@ export class SessionMessageLoader {
           ?? mergedPartsByMessageID.get(info.id)
           ?? [],
       })),
-      { mode },
+      { mode: mode === "prepend" ? "prepend" : "merge" },
     )
     if (!isCurrent()) return null
-    if (materialized.messagesChanged || materialized.partsChanged) {
+    // Records the page made redundant were removed before materializing;
+    // that removal is a change even when the page itself changes nothing.
+    const messagesChanged = materialized.messagesChanged || state.message !== current.message
+    const partsChanged = materialized.partsChanged || state.part !== current.part
+    if (messagesChanged || partsChanged) {
       store.setState({
-        ...(materialized.messagesChanged ? { message: materialized.message } : {}),
-        ...(materialized.partsChanged ? { part: materialized.part } : {}),
+        ...(messagesChanged ? { message: materialized.message } : {}),
+        ...(partsChanged ? { part: materialized.part } : {}),
       })
     }
     return { messages: materialized.messages }

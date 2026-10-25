@@ -14,7 +14,7 @@ import { permissionFilePreviewsSchema } from './permissionFilePreviews';
 import { formatShortcutForDisplay } from '@/lib/shortcuts';
 import { toolFileDiffs } from '@/lib/opencode/tools';
 import { getPermissionToolPresentation, getToolDisplayName } from './permissionToolPresentation';
-import { describeSavePatterns, permissionSummaryMetadataSchema, summarizePermission, type PermissionTarget } from './permissionSummary';
+import { canSavePermission, describeSavePatterns, permissionSummaryMetadataSchema, summarizePermission, type PermissionTarget } from './permissionSummary';
 import { usePermissionFromSubagent, usePermissionResponse } from './usePermissionResponse';
 
 const PERMISSION_BASH_CUSTOM_STYLE: React.CSSProperties = {
@@ -22,7 +22,7 @@ const PERMISSION_BASH_CUSTOM_STYLE: React.CSSProperties = {
   padding: '0.5rem',
   fontSize: 'var(--text-meta)',
   lineHeight: '1.25rem',
-  background: 'rgb(var(--muted) / 0.3)',
+  background: 'color-mix(in srgb, var(--muted) 30%, transparent)',
   borderRadius: '0.25rem',
   whiteSpace: 'pre-wrap',
   wordBreak: 'break-word',
@@ -43,7 +43,7 @@ const PERMISSION_JSON_CUSTOM_STYLE: React.CSSProperties = {
   padding: '0.5rem',
   fontSize: 'var(--text-meta)',
   lineHeight: '1.25rem',
-  background: 'rgb(var(--muted) / 0.3)',
+  background: 'color-mix(in srgb, var(--muted) 30%, transparent)',
   borderRadius: '0.25rem',
 };
 
@@ -281,7 +281,7 @@ export const PermissionRequestContent: React.FC<{ permission: PermissionRequest 
         {Object.keys(metadata).length > 0 && !summary.metadataExplained && !genericContent && !description && (
           <details className="group">
             <summary className="typography-meta flex cursor-pointer list-none items-center gap-1 text-muted-foreground hover:text-foreground [&::-webkit-details-marker]:hidden">
-              <Icon name="arrow-right-s" className="size-3.5 transition-transform group-open:rotate-90" />
+              <Icon name="arrow-right-s" className="size-3.5 transition-transform group-open:rotate-90 rtl:group-open:-rotate-90" />
               {t('chat.permissionCard.showDetails')}
             </summary>
             <ScrollableOverlay outerClassName="mt-1 max-h-32" className="p-0">
@@ -369,6 +369,7 @@ export const PermissionActions: React.FC<{
   const { t } = useI18n();
   const always = useAlwaysLabel(permission);
   const hasSave = always.full !== undefined;
+  const canSave = canSavePermission(permission.save);
 
   if (variant === 'dock') {
     return (
@@ -376,18 +377,20 @@ export const PermissionActions: React.FC<{
         <Button variant="ghost" size="xs" disabled={isResponding} onClick={() => onRespond('reject')} className="text-[var(--status-error)]">
           <Icon name="close" className="size-3.5" />
           {t('chat.permissionCard.deny')}
-          <kbd className="ml-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+backspace')}</kbd>
+          <kbd className="ms-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+backspace')}</kbd>
         </Button>
         <div className="min-w-0 flex-1" />
-        <Button variant="outline" size="xs" disabled={isResponding} onClick={() => onRespond('always')} title={always.full}>
-          <Icon name="time" className="size-3.5" />
-          <span className="max-w-[180px] truncate">{always.label}</span>
-          {!hasSave ? <kbd className="ml-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+shift+enter')}</kbd> : null}
-        </Button>
+        {canSave ? (
+          <Button variant="outline" size="xs" disabled={isResponding} onClick={() => onRespond('always')} title={always.full}>
+            <Icon name="time" className="size-3.5" />
+            <span className="max-w-[180px] truncate">{always.label}</span>
+            {!hasSave ? <kbd className="ms-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+shift+enter')}</kbd> : null}
+          </Button>
+        ) : null}
         <Button size="xs" disabled={isResponding} onClick={() => onRespond('once')}>
           {isResponding ? <Icon name="loader-4" className="size-3.5 animate-spin" /> : <Icon name="check" className="size-3.5" />}
           {t('chat.permissionCard.allowOnce')}
-          <kbd className="ml-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+enter')}</kbd>
+          <kbd className="ms-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+enter')}</kbd>
         </Button>
       </div>
     );
@@ -397,52 +400,44 @@ export const PermissionActions: React.FC<{
     "flex items-center gap-1.5 sm:gap-1 px-3 sm:px-2 py-1.5 sm:py-1 typography-meta font-medium rounded transition-all min-h-[32px] sm:min-h-0 w-full sm:w-auto",
     "disabled:opacity-50 disabled:cursor-not-allowed",
   );
-  const hover = (idle: string, active: string) => ({
-    onMouseEnter: (event: React.MouseEvent<HTMLButtonElement>) => { event.currentTarget.style.backgroundColor = active; },
-    onMouseLeave: (event: React.MouseEvent<HTMLButtonElement>) => { event.currentTarget.style.backgroundColor = idle; },
-  });
 
   return (
     <div className="px-2 pb-2 sm:pb-1.5 pt-1.5 sm:pt-1 flex flex-col sm:flex-row sm:items-center sm:flex-wrap gap-1.5 border-t border-border/20">
       <button
         onClick={() => onRespond('once')}
         disabled={isResponding}
-        className={rowClass}
-        style={{ backgroundColor: 'rgb(var(--status-success) / 0.1)', color: 'var(--status-success)' }}
-        {...hover('rgb(var(--status-success) / 0.1)', 'rgb(var(--status-success) / 0.2)')}
+        className={cn(rowClass, 'bg-[var(--status-success)]/10 text-[var(--status-success)] hover:bg-[var(--status-success)]/20')}
       >
         <Icon name="check" className="h-3.5 w-3.5 sm:h-3 sm:w-3 flex-shrink-0" />
         {t('chat.permissionCard.allowOnce')}
-        <kbd className="ml-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+enter')}</kbd>
+        <kbd className="ms-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+enter')}</kbd>
       </button>
 
-      <button
-        onClick={() => onRespond('always')}
-        disabled={isResponding}
-        title={always.full}
-        className={rowClass}
-        style={{ backgroundColor: 'rgb(var(--muted) / 0.5)', color: 'var(--muted-foreground)' }}
-        {...hover('rgb(var(--muted) / 0.5)', 'rgb(var(--muted) / 0.7)')}
-      >
-        <Icon name="time" className="h-3.5 w-3.5 sm:h-3 sm:w-3 flex-shrink-0" />
-        <span className="truncate max-w-[180px]">{always.label}</span>
-        {!hasSave ? <kbd className="ml-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+shift+enter')}</kbd> : null}
-      </button>
+      {canSave ? (
+        <button
+          onClick={() => onRespond('always')}
+          disabled={isResponding}
+          title={always.full}
+          className={cn(rowClass, 'bg-[var(--muted)]/50 text-muted-foreground hover:bg-[var(--muted)]/70')}
+        >
+          <Icon name="time" className="h-3.5 w-3.5 sm:h-3 sm:w-3 flex-shrink-0" />
+          <span className="truncate max-w-[180px]">{always.label}</span>
+          {!hasSave ? <kbd className="ms-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+shift+enter')}</kbd> : null}
+        </button>
+      ) : null}
 
       <button
         onClick={() => onRespond('reject')}
         disabled={isResponding}
-        className={rowClass}
-        style={{ backgroundColor: 'rgb(var(--status-error) / 0.1)', color: 'var(--status-error)' }}
-        {...hover('rgb(var(--status-error) / 0.1)', 'rgb(var(--status-error) / 0.2)')}
+        className={cn(rowClass, 'bg-[var(--status-error)]/10 text-[var(--status-error)] hover:bg-[var(--status-error)]/20')}
       >
         <Icon name="close" className="h-3.5 w-3.5 sm:h-3 sm:w-3 flex-shrink-0" />
         {t('chat.permissionCard.deny')}
-        <kbd className="ml-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+backspace')}</kbd>
+        <kbd className="ms-1 hidden sm:inline typography-micro opacity-60">{formatShortcutForDisplay('alt+backspace')}</kbd>
       </button>
 
       {isResponding && (
-        <div className="flex justify-center w-full sm:w-auto sm:ml-auto py-1 sm:py-0 typography-meta text-muted-foreground">
+        <div className="flex justify-center w-full sm:w-auto sm:ms-auto py-1 sm:py-0 typography-meta text-muted-foreground">
           <div className="animate-spin h-3 w-3 border border-primary border-t-transparent rounded-full" />
         </div>
       )}

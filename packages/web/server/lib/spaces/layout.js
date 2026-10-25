@@ -65,6 +65,10 @@ export const SPACE_TOKEN_PATH = `${SPACE_TOKEN_DIRECTORY}/token`;
 // with it too, and all it changes then is the line under the group.
 export const SPACE_IDLE_STOP_PATH = `${SPACE_TOKEN_DIRECTORY}/idle-stop.json`;
 export const SPACE_IDLE_EXIT_CODE = 75;
+// The permission mode a new chat starts in, Settings → Sessions, which the host writes the same
+// way. The agent can rewrite it, and gains nothing by that: it already owns the settings and the
+// token of the server inside, so it can set any chat's mode anyway.
+export const SPACE_PERMISSION_DEFAULT_PATH = `${SPACE_TOKEN_DIRECTORY}/permission-default.json`;
 
 // The gatekeeper, the space's only way out. It sits on the space's internal network under this
 // name and on the space's own outer network, and nothing else joins either of them.
@@ -93,11 +97,21 @@ export const GATEKEEPER_PROGRAM_DIRECTORY = '/tmp/openchamber-gatekeeper';
 export const GATEKEEPER_PROGRAM_PATH = `${GATEKEEPER_PROGRAM_DIRECTORY}/gatekeeper.cjs`;
 export const GATEKEEPER_BIND_PATH = `${GATEKEEPER_PROGRAM_DIRECTORY}/bind`;
 
-// OpenCode's global configuration inside a space, where the host writes the provider
-// configuration that sends model calls through the window. The agent can change it; the
-// gatekeeper is what enforces, this only cooperates.
-export const SPACE_OPENCODE_CONFIG_DIRECTORY = `${SPACE_HOME}/.config/opencode`;
-export const SPACE_OPENCODE_CONFIG_PATH = `${SPACE_OPENCODE_CONFIG_DIRECTORY}/opencode.json`;
+// OpenCode's configuration inside a space, where the host writes the provider configuration
+// that sends model calls through the window: a `.opencode` folder in the work volume beside the
+// project's copy. OpenCode reads a `.opencode/opencode.json` of any folder above the project
+// over the project's own `opencode.json`, measured on 2.0.27, and that file travels in with the
+// code: written in the home directory, the host's entry lost to a provider the project defines
+// itself, with its real address, which nothing inside can reach. The folder starts with a dot,
+// which no project folder name can, and it is outside the project's repository, so nothing of it
+// comes out with the code. The agent can change it; the gatekeeper is what enforces, this only
+// cooperates.
+export const spaceOpenCodeConfigDirectory = (spaceId) => `${spaceWorkPath(spaceId)}/.opencode`;
+export const spaceOpenCodeConfigPath = (spaceId) => `${spaceOpenCodeConfigDirectory(spaceId)}/opencode.json`;
+// Where the host wrote it before, OpenCode's global file in the home volume. A space made then
+// still holds it, and OpenCode merges a provider's settings across layers field by field, so a
+// stale entry there would leak fields into the one beside the project; the write removes it.
+export const LEGACY_SPACE_OPENCODE_CONFIG_PATH = `${SPACE_HOME}/.config/opencode/opencode.json`;
 
 const IMAGE_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 
@@ -142,7 +156,7 @@ export const SPACE_ENVIRONMENT = Object.freeze({
   // NODE_USE_ENV_PROXY=1 proxies loopback too. Both spellings, because curl reads both.
   NO_PROXY: `${GATEKEEPER_ALIAS},localhost,127.0.0.1`,
   no_proxy: `${GATEKEEPER_ALIAS},localhost,127.0.0.1`,
-  // Node 22 ignores proxy variables without this. Measured: EAI_AGAIN for every fetch.
+  // Node ignores proxy variables without this. Measured on 22 and 24: EAI_AGAIN for every fetch.
   NODE_USE_ENV_PROXY: '1',
   // OpenCode's catalog and update downloads would only spend corridor attempts.
   OPENCODE_DISABLE_MODELS_FETCH: '1',
@@ -153,6 +167,8 @@ export const SPACE_ENVIRONMENT = Object.freeze({
   // Where the server inside reads the idle stop's setting. Only a space has this variable, so the
   // timer never runs on the host.
   OPENCHAMBER_SPACE_IDLE_STOP_FILE: SPACE_IDLE_STOP_PATH,
+  // Where the server inside reads the permission mode a new chat starts in, in place of its own settings.
+  OPENCHAMBER_SPACE_PERMISSION_DEFAULT_FILE: SPACE_PERMISSION_DEFAULT_PATH,
 });
 
 // Waits for the token file, takes it as the server password, and becomes the server.

@@ -8,6 +8,7 @@ description: Use when creating or modifying OpenChamber Settings pages, dialogs,
 ## Required Companion Skills
 
 - Load `theme-system` for colors, buttons, icons, and visual states.
+- Load `openchamber-ui-guidance` for depth, surfaces, layout stability, sizing and composition.
 - Load `locale-ui-patterns` for every visible string, tooltip, placeholder, and accessible label.
 - Load `ui-api-decoupling` when a setting reads/writes runtime data or adds a capability, and write the surface list from its *Name The Surfaces Before Editing* step before adding or moving a settings page: a page that exists on desktop and is unreachable on a phone is the common way this goes wrong.
 
@@ -27,6 +28,25 @@ shape is genuinely missing.
 - Controls have one standard size (`h-9` / select `size="settings"`) and capped widths — no full-bleed inputs.
 - Layouts respond to the settings pane width via container queries (`@xl:` / `@3xl:`), never viewport `sm:`/`lg:` breakpoints (the pane is much narrower than the viewport inside the dialog).
 - Checkbox/radio state comes before labels; selected states are subtle and never shift layout.
+
+## Keep A Page From Turning Into A List
+
+Pages grow one control at a time, and each addition looks fine alone; the
+mess shows up as a whole. When adding to a page, read the page, not only the
+spot you add to:
+
+- A section holds one topic a user would name ("Terminal", "Sending"). A new
+  setting goes into the section it belongs to, or starts its own; never append
+  it to whatever section is last or nearest.
+- One row kind per run: field rows together, checkboxes together. A field row
+  (label + select, stepper, chips) between checkboxes is the clearest sign of
+  a page that needs regrouping.
+- Same shape for the same kind of choice: a short enum is chips in a field
+  row everywhere, never radios on one page and chips on the next.
+- A text line belongs to one option and sits under its label (`description`,
+  `footer`), never loose between two rows.
+- When a page passes about four sections or a scroll of mixed topics, split it
+  into tabs (`references/layout.md`, Pages With Tabs) rather than adding more.
 
 ## Load References By Task
 
@@ -58,6 +78,7 @@ Do not introduce raw `<Tooltip>`-based info icons, direct Remixicon components, 
 ## Description Policy (info hints)
 
 - Explanatory prose goes behind the info icon via the `info` prop by default.
+- An info hint is one or two short sentences that add what the label or summary does not say. It names no list of every action and carries no caveat that stopped being true (for example "applies after OpenCode restarts" for tools that now apply live).
 - When labels alone cannot explain the differences, consequences, or conditions needed to choose a setting, use a title, a visible description, then checkbox or radio controls. Option lists whose labels already read as complete choices (large-text paste modes, send shortcut) keep the explanation behind `info` even when it carries an exception. Having multiple options or a group title alone does not require a description; see `references/controls.md` for composition.
 - Stays visible: security/data-loss warnings, destructive consequences, required syntax/placeholder lists the user reads while typing, dynamic status, empty states, validation errors, active-flow wizard instructions.
 - Mixed text: keep the warning sentence visible, move the explanation to `info`.

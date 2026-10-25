@@ -1,9 +1,11 @@
-import { spaceApiPath } from '@/lib/spaces/space-route';
+import { spaceIdOfDirectory } from '@/lib/spaces/space-route';
 import { z } from 'zod';
 import type {
   GitStatus,
   GitDiffResponse,
   GetGitDiffOptions,
+  GetGitDiffsOptions,
+  GitPathDiffBatchEntry,
   GetGitRangeDiffOptions,
   GetGitRangeFilesOptions,
   GetGitCommitDiffOptions,
@@ -22,6 +24,11 @@ import type {
   RemoveGitWorktreePayload,
   GitWorktreeSnapshotPayload,
   GitWorktreeSnapshotResult,
+  ArchiveGitWorktreePayload,
+  DeleteGitWorktreeArchivePayload,
+  GitWorktreeArchive,
+  GitWorktreeArchiveRestoreResult,
+  GitWorktreeTitleResult,
   GitWorktreeValidationResult,
   CreateGitCommitOptions,
   GitCommitResult,
@@ -67,7 +74,7 @@ import { GitPathUnavailableError, gitPathUnavailableBodySchema, gitSubmoduleStat
 
 const API_BASE = '/api/git';
 const gitRangeDiffSchema = z.object({ diff: z.string() });
-const gitRangeFilesSchema = z.object({ files: z.array(z.object({ path: z.string(), status: z.string() })) });
+const gitRangeFilesSchema = z.object({ files: z.array(z.object({ path: z.string(), status: z.string(), revision: z.string().optional() })) });
 const gitRangeErrorSchema = z.object({ error: z.string() });
 const gitCommitFilesSchema = z.object({ files: z.array(z.object({
   path: z.string(), previousPath: z.string().optional(), changeType: z.string(),
@@ -82,6 +89,12 @@ const gitLogSchema = z.object({ all: z.array(gitLogEntrySchema), latest: gitLogE
 
 // Servers before #3586 send no `submodule`; that means "not known to be one".
 const gitPathDiffSchema = z.object({ diff: z.string(), submodule: gitSubmoduleStateSchema.nullable().default(null) });
+const gitPathDiffsSchema = z.object({
+  diffs: z.array(z.union([
+    z.object({ path: z.string(), diff: z.string(), submodule: gitSubmoduleStateSchema.nullable().default(null) }),
+    z.object({ path: z.string(), error: z.string(), code: z.enum(['path_not_found', 'nested_repository', 'untracked_directory']).nullable() }),
+  ])),
+});
 const gitFileDiffSchema = z.object({
   original: z.string(),
   modified: z.string(),
@@ -361,6 +374,7 @@ const operationErrorCodeSchema = z.enum([
     'OUTCOME_UNKNOWN',
     'RUNTIME_UNSUPPORTED',
     'GIT_LFS_CLIENT_MISSING',
+    'CHECKOUT_TOO_LARGE',
     'UNKNOWN',
   ]);
 const operationErrorSchema = <const Code extends readonly [string, ...string[]]>(codes: Code) => z.object({
@@ -444,7 +458,7 @@ export const gitNetworkOperationSchema = z.discriminatedUnion('state', [
     state: z.literal('partial'),
     error: operationErrorSchema([
       'INVALID_REQUEST', 'AUTHENTICATION_REQUIRED', 'AUTHENTICATION_FAILED', 'TRANSPORT_FAILED',
-      'RUNTIME_UNSUPPORTED', 'GIT_LFS_CLIENT_MISSING', 'UNKNOWN',
+      'RUNTIME_UNSUPPORTED', 'GIT_LFS_CLIENT_MISSING', 'CHECKOUT_TOO_LARGE', 'UNKNOWN',
     ]),
   }).strict(),
   z.object({
@@ -457,6 +471,7 @@ export const gitNetworkOperationSchema = z.discriminatedUnion('state', [
       'TRANSPORT_FAILED',
       'RUNTIME_UNSUPPORTED',
       'GIT_LFS_CLIENT_MISSING',
+      'CHECKOUT_TOO_LARGE',
       'UNKNOWN',
     ]),
   }).strict(),
@@ -789,8 +804,198 @@ function buildUrl(
   const query: Record<string, string | number | boolean | undefined> = { ...params };
   if (directory) query.directory = directory;
 
-  // A directory inside an isolated space addresses that space's git.
-  return getRuntimeUrlResolver().api(spaceApiPath(path, directory), query);
+  // The `directory` query also sends a request about a space's directory to that space's git.
+  return getRuntimeUrlResolver().api(path, query);
+}
+
+type ProjectOverviewField = 'repo' | 'status' | 'root' | 'worktrees';
+
+type ProjectOverviewResponse = {
+  directory: string;
+  isGitRepository?: boolean;
+  status?: GitStatus | null;
+  root?: string | null;
+  worktrees?: GitWorktreeInfo[] | null;
+  errors?: string[];
+  error?: string;
+};
+
+type ProjectOverviewWaiter = {
+  resolve: (overview: ProjectOverviewResponse) => void;
+  reject: (error: Error) => void;
+};
+
+type ProjectOverviewBatch = {
+  runtimeKey: string;
+  field: ProjectOverviewField;
+  waiters: Map<string, ProjectOverviewWaiter[]>;
+  timer: ReturnType<typeof setTimeout> | null;
+};
+
+// Repository checks, primary roots, worktree lists, and the sidebar's status
+// prefetch are a request per project whose answers are small, so the round
+// trips and headers dominate. Reads of one field admitted within the same short
+// window share one batched request. Each field gets its own batch so a cheap
+// read never waits on an expensive one: a repository check that shared a
+// request with a status read would answer only when the slowest status did.
+// Worktrees live on their own endpoint because that one is refused across the
+// space boundary, like `/api/git/worktrees`.
+const PROJECT_OVERVIEW_BATCH_WINDOW_MS = 15;
+const PROJECT_OVERVIEW_BATCH_MAX_DIRECTORIES = 200;
+
+const projectOverviewEndpoint = (field: ProjectOverviewField): string =>
+  field === 'worktrees' ? `${API_BASE}/project-worktrees` : `${API_BASE}/projects`;
+
+// `/api/git/projects` always answers the repository check and computes `status`
+// and `root` only when asked.
+const projectOverviewBody = (field: ProjectOverviewField, directories: string[]): string =>
+  JSON.stringify(field === 'status' || field === 'root' ? { directories, fields: [field] } : { directories });
+
+// Batches are keyed by field and routing context. A directory under
+// `/spaces/<id>` is answered by that space's server and a host directory by the
+// host's, and the dispatcher reads the directory from the URL query, never the
+// body, so one request cannot serve a mixed batch. Keying by space id keeps each
+// context in its own batch and `directories[0]` matching every directory the
+// request carries.
+const projectOverviewBatchKey = (field: ProjectOverviewField, directory: string): string =>
+  `${field}\0${spaceIdOfDirectory(directory) ?? ''}`;
+
+const pendingProjectOverviews = new Map<string, ProjectOverviewBatch>();
+
+const flushProjectOverviews = async (batchKey: string): Promise<void> => {
+  const batch = pendingProjectOverviews.get(batchKey);
+  pendingProjectOverviews.delete(batchKey);
+  if (!batch) return;
+
+  // A runtime switch between admission and flush would send these directories to
+  // the new runtime's base while their context is the old one. Drop the batch
+  // instead of pairing them; callers treat rejection as a failed read and retry.
+  if (batch.runtimeKey !== getRuntimeKey()) {
+    const error = new Error('Runtime changed before project repository batch was sent');
+    for (const waiters of batch.waiters.values()) {
+      for (const waiter of waiters) waiter.reject(error);
+    }
+    return;
+  }
+
+  const directories = [...batch.waiters.keys()];
+  // Capture each directory's status-cache version before the request, so a
+  // mutation that lands while the batch is in flight is not overwritten by the
+  // pre-mutation status the server computed.
+  const statusVersionAtFlush = new Map<string, number>();
+  for (const directory of directories) {
+    statusVersionAtFlush.set(directory, getStatusCacheVersion(batch.runtimeKey, directory));
+  }
+
+  const endpoint = projectOverviewEndpoint(batch.field);
+  const byDirectory = new Map<string, ProjectOverviewResponse>();
+  // Chunk above the server's per-request cap so every directory is read instead
+  // of the overflow rejecting.
+  const chunks: string[][] = [];
+  for (let index = 0; index < directories.length; index += PROJECT_OVERVIEW_BATCH_MAX_DIRECTORIES) {
+    chunks.push(directories.slice(index, index + PROJECT_OVERVIEW_BATCH_MAX_DIRECTORIES));
+  }
+  await Promise.all(chunks.map(async (chunk) => {
+    try {
+      // The batch is single-context (see projectOverviewBatchKey), so the first
+      // directory's URL context matches every directory in the body.
+      const response = await runtimeFetch(buildUrl(endpoint, chunk[0]), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: projectOverviewBody(batch.field, chunk),
+      });
+      if (!response.ok) {
+        throw new Error(`Failed to read project repositories: ${response.statusText}`);
+      }
+      // SAFETY: this shape is produced by this app's own `/api/git/projects` and
+      // `/api/git/project-worktrees` handlers.
+      const payload = await response.json() as { projects?: ProjectOverviewResponse[] } | null;
+      for (const project of payload?.projects ?? []) {
+        byDirectory.set(project.directory, project);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to read project repositories';
+      for (const directory of chunk) {
+        byDirectory.set(directory, { directory, error: message });
+      }
+    }
+  }));
+
+  // Warm the caches the per-project reads use, so the store's repository check
+  // and status read that follow a batch are cache hits instead of requests.
+  for (const [directory, project] of byDirectory) {
+    if (typeof project.isGitRepository === 'boolean') {
+      gitRepoCache.set(getDirectoryCacheKey(batch.runtimeKey, directory), {
+        value: project.isGitRepository,
+        expiresAt: Date.now() + GIT_REPO_CHECK_CACHE_TTL_MS,
+      });
+    }
+    if (project.status && getStatusCacheVersion(batch.runtimeKey, directory) === statusVersionAtFlush.get(directory)) {
+      gitStatusCache.set(getStatusCacheKey(batch.runtimeKey, directory, undefined), {
+        value: project.status,
+        expiresAt: Date.now() + GIT_STATUS_CACHE_TTL_MS,
+      });
+    }
+  }
+
+  for (const [directory, waiters] of batch.waiters) {
+    const overview = byDirectory.get(directory) ?? null;
+    for (const waiter of waiters) {
+      if (!overview) {
+        waiter.reject(new Error('Project repository read missing from batch response'));
+      } else if (overview.error) {
+        waiter.reject(new Error(overview.error));
+      } else if (overview.errors?.includes(batch.field)) {
+        waiter.reject(new Error(`Failed to read project ${batch.field}`));
+      } else {
+        waiter.resolve(overview);
+      }
+    }
+  }
+};
+
+const readProjectOverview = (directory: string, field: ProjectOverviewField): Promise<ProjectOverviewResponse> => {
+  const runtimeKey = getRuntimeKey();
+  const batchKey = projectOverviewBatchKey(field, directory);
+  const existing = pendingProjectOverviews.get(batchKey);
+  if (existing && existing.runtimeKey !== runtimeKey) {
+    void flushProjectOverviews(batchKey);
+  }
+  let batch = pendingProjectOverviews.get(batchKey);
+  if (!batch) {
+    batch = { runtimeKey, field, waiters: new Map(), timer: null };
+    pendingProjectOverviews.set(batchKey, batch);
+  }
+  const current = batch;
+  return new Promise<ProjectOverviewResponse>((resolve, reject) => {
+    const waiters = current.waiters.get(directory) ?? [];
+    waiters.push({ resolve, reject });
+    current.waiters.set(directory, waiters);
+    if (current.timer === null) {
+      current.timer = setTimeout(() => {
+        void flushProjectOverviews(batchKey);
+      }, PROJECT_OVERVIEW_BATCH_WINDOW_MS);
+    }
+  });
+};
+
+/**
+ * Read the full status of many project directories in one batched request and
+ * keep each answer in the status cache, so the per-project `getGitStatus` reads
+ * that follow are cache hits. Meant for a project list populating its badges:
+ * a single directory's status keeps its own request in `getGitStatus`, so the
+ * repository the user works in never waits on a slower project's status.
+ * Failures are left to the per-project reads, which retry them one by one.
+ */
+export async function prefetchProjectStatuses(directories: string[]): Promise<void> {
+  const runtimeKey = getRuntimeKey();
+  const now = Date.now();
+  const pending = directories.filter((directory) => {
+    const key = getStatusCacheKey(runtimeKey, directory, undefined);
+    const cached = gitStatusCache.get(key);
+    return !(cached && cached.expiresAt > now) && !gitStatusInFlight.has(key);
+  });
+  await Promise.allSettled(pending.map((directory) => readProjectOverview(directory, 'status')));
 }
 
 export async function checkIsGitRepository(directory: string): Promise<boolean> {
@@ -807,12 +1012,8 @@ export async function checkIsGitRepository(directory: string): Promise<boolean> 
   }
 
   const task = (async () => {
-    const response = await runtimeFetch(buildUrl(`${API_BASE}/check`, directory));
-    if (!response.ok) {
-      throw new Error(`Failed to check git repository: ${response.statusText}`);
-    }
-    const data = await response.json();
-    const isGitRepository = Boolean(data.isGitRepository);
+    const overview = await readProjectOverview(directory, 'repo');
+    const isGitRepository = overview.isGitRepository === true;
     gitRepoCache.set(key, {
       value: isGitRepository,
       expiresAt: Date.now() + GIT_REPO_CHECK_CACHE_TTL_MS,
@@ -881,10 +1082,14 @@ export async function getGitStatus(directory: string, options?: { mode?: 'light'
 
   const task = (async () => {
     const cacheVersion = getStatusCacheVersion(runtimeKey, directory);
+    // Status keeps its own route: light reads pass `mode`, forced reads bypass
+    // the cache, and one directory never waits on another's status. A project
+    // list warms this cache through `prefetchProjectStatuses` instead.
     const response = await runtimeFetch(buildUrl(`${API_BASE}/status`, directory, mode ? { mode } : undefined));
     if (!response.ok) {
       throw new Error(`Failed to get git status: ${response.statusText}`);
     }
+    // SAFETY: `/api/git/status` is this app's own route; its body is a GitStatus.
     const payload = await response.json() as GitStatus;
     if (getStatusCacheVersion(runtimeKey, directory) === cacheVersion) {
       gitStatusCache.set(key, {
@@ -906,12 +1111,27 @@ export async function getGitStatus(directory: string, options?: { mode?: 'light'
 }
 
 export async function resolveGitPrimaryRoot(directory: string): Promise<{ root: string }> {
-  const response = await runtimeFetch(buildUrl(`${API_BASE}/primary-root`, directory));
+  const overview = await readProjectOverview(directory, 'root');
+  return { root: overview.root ? overview.root : directory };
+}
+
+/**
+ * Where `directory` sits inside its repository's checkout: `ai` for `<checkout>/ai`,
+ * an empty string at the checkout root. Rejects when the answer is unavailable, so
+ * a caller never takes a failed read for "at the root".
+ */
+export async function resolveGitRepositoryPrefix(directory: string): Promise<string> {
+  const response = await runtimeFetch(buildUrl(`${API_BASE}/toplevel`, directory));
   if (!response.ok) {
-    throw new Error(`Failed to resolve git primary root: ${response.statusText}`);
+    throw new Error(`Failed to resolve the repository folder: ${response.statusText}`);
   }
-  const payload = await response.json().catch(() => ({})) as { root?: string };
-  return { root: typeof payload.root === 'string' && payload.root ? payload.root : directory };
+  // SAFETY: the route answers `{ root, prefix }`; a body that is not that object leaves `prefix` undefined, and anything but a string is rejected below.
+  const payload = await response.json().catch(() => ({})) as { prefix?: string | null };
+  // A missing or null prefix is a failed read, not "at the root".
+  if (payload.prefix === undefined || payload.prefix === null) {
+    throw new Error('The server did not report the repository folder');
+  }
+  return payload.prefix;
 }
 
 export async function resolveGitTopLevel(directory: string): Promise<{ root: string }> {
@@ -970,6 +1190,30 @@ export async function getGitDiff(directory: string, options: GetGitDiffOptions):
   }
 
   return gitPathDiffSchema.parse(await response.json());
+}
+
+// The route's per-request bound; a longer list goes out in several requests.
+const GIT_DIFFS_MAX_PATHS = 1000;
+
+export async function getGitDiffs(directory: string, options: GetGitDiffsOptions): Promise<GitPathDiffBatchEntry[]> {
+  const { paths, staged, contextLines } = options;
+  const entries: GitPathDiffBatchEntry[] = [];
+  for (let start = 0; start < paths.length; start += GIT_DIFFS_MAX_PATHS) {
+    const response = await runtimeFetch(buildUrl(`${API_BASE}/diffs`, directory), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths: paths.slice(start, start + GIT_DIFFS_MAX_PATHS), staged: staged === true, context: contextLines }),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to get git diffs: ${response.statusText}`);
+    }
+    for (const entry of gitPathDiffsSchema.parse(await response.json()).diffs) {
+      entries.push('diff' in entry
+        ? { path: entry.path, ok: true, diff: { diff: entry.diff, submodule: entry.submodule } }
+        : { path: entry.path, ok: false, error: entry.error, reason: entry.code });
+    }
+  }
+  return entries;
 }
 
 export async function getGitRangeDiff(
@@ -1360,12 +1604,8 @@ export async function generatePullRequestDescription(
 }
 
 export async function listGitWorktrees(directory: string): Promise<GitWorktreeInfo[]> {
-  const response = await runtimeFetch(buildUrl(`${API_BASE}/worktrees`, directory));
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(error.error || 'Failed to list worktrees');
-  }
-  return response.json();
+  const overview = await readProjectOverview(directory, 'worktrees');
+  return overview.worktrees ?? [];
 }
 
 export async function validateGitWorktree(directory: string, payload: CreateGitWorktreePayload): Promise<GitWorktreeValidationResult> {
@@ -1442,6 +1682,68 @@ export async function deleteGitWorktree(directory: string, payload: RemoveGitWor
 
   return response.json();
 }
+
+const worktreeTitleResultSchema = z.object({ title: z.string(), branch: z.string() });
+
+export async function setGitWorktreeTitle(directory: string, title: string): Promise<GitWorktreeTitleResult> {
+  const response = await runtimeFetch(buildUrl(`${API_BASE}/worktrees/title`, directory), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title }),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = z.object({ error: z.string() }).safeParse(body).data?.error;
+    throw new Error(message || 'Failed to rename the task');
+  }
+  const parsed = worktreeTitleResultSchema.safeParse(body);
+  if (!parsed.success) throw new Error('Malformed task title response');
+  return parsed.data;
+}
+
+const worktreeArchiveSchema = z.object({
+  id: z.string().min(1),
+  ref: z.string().min(1),
+  commit: z.string().min(1),
+  head: z.string(),
+  path: z.string().min(1),
+  branch: z.string(),
+  branchExists: z.boolean(),
+  title: z.string(),
+  archivedAt: z.number(),
+  sessionIds: z.array(z.string()),
+});
+
+const worktreeArchiveRequest = async <T>(path: string, directory: string, init: RequestInit, schema: z.ZodType<T>, fallback: string): Promise<T> => {
+  const response = await runtimeFetch(buildUrl(`${API_BASE}/worktrees/archives${path}`, directory), {
+    ...init,
+    headers: init.body ? { 'Content-Type': 'application/json' } : undefined,
+  });
+  if (!response.ok) {
+    const body = z.object({ error: z.string().optional(), code: z.string().optional() }).catch({})
+      .parse(await response.json().catch(() => null));
+    const message = body.error || response.statusText || fallback;
+    // The server's code tells a kept archive or a partial removal apart.
+    throw body.code ? new GitWorktreeRequestError(body.code, message, response.status) : new Error(message);
+  }
+  return schema.parse(await response.json());
+};
+
+export const archiveGitWorktree = (directory: string, payload: ArchiveGitWorktreePayload): Promise<GitWorktreeArchive> => (
+  worktreeArchiveRequest('', directory, { method: 'POST', body: JSON.stringify(payload) }, worktreeArchiveSchema, 'Failed to archive worktree')
+);
+
+export const listGitWorktreeArchives = async (directory: string): Promise<GitWorktreeArchive[]> => (
+  (await worktreeArchiveRequest('', directory, { method: 'GET' }, z.object({ archives: z.array(worktreeArchiveSchema) }), 'Failed to list worktree archives')).archives
+);
+
+export const restoreGitWorktreeArchive = (directory: string, id: string): Promise<GitWorktreeArchiveRestoreResult> => (
+  worktreeArchiveRequest('/restore', directory, { method: 'POST', body: JSON.stringify({ id }) }, z.object({ id: z.string(), conflicts: z.boolean() }), 'Failed to restore worktree archive')
+);
+
+export const deleteGitWorktreeArchive = (directory: string, payload: DeleteGitWorktreeArchivePayload): Promise<{ id: string; branchDeleted: boolean }> => (
+  worktreeArchiveRequest('', directory, { method: 'DELETE', body: JSON.stringify(payload) }, z.object({ id: z.string(), branchDeleted: z.boolean() }), 'Failed to delete worktree archive')
+);
 
 const worktreeSnapshotResultSchema = z.object({
   ref: z.string(),
@@ -1832,6 +2134,23 @@ export async function getGitLog(
     throw new Error(`Failed to get git log: ${errorBody.error || response.statusText}`);
   }
   return gitLogSchema.parse(await response.json());
+}
+
+const changeIdAmendSchema = z.object({ sha: z.string().regex(/^[0-9a-f]{40}$/), changeId: z.string().regex(/^I[0-9a-f]{40}$/) });
+
+/** `GitAPI.addChangeIdToHead`: the server amends HEAD, refusing when it moved past `expectedHead`. */
+export async function addChangeIdToHead(directory: string, expectedHead: string): Promise<{ sha: string; changeId: string }> {
+  const response = await runtimeFetch(buildUrl(`${API_BASE}/change-id`, directory), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expectedHead }),
+  });
+  if (!response.ok) {
+    const message = await response.json().catch(() => ({ error: response.statusText }));
+    throw new Error(message.error || 'Failed to add a Change-Id');
+  }
+  invalidateGitStatusCache(directory);
+  return changeIdAmendSchema.parse(await response.json());
 }
 
 export async function getCommitFiles(

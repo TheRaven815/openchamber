@@ -17,7 +17,7 @@ openchamber --ui-password be-creative-here
 
 Sie können es auch über die Umgebungsvariable `OPENCHAMBER_UI_PASSWORD` setzen, statt es in die Befehlszeile zu schreiben. Nach der Anmeldung merkt sich OpenChamber das Gerät für eine Weile, damit Sie nicht jedes Mal gefragt werden.
 
-Setzen Sie immer ein Passwort, wenn die Instanz für andere erreichbar ist — besonders über einen [Tunnel](/tunnels/) oder das öffentliche Internet.
+Setzen Sie immer ein Passwort, wenn die Instanz für andere erreichbar ist — besonders über einen [Tunnel](/de/tunnels/) oder das öffentliche Internet.
 
 ## Passkeys
 
@@ -27,14 +27,14 @@ Passkeys sind an das aktuelle Passwort gebunden. Wenn Sie das Passwort ändern o
 
 ## Geräte-Tokens
 
-Geräte, die über [Ein Gerät verbinden](/connect-devices/) gekoppelt werden, authentifizieren sich mit eigenen gerätespezifischen Tokens, nicht mit dem UI-Passwort. Pairing-Links sind nur einmal nutzbar und laufen ab, wenn sie nicht verwendet werden; jedes gekoppelte Gerät wird unter **Einstellungen → Remote-Instanzen → Mit diesem Server verbinden** aufgeführt, wo Sie es jederzeit widerrufen können. Verbindungen von außerhalb laufen über das [Private Relay](/private-relay/), das Ende-zu-Ende verschlüsselt ist und Ihren Traffic nicht lesen kann.
+Geräte, die über [Ein Gerät verbinden](/de/connect-devices/) gekoppelt werden, authentifizieren sich mit eigenen gerätespezifischen Tokens, nicht mit dem UI-Passwort. Pairing-Links sind nur einmal nutzbar und laufen ab, wenn sie nicht verwendet werden; jedes gekoppelte Gerät wird unter **Einstellungen → Remote-Instanzen → Mit diesem Server verbinden** aufgeführt, wo Sie es jederzeit widerrufen können. Verbindungen von außerhalb laufen über das [Private Relay](/de/private-relay/), das Ende-zu-Ende verschlüsselt ist und Ihren Traffic nicht lesen kann.
 
 ## Bevor Sie es freigeben
 
 - Standardmäßig lauscht OpenChamber nur auf Ihrem eigenen Rechner (`127.0.0.1`). Es braucht eine bewusste Änderung, um breiter zu lauschen, und Sie sollten vorher ein Passwort setzen.
-- Für Ihre eigenen Geräte bevorzugen Sie [Pairing](/connect-devices/) mit dem [Private Relay](/private-relay/) — dabei wird überhaupt nichts öffentlich freigegeben.
-- Wenn Sie eine öffentliche URL brauchen, verwenden Sie lieber einen [Tunnel](/tunnels/) oder ein privates Netzwerk (z. B. VPN), statt einen Port ins Internet zu öffnen.
-- Wenn Sie OpenChamber hinter Ihrem eigenen HTTPS-Server betreiben, sehen Sie sich [Reverse Proxy](/reverse-proxy/) an.
+- Für Ihre eigenen Geräte bevorzugen Sie [Pairing](/de/connect-devices/) mit dem [Private Relay](/de/private-relay/) — dabei wird überhaupt nichts öffentlich freigegeben.
+- Wenn Sie eine öffentliche URL brauchen, verwenden Sie lieber einen [Tunnel](/de/tunnels/) oder ein privates Netzwerk (z. B. VPN), statt einen Port ins Internet zu öffnen.
+- Wenn Sie OpenChamber hinter Ihrem eigenen HTTPS-Server betreiben, sehen Sie sich [Reverse Proxy](/de/reverse-proxy/) an.
 
 ## Enterprise-Modus
 
@@ -60,7 +60,7 @@ Der Pfad hängt nicht davon ab, wie OpenChamber installiert ist. Die Desktop-App
   "allowNetworkAccess": false,
   "allowedExtensions": ["https://github.com/acme/"],
   "jev": {
-    "url": "https://llm.acme.com/v1",
+    "url": "https://llm.acme.com/v1/systemone",
     "model": "acme-classifier",
     "apiKey": "..."
   }
@@ -104,6 +104,19 @@ Wenn OpenCode auf deinen Rechnern schon installiert ist und OpenChamber genau di
 - Die CLI muss OpenCode 2.x sein, mindestens die Version, die OpenChamber verlangt. Mit einer älteren bleibt OpenChamber beim Bildschirm „OpenCode aktualisieren“ stehen.
 - Ein Ordner geht auch, wenn er `opencode` enthält (`opencode.exe` unter Windows). Eine Umgebungsvariable dafür gibt es nicht, weil Nutzer diese selbst setzen können.
 
+
+### Integrierte Skill-Kataloge ausblenden
+
+OpenChamber bringt einige öffentliche Skill-Kataloge mit (Anthropic, OpenAI, Cursor, Matt Pocock). Wenn deine Organisation einen eigenen pflegt, füge ihn als eigenen Katalog hinzu und blende die integrierten in der Richtliniendatei aus. Das funktioniert mit oder ohne Enterprise-Modus.
+
+```json
+{
+  "hideBuiltinSkillCatalogs": true
+}
+```
+
+Die Einstellungen bieten dann nur Kataloge an, die Personen selbst hinzufügen, und OpenChamber lädt keinen integrierten, auch nicht auf direkte Anfrage. Eine Umgebungsvariable gibt es dafür nicht, da Nutzer diese selbst setzen können.
+
 ### Beispiele
 
 Die Richtliniendatei auf einem Mac ablegen. Führen Sie im Terminal als Administrator aus:
@@ -142,7 +155,7 @@ environment:
   OPENCHAMBER_ALLOW_NETWORK_ACCESS: "1"
   # Optional:
   OPENCHAMBER_RELAY_URL: wss://relay.acme.com/ws
-  OPENCHAMBER_JEV_URL: https://llm.acme.com/v1
+  OPENCHAMBER_JEV_URL: https://llm.acme.com/v1/systemone
   OPENCHAMBER_JEV_MODEL: acme-classifier
   OPENCHAMBER_JEV_API_KEY: ${ACME_JEV_KEY}
   OPENCHAMBER_ALLOWED_EXTENSIONS: https://github.com/acme/
@@ -153,16 +166,18 @@ Zur Kontrolle öffnen Sie Einstellungen → Anbieter: Oben erscheint ein Hinweis
 ### Was sich ändert
 
 - Modellanbieter kommen nur aus Ihrer OpenCode-Konfiguration. Einen Anbieter verbinden, sich bei einem anmelden, einen Schlüssel hinzufügen oder einen eigenen Anbieter anlegen ist in OpenChamber ausgeschaltet; bestehende Konten entfernen oder wechseln funktioniert weiter. Das schließt nur den Weg über die App; die eigentliche Sperre ist die unten beschriebene OpenCode-Richtlinie. Die Anmeldung bei einem MCP-Server aus Ihrer OpenCode-Konfiguration funktioniert weiter, denn sie erreicht diesen Server und keinen Modellanbieter.
-- [Klassifizierungsanbieter (Jev)](/classification-providers/) bleiben aus, auch ein eigener Endpunkt, den jemand in den Einstellungen einträgt. Sicherheitsnetz und Auto werden nicht angeboten, und Sitzungen kommen nur von Hand in Arbeit. Um Jev über Ihre eigene Infrastruktur zu nutzen, legen Sie einen Endpunkt mit `jev` in der Richtliniendatei oder mit `OPENCHAMBER_JEV_URL` fest (dazu `OPENCHAMBER_JEV_MODEL` und, falls er einen braucht, `OPENCHAMBER_JEV_API_KEY`). Er wird zur Voreinstellung, lässt sich weiterhin ausschalten, und etwas anderes kann nicht gewählt werden.
+- [Klassifizierungsanbieter (Jev)](/de/classification-providers/) bleiben aus, auch ein eigener Endpunkt, den jemand in den Einstellungen einträgt. Sicherheitsnetz und Auto werden nicht angeboten, und Sitzungen in Arbeit bekommen keinen Hinweis „scheint erledigt“. Um Jev über Ihre eigene Infrastruktur zu nutzen, legen Sie einen Endpunkt mit `jev` in der Richtliniendatei oder mit `OPENCHAMBER_JEV_URL` fest (dazu `OPENCHAMBER_JEV_MODEL` und, falls er einen braucht, `OPENCHAMBER_JEV_API_KEY`). Er wird zur Voreinstellung, lässt sich weiterhin ausschalten, und etwas anderes kann nicht gewählt werden.
 - Vorlesen über OpenAI ist aus. Ein eigener Server für Sprachausgabe oder Transkription muss auf demselben Rechner laufen. Lokale Stimmen und lokale Diktiermodelle funktionieren weiter.
 - Push-Benachrichtigungen an Telefone und Browser enthalten nur einen allgemeinen Titel wie „Agent response is ready“, ohne Nachrichtentext oder Sitzungsnamen. Desktop-Benachrichtigungen bleiben auf Ihrem Rechner und behalten den vollständigen Text.
 - Update-Prüfungen laufen weiter, damit Sicherheitsfixes Sie weiterhin erreichen, aber sie melden nie Nutzungsdaten, nicht einmal die anonyme Installations-ID.
-- [Externe Tunnel](/tunnels/) (Cloudflare, ngrok) sind aus. Ein Tunnelanbieter entschlüsselt den Traffic an seinem Edge und sieht jede Anfrage im Klartext.
+- [Externe Tunnel](/de/tunnels/) (Cloudflare, ngrok, Tailscale) sind aus. Cloudflare und ngrok entschlüsseln den Traffic an ihrem Edge und sehen jede Anfrage im Klartext; Tailscale Serve und Funnel öffnen diesen Rechner für andere Geräte.
 - `.drawio`-Diagramme öffnen sich als XML-Text. Der Diagrammeditor ist eine Seite von diagrams.net, und ein dort geöffnetes Diagramm wird ihr übergeben.
+- Der Integrationskatalog in der Seitenleiste ist ausgeblendet. Er installiert externe Dienste aus einer Liste, die mit OpenChamber ausgeliefert wird. MCP-Server, Plugins und Skills in den Einstellungen hinzuzufügen funktioniert wie bisher.
 - Schriften für Oberfläche und Code, die von einem öffentlichen CDN geladen werden, fallen auf die Systemschriften zurück. Deine Auswahl bleibt für die Zeit ohne den Modus erhalten.
-- Das [Private Relay](/private-relay/) funktioniert nur über Ihr eigenes Relay. Betreiben Sie ein [selbst gehostetes Relay](https://github.com/openchamber/openchamber-relay) und richten Sie OpenChamber mit `relayUrl` in der Richtliniendatei oder mit `OPENCHAMBER_RELAY_URL=wss://relay.example.com/ws` darauf aus. Auch das gemeinsame Relay kann Ihren Traffic nicht lesen, da es Ende-zu-Ende verschlüsselt ist, aber Ihr eigenes hält die Verbindungsmetadaten und den Weg zu diesem Rechner in Ihrem Netzwerk. Ohne eigenes Relay lassen sich überhaupt keine Geräte koppeln.
-- OpenChamber lauscht nur auf dem Rechner, auf dem es läuft. Die Desktop-Einstellung, mit der andere Geräte im lokalen Netzwerk die App öffnen können, ist aus, und der Server startet nicht auf einer Netzwerkadresse, weder über die CLI (`--host`, `--lan`) noch über die Umgebung. Taucht die Richtliniendatei auf, während die App läuft, werden Verbindungen von anderen Rechnern bis zum nächsten Start getrennt. Netzwerkzugriff erlauben Sie mit `"allowNetworkAccess": true` in der Richtliniendatei oder mit `OPENCHAMBER_ALLOW_NETWORK_ACCESS=1`, wo die Umgebung den Enterprise-Modus einschaltet. Denken Sie daran, dass die Verbindung unverschlüsseltes HTTP ist, in einem gemeinsamen Netzwerk kann sie also jeder mitlesen; stellen Sie einen Server, den andere erreichen, hinter [Ihr eigenes HTTPS](/reverse-proxy/).
-- [Erweiterungen](/extensions/), die Daten vom Rechner nach außen senden können (weil sie eine externe API ansprechen, von externen Adressen laden oder einen Hintergrunddienst ausführen), lassen sich nur aus einem Git-Repository installieren, das in `allowedExtensions` steht. Erweiterungen, die nichts davon tun, installieren Sie wie gewohnt. Eine installierte Erweiterung aus einer anderen Quelle bleibt aus, und die Einstellungen sagen, warum. Die Liste enthält Repository-URLs, weil eine Erweiterung ihren Namen selbst wählt; ein Eintrag, der auf `/` endet, wie `https://github.com/acme/`, erlaubt jedes Repository darunter. Auf den Rechnern von Leuten, die Erweiterungen entwickeln, erlaubt `"allowLocalExtensions": true` außerdem die Installation aus einem lokalen Ordner. Ein ZIP bleibt in jedem Fall gesperrt.
+- Das [Private Relay](/de/private-relay/) funktioniert nur über Ihr eigenes Relay. Betreiben Sie ein [selbst gehostetes Relay](https://github.com/openchamber/openchamber-relay) und richten Sie OpenChamber mit `relayUrl` in der Richtliniendatei oder mit `OPENCHAMBER_RELAY_URL=wss://relay.example.com/ws` darauf aus. Auch das gemeinsame Relay kann Ihren Traffic nicht lesen, da es Ende-zu-Ende verschlüsselt ist, aber Ihr eigenes hält die Verbindungsmetadaten und den Weg zu diesem Rechner in Ihrem Netzwerk. Ohne eigenes Relay lassen sich überhaupt keine Geräte koppeln.
+- OpenChamber lauscht nur auf dem Rechner, auf dem es läuft. Die Desktop-Einstellung, mit der andere Geräte im lokalen Netzwerk die App öffnen können, ist aus, und der Server startet nicht auf einer Netzwerkadresse, weder über die CLI (`--host`, `--lan`) noch über die Umgebung. Taucht die Richtliniendatei auf, während die App läuft, werden Verbindungen von anderen Rechnern bis zum nächsten Start getrennt. Netzwerkzugriff erlauben Sie mit `"allowNetworkAccess": true` in der Richtliniendatei oder mit `OPENCHAMBER_ALLOW_NETWORK_ACCESS=1`, wo die Umgebung den Enterprise-Modus einschaltet. Denken Sie daran, dass die Verbindung unverschlüsseltes HTTP ist, in einem gemeinsamen Netzwerk kann sie also jeder mitlesen; stellen Sie einen Server, den andere erreichen, hinter [Ihr eigenes HTTPS](/de/reverse-proxy/).
+- [Erweiterungen](/de/extensions/), die Daten vom Rechner nach außen senden können (weil sie eine externe API ansprechen, von externen Adressen laden oder einen Hintergrunddienst ausführen), lassen sich nur aus einem Git-Repository installieren, das in `allowedExtensions` steht. Erweiterungen, die nichts davon tun, installieren Sie wie gewohnt. Eine installierte Erweiterung aus einer anderen Quelle bleibt aus, und die Einstellungen sagen, warum. Die Liste enthält Repository-URLs, weil eine Erweiterung ihren Namen selbst wählt; ein Eintrag, der auf `/` endet, wie `https://github.com/acme/`, erlaubt jedes Repository darunter. Auf den Rechnern von Leuten, die Erweiterungen entwickeln, erlaubt `"allowLocalExtensions": true` außerdem die Installation aus einem lokalen Ordner. Ein ZIP bleibt in jedem Fall gesperrt.
+- Umgebungsvariablen aus **Einstellungen → Allgemein** und aus `opencode service set env` erreichen OpenCode nicht, weil eine davon einen Anbieterschlüssel enthalten könnte. Git, das Terminal und Projektaktionen bekommen sie weiterhin.
 - In der VS Code-Erweiterung ist das Verbinden von Anbietern aus, und Update-Prüfungen melden keine Nutzungsdaten. Jev, Relay, Tunnel, Push-Benachrichtigungen und Sprachdienste aus der Cloud gibt es dort ohnehin nicht.
 
 Aufgaben des kleinen Modells (Sitzungstitel, Zusammenfassungen, Commit-Nachrichten, die Durchsicht der Änderungen) brauchen keinen besonderen Modus. Sie laufen immer auf dem kleinen Modell, das Sie in den Einstellungen gewählt haben, auf einem kleinen Modell des Anbieters, mit dem Sie gerade arbeiten, oder auf dem Standardmodell aus Ihrer OpenCode-Konfiguration. Sie weichen nie auf einen anderen Anbieter aus, der zufällig ebenfalls verbunden ist.
@@ -191,7 +206,7 @@ Die Websuchen und Seitenabrufe des Agenten laufen ebenfalls über OpenCode, zum 
 
 ## Verwandt
 
-- [Ein Gerät verbinden](/connect-devices/) — einmaliges Pairing und gerätespezifische Tokens
-- [Private Relay](/private-relay/) — Ende-zu-Ende-verschlüsselter Zugriff von überall
-- [Tunnel](/tunnels/) — eine öffentliche URL freigeben, wenn Sie eine brauchen
-- [Reverse Proxy](/reverse-proxy/) — OpenChamber hinter Ihrem eigenen Server betreiben
+- [Ein Gerät verbinden](/de/connect-devices/) — einmaliges Pairing und gerätespezifische Tokens
+- [Private Relay](/de/private-relay/) — Ende-zu-Ende-verschlüsselter Zugriff von überall
+- [Tunnel](/de/tunnels/) — eine öffentliche URL freigeben, wenn Sie eine brauchen
+- [Reverse Proxy](/de/reverse-proxy/) — OpenChamber hinter Ihrem eigenen Server betreiben

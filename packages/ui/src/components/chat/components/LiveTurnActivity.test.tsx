@@ -10,6 +10,8 @@ import { OpenCode } from '@opencode/client';
 import type { Part, AssistantMessage } from '@/lib/opencode/model';
 import { I18nProvider, useI18nStore } from '@/lib/i18n';
 import { RuntimeAPIContext } from '@/contexts/runtimeAPIContext';
+import { ThemeSystemContext, type ThemeContextValue } from '@/contexts/theme-system-context';
+import { getDefaultTheme } from '@/lib/theme/themes';
 import type { RuntimeAPIs } from '@/lib/api/types';
 import { SyncProvider } from '@/sync/sync-context';
 import { useUIStore } from '@/stores/useUIStore';
@@ -47,6 +49,15 @@ const runtimeApis: RuntimeAPIs = {
     get permissions() { return unavailable(); },
     get notifications() { return unavailable(); },
 };
+const unexpectedThemeChange = (): never => { throw new Error('Rendering must not change the theme'); };
+const theme = getDefaultTheme(true);
+const themeContext: ThemeContextValue = {
+    currentTheme: theme, availableThemes: [theme], customThemeIds: [], customThemesLoading: false,
+    setTheme: unexpectedThemeChange, reloadCustomThemes: unexpectedThemeChange, importTheme: unexpectedThemeChange,
+    deleteImportedTheme: unexpectedThemeChange, isSystemPreference: false, setSystemPreference: unexpectedThemeChange,
+    themeMode: 'dark', setThemeMode: unexpectedThemeChange, lightThemeId: getDefaultTheme(false).metadata.id,
+    darkThemeId: theme.metadata.id, setLightThemePreference: unexpectedThemeChange, setDarkThemePreference: unexpectedThemeChange,
+};
 const sdk = OpenCode.make({ baseUrl: 'http://localhost', fetch: async () => new Response('[]', { headers: { 'Content-Type': 'application/json' } }) });
 // The answer's action bar also has an aria-expanded button, the branch menu
 // trigger, so the changed-file toggle is the one that opens no popup.
@@ -75,11 +86,13 @@ function turn(messages: ChatMessageEntry[]): TurnRecord {
     }, ...messages]).turns[0];
 }
 
-function Harness({ record, retired = false, changedFiles, isLatestTurn = true }: {
+function Harness({ record, retired = false, changedFiles, isLatestTurn = true, onCopyMessage, onCopyTurn }: {
     record: TurnRecord;
     retired?: boolean;
     changedFiles?: TurnChangedFile[];
     isLatestTurn?: boolean;
+    onCopyMessage?: (messageId: string) => boolean;
+    onCopyTurn?: () => Promise<boolean>;
 }) {
     const [expanded, setExpanded] = React.useState(false);
     const renderMessage = (message: ChatMessageEntry) => (
@@ -91,6 +104,8 @@ function Harness({ record, retired = false, changedFiles, isLatestTurn = true }:
                 isMobile={false} copiedCode={null} onCopyCode={() => undefined} expandedTools={new Set()}
                 onToggleTool={() => undefined} onShowPopup={() => undefined} streamPhase="completed" allowAnimation={false}
                 hasTextContent={message.parts.some((part) => part.type === 'text')} showReasoningTraces
+                onCopyMessage={onCopyMessage ? () => onCopyMessage(message.info.id) : undefined}
+                onCopyTurn={message === record.assistantMessages.at(-1) ? onCopyTurn : undefined}
                 turnGroupingContext={{
                     turnId: 'user', isFirstAssistantInTurn: message === record.assistantMessages[0],
                     isLastAssistantInTurn: message === record.assistantMessages.at(-1),
@@ -100,12 +115,14 @@ function Harness({ record, retired = false, changedFiles, isLatestTurn = true }:
         </div>
     );
     return <RuntimeAPIContext.Provider value={runtimeApis}>
-        <SyncProvider sdk={sdk} directory="/project">
-            <I18nProvider>
-                <LiveTurnActivity turn={record} hasLaterAssistant={retired} expanded={expanded}
-                    onToggle={() => setExpanded((value) => !value)} renderMessage={renderMessage} />
-            </I18nProvider>
-        </SyncProvider>
+        <ThemeSystemContext.Provider value={themeContext}>
+            <SyncProvider sdk={sdk} directory="/project">
+                <I18nProvider>
+                    <LiveTurnActivity turn={record} hasLaterAssistant={retired} expanded={expanded}
+                        onToggle={() => setExpanded((value) => !value)} renderMessage={renderMessage} />
+                </I18nProvider>
+            </SyncProvider>
+        </ThemeSystemContext.Provider>
     </RuntimeAPIContext.Provider>;
 }
 
@@ -142,7 +159,7 @@ describe('live Activity with the real message body', () => {
         container = document.createElement('div');
         document.body.append(container);
         root = createRoot(container);
-        useUIStore.setState({ chatRenderMode: 'live', collapsibleThinkingBlocks: false, showSplitAssistantMessageActions: false });
+        useUIStore.setState({ collapsibleThinkingBlocks: false, showSplitAssistantMessageActions: false });
         useDirectoryStore.setState({ currentDirectory: '/project' });
         useI18nStore.getState().setLocale('en');
         MessageBody = (await import('../message/MessageBody')).default;
@@ -156,8 +173,9 @@ describe('live Activity with the real message body', () => {
         const progress = assistant('progress', [text('progress-text', 'Checking the source'), readPart], 'tool-calls');
         await act(async () => root.render(<Harness record={turn([progress])} />));
         expect(container.textContent).toContain('Checking the source');
-        expect(container.querySelector('[aria-controls]')).toBeNull();
-        expect(container.textContent).not.toContain('Activity');
+        // The header shows from the first step, folded to the latest rows.
+        expect(container.querySelector('button[aria-controls]')?.getAttribute('aria-expanded')).toBe('false');
+        expect(container.textContent).toContain('Activity');
         const final = assistant('final', [text('final-text', 'The final answer')], 'stop');
         await act(async () => root.render(<Harness record={turn([progress, final])} />));
         expect(container.textContent).toContain('The final answer');
@@ -171,6 +189,84 @@ describe('live Activity with the real message body', () => {
         expect(container.textContent).toContain('The final answer');
         await act(async () => root.render(<Harness record={turn([progress, { ...final, parts: [...final.parts] }])} />));
         expect(header?.getAttribute('aria-expanded')).toBe('true');
+    });
+
+    test('draws a page the agent showed above the answer, outside the folded Activity', async () => {
+        const pagePart = (id: string, messageID: string, ok: boolean): Part => ({
+            type: 'tool', tool: 'openchamber_render', id, callID: id, sessionID: 'session', messageID,
+            state: {
+                status: 'completed', input: { action: 'render.page', parameters: { html: '<p>chart</p>', title: `Page ${id}` } },
+                output: '{}', metadata: { openchamber: { ok } }, time: { start: 1, end: 2 },
+            },
+        });
+        const progress = assistant('progress', [text('progress-text', 'Drawing'), readPart, pagePart('early', 'progress', true), pagePart('refused', 'progress', false)], 'tool-calls');
+        const final = assistant('final', [pagePart('late', 'final', true), text('final-text', 'Here it is')], 'stop');
+        await act(async () => root.render(<Harness record={turn([progress, final])} />));
+        const frames = () => [...container.querySelectorAll('iframe')].map((frame) => frame.getAttribute('title'));
+        // Both accepted pages sit with the answer, in the order they ran; the refused one does not.
+        expect(frames()).toEqual(['Page early', 'Page late']);
+        const finalMessage = container.querySelector('[data-fixture-message="final"]');
+        expect(finalMessage?.textContent?.indexOf('Here it is')).toBeGreaterThan(-1);
+        expect(finalMessage?.querySelectorAll('iframe')).toHaveLength(2);
+        expect(container.querySelector('iframe')?.getAttribute('sandbox')).toBe('allow-scripts allow-forms');
+        // Opening Activity shows the steps without drawing the pages a second time.
+        await act(async () => container.querySelector<HTMLButtonElement>('button[aria-controls]')?.click());
+        expect(container.textContent).toContain('Drawing');
+        expect(frames()).toEqual(['Page early', 'Page late']);
+    });
+
+    test('keeps a page in view in a turn that ended without an answer', async () => {
+        const page: Part = {
+            type: 'tool', tool: 'openchamber_render', id: 'page', callID: 'page', sessionID: 'session', messageID: 'progress',
+            state: {
+                status: 'completed', input: { action: 'render.page', html: '<p>chart</p>', title: 'Drawn page' },
+                output: '{}', metadata: { openchamber: { ok: true } }, time: { start: 1, end: 2 },
+            },
+        };
+        const record = turn([assistant('progress', [text('progress-text', 'Still working'), readPart, page], 'tool-calls')]);
+        await act(async () => root.render(<Harness record={record} retired />));
+        // The steps fold away; the page stays below the fold, drawn once.
+        expect(container.textContent).not.toContain('Still working');
+        expect([...container.querySelectorAll('iframe')].map((frame) => frame.getAttribute('title'))).toEqual(['Drawn page']);
+        await act(async () => container.querySelector<HTMLButtonElement>('button[aria-controls]')?.click());
+        expect(container.textContent).toContain('Still working');
+        expect(container.querySelectorAll('iframe')).toHaveLength(1);
+    });
+
+    test('draws what the agent does after a page below it while the turn works', async () => {
+        const page: Part = {
+            type: 'tool', tool: 'openchamber_render', id: 'page', callID: 'page', sessionID: 'session', messageID: 'asked',
+            state: {
+                status: 'completed', input: { action: 'render.page', html: '<p>pick</p>', title: 'Pick a layout', awaitAnswer: true },
+                output: '{}', metadata: { openchamber: { ok: true, answer: { answered: true, summary: 'B', data: null } } }, time: { start: 1, end: 2 },
+            },
+        };
+        const before = assistant('before', [text('before-text', 'Looking around'), readPart], 'tool-calls');
+        const asked = assistant('asked', [page], 'tool-calls');
+        // The reply is still being written: not yet marked final.
+        const writing = assistant('writing', [text('writing-text', 'Building layout B')], undefined);
+        await act(async () => root.render(<Harness record={turn([before, asked, writing])} />));
+
+        const html = container.innerHTML;
+        expect(html.indexOf('title="Pick a layout"')).toBeGreaterThan(-1);
+        expect(html.indexOf('Building layout B')).toBeGreaterThan(html.indexOf('title="Pick a layout"'));
+        expect(html.indexOf('Looking around')).toBeLessThan(html.indexOf('title="Pick a layout"'));
+        expect(container.querySelectorAll('iframe')).toHaveLength(1);
+    });
+
+    test('keeps a page that waits for the user\'s answer in view while its call runs', async () => {
+        const page: Part = {
+            type: 'tool', tool: 'openchamber_render', id: 'page', callID: 'page', sessionID: 'session', messageID: 'progress',
+            state: {
+                status: 'running', input: { action: 'render.page', html: '<p>pick</p>', title: 'Pick a layout', awaitAnswer: true },
+                time: { start: 1 },
+            },
+        };
+        const record = turn([assistant('progress', [text('progress-text', 'Asking'), readPart, page], 'tool-calls')]);
+        await act(async () => root.render(<Harness record={record} retired />));
+        expect(container.textContent).not.toContain('Asking');
+        expect([...container.querySelectorAll('iframe')].map((frame) => frame.getAttribute('title'))).toEqual(['Pick a layout']);
+        expect(container.querySelector('[data-html-render-status="waiting"]')).not.toBeNull();
     });
 
     test('keeps thinking in the final message inside Activity, not outside with the answer', async () => {
@@ -188,12 +284,35 @@ describe('live Activity with the real message body', () => {
         const record = turn([assistant('progress', [text('progress-text', 'Still working'), readPart], 'tool-calls')]);
         await act(async () => root.render(<Harness record={record} />));
         expect(container.textContent).toContain('Still working');
-        expect(container.textContent).not.toContain('Activity');
+        expect(container.textContent).toContain('Activity');
         await act(async () => root.render(<Harness record={record} retired />));
         expect(container.textContent).not.toContain('Still working');
         expect(container.textContent).toContain('Activity');
         await act(async () => container.querySelector<HTMLButtonElement>('button[aria-controls]')?.click());
         expect(container.textContent).toContain('Still working');
+    });
+
+    test('the answer copies the whole turn while each earlier step copies only itself', async () => {
+        useUIStore.setState({ showSplitAssistantMessageActions: true });
+        const copiedMessages: string[] = [];
+        let copiedTurns = 0;
+        const progress = assistant('progress', [text('progress-text', 'Checking the source'), readPart], 'tool-calls');
+        const final = assistant('final', [text('final-text', 'The final answer')], 'stop');
+        await act(async () => root.render(<Harness record={turn([progress, final])}
+            onCopyMessage={(messageId) => { copiedMessages.push(messageId); return true; }}
+            onCopyTurn={async () => { copiedTurns += 1; return true; }} />));
+        await act(async () => container.querySelector<HTMLButtonElement>('button[aria-controls]')?.click());
+
+        const copyButton = (messageId: string) => container.querySelector<HTMLButtonElement>(
+            `[data-fixture-message="${messageId}"] button[aria-label="Copy message text"]`,
+        );
+        await act(async () => copyButton('final')?.click());
+        expect(copiedTurns).toBe(1);
+        expect(copiedMessages).toEqual([]);
+
+        await act(async () => copyButton('progress')?.click());
+        expect(copiedTurns).toBe(1);
+        expect(copiedMessages).toEqual(['progress']);
     });
 
     test('keeps file statistics visible when expanded and uses an ASCII minus', async () => {

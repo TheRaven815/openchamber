@@ -13,11 +13,76 @@ other.
   scheduled-task action allowlist. `actions.js` marks CLI-only actions with
   `agentExposed: false` (currently `schedule.status`); the agent tool consumes
   the filtered `OPENCHAMBER_AGENT_TOOL_*` exports. `schedule.toggle` requires
-  the `disabled` boolean and replaces separate enable/disable actions;
+  the `disabled` boolean and replaces separate enable/disable actions; its
+  `enabled` is the saved state, never the requested one. Loop tasks and the
+  refusal to enable a repository loop are the scheduled-task service's rules
+  (`../scheduled-tasks/DOCUMENTATION.md`, *Local approval*).
   `schedule.list` also returns scheduler status as `scheduler`.
+  `schedule.update` patches a task in place: only the fields the call names
+  change, the id and run state stay, and a task driven by a loop file is
+  refused (the file is its source).
+  `schedule.create` and `schedule.update` accept `targetSessionId`, validated
+  by the scheduled-task service. An empty update clears the target. Create
+  without a model inherits the target selection; an explicit agent overrides
+  it. A task without a target still requires a model.
+- `project-knowledge.js` runs the `knowledge.*` actions of the
+  `openchamber_knowledge` agent tool (`list`, `save`, `delete`, `show`;
+  `kind` names note, todo or plan) against
+  `../project-context/runtime.js`. The owner is the session directory (or the
+  given `projectId` / `directory`) resolved by the same resolver session
+  knowledge and memory use, so what an agent writes is what the next session
+  is given. Notes it creates are `source: agent` with the calling session as
+  origin; payload provenance is ignored. Plans are handed out as file paths
+  (`list`, and the answer to `save`), never as text: the agent reads a plan
+  and makes small edits, such as ticking a step, with its own file tools, and
+  `save` creates or replaces one whole. `expected` guards a replacement only:
+  a save that carries it without an `id` is a 400, never a silently ignored
+  conflict check. Notes and todos carry `planId`, todos `dependsOn`, under
+  the storage rules of `../project-context/DOCUMENTATION.md`; an update may
+  send only those fields. `list` narrows notes, todos and plans to one `planId`; `ready: true`
+  keeps only unfinished todos whose dependencies all exist and are completed,
+  judged on the whole stored list before the plan filter. Readiness is never
+  stored. A plan save with `sessionId` sets or replaces (`null` clears) the
+  existing plan's session link; it carries no markdown, and a call with
+  both, or without an `id`, is refused before anything is written. That
+  input names the plan's session and never a note's origin. A field the
+  tool declares for another kind is a 400. The actions answer `403` while
+  `agentKnowledgeToolEnabled` is `false`. `show` checks the plan exists and
+  sends `openchamber:plan-open-request` to every connected window, like
+  `file.open`; every layout opens the plan the way a click in the Project
+  knowledge Plans list does: in place in the panel on desktop and web, in the
+  drawer's plan viewer on mobile. No
+  window reached is `503`.
+- `render-page.js` runs `render.page` for the `openchamber_render` agent tool. Only `html` is required: a page sent without a title is named after its own `<title>`, else its first h1 to h3, else "Page", with the same rule the chat uses (`renderedPage` in `packages/ui/src/lib/opencode/tools.ts`). Weaker models sent title and html in separate calls, each refused call costing the whole page again; a missing html now also asks for both in one call.
+  The chat draws the page from the call's own input, so the action stores
+  nothing: it checks `html` (at most 200,000 characters) and `title` (at most
+  120) and answers `403` while `agentRenderToolEnabled` is `false`. With
+  `awaitAnswer` the action waits in `createPageAnswers`, keyed by session and
+  call id, until `answerPage` resolves it (`POST /api/openchamber/render/answer`
+  from the chat: a summary of at most 500 characters and data of at most
+  16,000 characters as JSON) or the request is aborted. Nothing outlives the
+  call, so a second answer, an answer for a call that ended, and an answer
+  after a server restart are a `404`, never a silent success.
+  `onPageWaitChange` hears both ends of a wait. The server's wiring
+  (`index.js`) lists the page with the session's pending requests
+  (`trackWaitingPage` in `../opencode/session-runtime.js`), broadcasts
+  `openchamber:page-waiting` / `openchamber:page-settled` to the clients, and
+  sends the same "Input needed" notification a form gets.
+  `renderPageImageSources` lists the local images a page names by absolute
+  path (in quotes or a CSS `url()`, PNG, JPEG, GIF or WebP), every one of them.
+  The image grant route (`../markdown-image-grants/`) allows exactly those, and
+  the chat reads them with the same rule. `fitRenderPageImages` checks the
+  files and takes them in page order while they add up to at most
+  `RENDER_PAGE_IMAGE_BUDGET_BYTES` (25 MB); the grant route serves a page by it.
+  The action checks the page the same way before answering, so the agent hears
+  what the user will see: when an image will not show, the result carries
+  `images` (`shown`, `notShown` with each path and its reason, and `weightMB`
+  against `budgetMB` when the budget cut it) and a note telling the agent to
+  split the page or use smaller images. A page whose images all show answers
+  as before.
 - `routes.js` is the authenticated CLI HTTP adapter. It forwards one action,
   preserves service status and partial-result details, and propagates request
-  cancellation.
+  cancellation. It also carries the chat's answer to a waiting page.
 - `../agent-tool/runtime.js` is the managed-tool adapter. It wraps service
   results in the versioned native-tool envelope and uses a separate ephemeral
   loopback credential.
@@ -40,6 +105,12 @@ other.
   result carries `resultDelivery`: `pending` with a note for the agent, or
   `not-scheduled` with the reason (the prompt never landed, or registering
   failed); the session keeps running either way, so neither is thrown.
+- `returnResult` and `wait` must be booleans when present. Both are compared
+  with `=== true`, so a string `"true"` (the tool path forwards raw JSON, and a
+  model or harness can stringify a boolean) would read as false: a dispatch
+  whose result is never delivered, or a wait that returns at once. A
+  non-boolean is rejected with a 400 before anything is created, the same way
+  `schedule.toggle` requires its `disabled` boolean.
 - Validation that protects side effects runs before session creation or
   dispatch. An explicitly requested model, agent, or variant is checked against
   the directory's own OpenCode agent and provider lists before any session,
@@ -53,6 +124,54 @@ other.
 - Send and fork dispatches without an explicit model/agent/variant reuse the
   target session's last user-message selection before falling back to the
   configured defaults; only session creation resolves defaults directly.
+- `session.create` with `pullRequest` passes the number, and `worktree` and
+  `branch` as folder and local-branch names, to the session service, which
+  creates the worktree through the injected `createChangeRequestWorktree`
+  (the Git routes' contributor pipeline) before any session exists. A
+  malformed number, or `startRef`/`setUpstream` beside it, is a 400; a
+  server without that pipeline answers 501 and never makes a plain branch
+  worktree instead; a provider or transfer refusal keeps its status and
+  message, and no session is created.
+- `session.moveToWorktree` moves a session into a new worktree of its
+  repository and is the session service's `moveToWorktree`
+  (`../openchamber-sessions/worktree-move.js`). The session defaults to the
+  caller, the source directory to where that session lives (the global
+  session list, else the call's directory), `worktree` names the folder and
+  is required, `branch` and `startRef` are optional, and `existingBranch`
+  checks out a branch that already exists in place of both. The worktree is made by
+  the same `createWorktree` pipeline as `session.create`, waits for the same
+  bootstrap, then the uncommitted changes of the files named in `carry`
+  travel in one git stash applied by hash (nothing moves without it), and the
+  session is moved last through OpenCode's
+  `session.move`. A failure after the worktree exists removes it again and
+  puts the changes back; when restoring fails too, the error names the stash
+  so nothing is lost. A 409 means the changes did not apply on the start ref.
+- A session created in a new worktree (`session.create` with `worktree` or
+  `pullRequest`) or moved into one (`session.moveToWorktree`) starts in the same
+  folder of that worktree as the project opens on in its repository: a project
+  at `repo/ai` starts in `<worktree>/ai`, a project at the repository root
+  starts at the worktree root (`../openchamber-sessions/worktree-start-directory.js`,
+  the folder from `git rev-parse --show-prefix` through `resolveWorktreeTopLevel`).
+  The result's `directory` is that folder and `worktree.path` stays the checkout
+  root. When the checkout lacks the folder, it cannot be checked, or git cannot
+  report the project's folder, the session starts at the worktree root and the
+  result carries `startDirectoryFallback` (`missing`, `unverified` or `unknown`).
+  The field is for API callers; the OpenChamber UI does not read it, because it
+  resolves its own start folder and shows its own warning. `unknown` also covers a
+  failed git read: `resolveWorktreeTopLevel` answers without a `prefix` then,
+  which is never taken for "the project is at the repository root". For a move,
+  the project is the registered project whose path contains the session's
+  directory inside the same checkout (the longest one), so a session in
+  `repo/ai/src` follows `repo/ai`. A session in another worktree, `<wtA>/ai/src`,
+  lies in no project path; its folder in that checkout (`ai/src`) picks the
+  longest registered project of the primary checkout whose folder holds it, so it
+  also follows `repo/ai` when `repo` is registered too. A project around a
+  worktree placed inside the repository folder (`repo/.worktrees/a`) does not
+  count as containing it. The UI applies the same rule
+  (`projectPathForCheckoutFolder`). A requested agent or model is validated in the
+  directory the request names, the project's own folder, as before: a new worktree
+  does not exist yet, and its start folder mirrors that one. Git work (carrying
+  changes, removal) stays on the worktree root.
 - Default agents resolve from the owning project before global settings and
   OpenCode defaults. Directory-based requests identify the project before
   creating a worktree; existing linked worktrees resolve through Git's primary
@@ -73,6 +192,27 @@ other.
   directory and does not erase other session results.
 - Destructive session/worktree deletion and project-path registration are not
   part of the action contract.
+- `session.create` called from a session passes that session as
+  `originSessionId`; the session service writes it to the new session as
+  `metadata.openchamber.originSessionID` before the prompt goes out, so the
+  sidebar lists it under the caller's work (a fork records its source itself).
+  A failed write leaves the session a root of its own and fails nothing.
+- `work.name` names the task the session (default: the calling one) works on
+  (`../openchamber-sessions/work-naming.js`, wired through the `workNaming`
+  dependency; without it the action answers 503). In a linked worktree it sets
+  the branch description (`setWorktreeTaskTitle` in `../git`); in the main
+  checkout it renames the task's root session, found through the same lineage
+  the sidebar nests by, and records `metadata.openchamber.workTitle`. A name
+  the user gave stays: the call changes nothing and answers `named: false`
+  with the current name. When to call it is in the session context, next to
+  the linking guidance (`WORK_NAME_GUIDANCE`). While the worktree's branch is
+  OpenChamber's unpushed placeholder (`readRenameableGeneratedBranch`), the
+  call also requires `branch` and renames it (`renameGeneratedWorktreeBranch`),
+  answering `branch` and `branchRenamed: true`; without `branch` it fails with
+  400, says how to call it, and names nothing. Any other branch, and the main
+  checkout, is not renamed: a `branch` passed there answers
+  `branchRenamed: false` with a note, so the agent does not take the call for
+  a rename.
 - `session.link` records a code change under review or an issue on a session
   (`../openchamber-sessions/session-link.js`), defaulting to the calling
   session. When to link is not in the action's description but at the head of
@@ -80,10 +220,22 @@ other.
   (`../session-knowledge/DOCUMENTATION.md`): what the work is about, never one
   mentioned in passing. It sends one service-neutral record (`url`, `title`, `kind`
   `change` or `issue`, optional `identifier`) and nothing is looked up, so any
-  tracker works. The URL decides what is stored: a GitHub pull or issue
+  tracker works. The URL decides what is stored: a github.com pull or issue
   address becomes the GitHub entry (kind from the path, live state as for any
-  link), a Linear issue address the Linear entry, anything else an `external`
-  entry shown by identifier. It only adds or refreshes links, never removes
+  link), an item link a registered tracker's `matchUrl` claims a tracker
+  entry (`{ id: '<provider>:<IDENTIFIER>', kind, provider, identifier }`;
+  Linear's id stays `linear:ENG-12` and its kind stays `linear` while the
+  `/api/linear` alias exists, so older bundled UIs keep showing and keeping
+  it; other trackers are `kind: 'tracker'`, see
+  `../trackers/DOCUMENTATION.md`), anything else an `external` entry shown by identifier.
+  A github.com discussion is such an external entry, identified `#N` unless the
+  agent named it, under the id the UI writes when one is attached
+  (`link:<origin>/<owner>/<repo>/discussions/<N>`), and newer UIs read it as a
+  discussion by its address.
+  A change request or issue address that a source-control provider's
+  `urls.thread` names (GitLab's `/-/merge_requests/N` shape on any host) is
+  keyed by the thread, so linking it again from a tab like `/diffs` or with a
+  query refreshes the one entry. It only adds or refreshes links, never removes
   one: the user owns removal. A missing field or a non-http(s) URL is a 400 and
   nothing is written.
 - `file.open` shows a file in the user's viewer. `file-open.js` resolves a
@@ -105,3 +257,9 @@ other.
   used as a path. The result also states how to present the image, because chat
   renders the image paths written in a finished answer below that message —
   saving the file is not what shows it to anyone.
+- `browser.close` removes a browser tab the calling session opened, and is
+  refused for any other tab, including the user's own tab an action without
+  `tabId` might otherwise fall back to (`../browser-control/DOCUMENTATION.md`).
+  Closing is panel state, so the client that owns the tab performs it through a
+  registered closer, not the page view; the server only validates `tabId` and
+  forwards the action like the rest.

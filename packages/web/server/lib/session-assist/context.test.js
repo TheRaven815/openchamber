@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { excerpt, loadAssistContext, loadSettledTurns, newestContentId } from './context.js';
+import { excerpt, loadAssistContext, newestContentId } from './context.js';
 import { buildAssistPrompt } from './prompt.js';
 
 // v2 message records are flat and a page lists them newest first.
@@ -81,6 +81,16 @@ describe('session assist context', () => {
     expect(context.turns[0].user.text).toContain('User comment:\nВиправ саме це');
     expect(context.turns[0].user.text).toContain('Fix it');
     expect(context.turns[0].user.authored).toContain('Виправ саме це');
+  });
+
+  it('reads a linked item as context, never as the user\'s own words, for the current link kinds and the legacy ones', async () => {
+    for (const kind of ['repository-issue', 'change-request', 'tracker-item', 'github-issue', 'linear-issue']) {
+      const link = user('u', `Linked ${kind}: ENG-12 Search`, { metadata: { openchamberContext: { kind } } });
+      const context = await load(async () => page([link, assistant('a', 'Done')]));
+      expect(context.turns[0].user.text, kind).toContain(`Linked ${kind}: ENG-12 Search`);
+      // The authored text is the language sample; a linked item's title is not one.
+      expect(context.turns[0].user.authored, kind).not.toContain('ENG-12');
+    }
   });
 
   it('retains the comment after a large quote and the conclusion after a long answer', async () => {
@@ -196,42 +206,5 @@ describe('session assist context', () => {
     expect(trimmed.length).toBeLessThanOrEqual(100);
     expect(trimmed).toMatch(/^START/);
     expect(trimmed).toMatch(/END$/);
-  });
-
-  it('reads the settled turns before a message that was just sent', async () => {
-    const signal = new AbortController().signal;
-    // The new request is already stored and has no answer yet.
-    const sent = await loadSettledTurns({
-      signal,
-      readPage: async () => page([...pair(1), ...pair(2), ...pair(3), ...pair(4), user('new', 'fresh request')]),
-    });
-    expect(sent.map((turn) => turn.user.id)).toEqual(['u2', 'u3', 'u4']);
-
-    // It may not be stored yet: the newest record is the previous answer.
-    const notStored = await loadSettledTurns({ signal, readPage: async () => page([...pair(1)]) });
-    expect(notStored.map((turn) => turn.user.id)).toEqual(['u1']);
-
-    // A session without a settled turn is an empty history, not a failure.
-    expect(await loadSettledTurns({ signal, readPage: async () => page([user('only', 'first message')]) })).toEqual([]);
-  });
-
-  it('keeps paging past an unanswered tail until three settled turns are found', async () => {
-    let calls = 0;
-    const turns = await loadSettledTurns({
-      signal: new AbortController().signal,
-      readPage: async ({ cursor }) => {
-        calls++;
-        return cursor ? page([...pair(1), ...pair(2)]) : page([...pair(3), user('new', 'fresh request')], 'older');
-      },
-    });
-    expect(calls).toBe(2);
-    expect(turns.map((turn) => turn.user.id)).toEqual(['u1', 'u2', 'u3']);
-  });
-
-  it('treats a failed page as failure, not as an empty history', async () => {
-    await expect(loadSettledTurns({
-      signal: new AbortController().signal,
-      readPage: async () => ({}),
-    })).rejects.toThrow('Session message page is unavailable');
   });
 });

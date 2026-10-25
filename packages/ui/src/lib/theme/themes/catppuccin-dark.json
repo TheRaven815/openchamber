@@ -26,13 +26,13 @@
       "elevated": "#181825"
     },
     "interactive": {
-      "border": "#8587961d",
+      "border": "#7f849c19",
       "selection": "#313244",
-      "borderHover": "#8587961d",
+      "borderHover": "#7f849c1d",
       "focusRing": "#cba6f7",
       "cursor": "#f5e0dc",
-      "hover": "#31324480",
-      "active": "#333446"
+      "hover": "#cdd6f412",
+      "active": "#cdd6f41f"
     },
     "status": {
       "error": "#f38ba8",
@@ -50,6 +50,7 @@
     },
     "syntax": {
       "base": {
+        "background": "#1e1e2e",
         "comment": "#9399b2",
         "keyword": "#cba6f7",
         "string": "#a6e3a1",
@@ -60,23 +61,23 @@
         "operator": "#94e2d5"
       },
       "tokens": {
-        "variableProperty": "#f9e2af",
-        "parameter": "#eba0ac",
-        "constant": "#94e2d5",
-        "boolean": "#fab387",
         "stringEscape": "#f5c2e7",
         "keywordImport": "#cba6f7",
+        "variableProperty": "#f9e2af",
+        "parameter": "#eba0ac",
+        "boolean": "#fab387",
+        "constant": "#94e2d5",
         "tag": "#89b4fa"
       },
       "highlights": {
+        "lineNumber": "#7f849c",
+        "lineNumberActive": "#cba6f7",
         "diffAdded": "#a6e3a1",
         "diffAddedBackground": "#a6e3a126",
         "diffRemoved": "#f38ba8",
         "diffRemovedBackground": "#f38ba826",
         "diffModified": "#f9e2af",
-        "diffModifiedBackground": "#f9e2af29",
-        "lineNumber": "#7f849c",
-        "lineNumberActive": "#cba6f7"
+        "diffModifiedBackground": "#f9e2af29"
       }
     },
     "pr": {
@@ -84,8 +85,8 @@
     },
     "chat": {
       "background": "#1e1e2e",
-      "userMessageBackground": "#151521",
-      "divider": "#8587961d"
+      "userMessageBackground": "#181825",
+      "divider": "#7f849c1d"
     },
     "markdown": {
       "link": "#89b4fa",
@@ -94,13 +95,15 @@
       "inlineCodeBackground": "#313244",
       "blockquote": "#cdd6f4",
       "blockquoteBorder": "#11111b",
-      "listMarker": "#cba6f799"
+      "listMarker": "#cba6f799",
+      "bold": "#cdd6f4",
+      "italic": "#cdd6f4"
     },
     "tools": {
-      "border": "#8587961d",
-      "icon": "#cba6f7",
+      "border": "#7f849c1d",
+      "icon": "#9399b2",
       "title": "#cdd6f4",
-      "description": "#cdd6f4cc",
+      "description": "#a6adc8",
       "edit": {
         "addedBackground": "#a6e3a126",
         "removedBackground": "#f38ba826",

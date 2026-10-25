@@ -28,7 +28,9 @@ JSON bodies enabled in `opencode/core-routes.js`; stopped by
 the queued send config names `openchamber/auto`, and answers with the real
 model and agent. OpenCode 2.x holds both on the session, so the queue applies
 them with the `POST /api/session/:id/model` and `/agent` calls it already
-makes. The queue captures the sentinel like any other send config.
+makes. The queue captures the sentinel like any other send config. The request
+text it routes on carries the same image attachment fact as a direct send
+(`attachmentHint`).
 
 ## Item
 
@@ -48,9 +50,16 @@ send never re-resolves mutable UI state:
     { kind: 'instruction', text },                       // derived from the text (skill instruction)
     { kind: 'synthetic', text },                         // handed to the composer by another surface
   ],
-  sendConfig: { providerID, modelID, agent?, variant? }   // required
+  sendConfig: { providerID, modelID, agent?, variant? },  // required
+  goal?: { objective?, tokenBudget }  // queued with "run as goal" armed
 }
 ```
+
+`goal` is the composer's armed goal, taken off the composer when the message
+is queued so it belongs to this message and no other. `objective` is present
+only when the arming flow supplied its own (the plan flow); otherwise the
+delivered `text` is the objective. A goal needs message text. Snapshots keep
+`goal`, so the queue row can show it.
 
 The server is a courier for `context`: it validates the shape (a kind it
 knows, a `metadata` object on `context` entries) and delivers each entry as a
@@ -71,7 +80,29 @@ never replaces editable text or delivered parts. Older items without a summary
 derive one from the attached comment metadata or the first non-instruction
 context text. This optional field needs no queue-file migration.
 
-## Persistence
+## Scheduled items
+
+Scheduled tasks use the same items with an optional `scheduledTask` field
+containing `projectId` and `taskId`. Reuse does not change the target's goal or
+auto-accept policy.
+Only the server can enqueue this provenance. Enqueue deduplicates the project
+and task across all session queues. A scheduled item can omit its model to
+keep the target session selection. Normal composer items still require their
+captured model. The UI retains both kinds in the same projection.
+
+Scheduled send guards and terminal result callbacks apply only to scheduled
+items. A definitive before-send target or task refusal with 404 or 409 removes
+that item and lets the next item proceed. This includes removed or retargeted
+tasks and moved targets. Other validation errors and all send failures use the
+existing queue retry policy, including model-switch 404 or 409 responses.
+Successful send reports `sent` without waiting for an assistant reply. Removing,
+clearing or evicting a waiting scheduled item reports `cancelled`. Scheduled
+items can be reordered and removed, but cannot be taken for editing or manual
+send. Bulk take returns only ordinary items and leaves scheduled items queued.
+Disable, delete and retarget use `cancelScheduledTask`. Existing composer
+persistence, retries, directory query and delivery gates remain unchanged.
+
+## Queue file
 
 `<data-dir>/message-queue.json` (`OPENCHAMBER_DATA_DIR` or
 `~/.config/openchamber`): `{ version, revision, sessions: { [sessionId]:
@@ -113,18 +144,26 @@ persisted "sending" flag would strand a message forever.
    the tick re-arms with backoff.
    The turn must also be over for the session's subagents: a parent idles
    while a background subagent works and runs again when OpenCode hands the
-   result back. While `../opencode/session-activity.js` finds a running child
+   result back. While `../opencode/session-activity.js` finds a running descendant
    the head waits (the rerun's idle event re-arms it, a 5 s recheck covers a
    missed one); a failed check is unknown and backs off like the rest.
+   The descendant check follows live active sessions through at most 8 parent
+   links, including idle intermediate subagents; a deeper chain counts as
+   unrelated, as in the UI. Unreadable lineage, cycles and the shared fetch
+   deadline keep the queue held with the existing retry policy. It does not scan historical child pages.
 5. The head is marked in flight (broadcast), then sent. The captured model and
    agent are switched onto the session first (`POST /session/:id/model`,
    `/agent`), because v2 holds both on the session rather than in the body; a
    captured `openchamber/auto` is resolved into a real pair by the routing
-   runtime beforehand. Then the captured context goes ahead as synthetic
-   messages (`POST /session/:id/synthetic` with `resume: false`, an attached
-   item's metadata riding along), followed by pending project knowledge
-   (`sessionKnowledgeRuntime.resolvePendingForSession`, recorded as delivered
-   only after the send is accepted), and then the message itself:
+   runtime beforehand. The session's project knowledge is written into its
+   instruction entries (`sessionKnowledgeRuntime.sync`, which never fails the
+   send). Then the captured context goes ahead as synthetic messages
+   (`POST /session/:id/synthetic` with `resume: false`, an attached item's
+   metadata riding along). An item with a `goal` starts it the way a
+   scheduled goal does: `createSessionGoal` (`../session-goal/create.js`)
+   saves the goal through the injected `persistSessionGoal` before anything is
+   admitted, so a failed save leaves nothing for the retry to duplicate, and
+   the goal briefing goes as the last synthetic message. Then the message itself:
    - text starting with `/` that names a command in OpenCode's `/command`
      list (skills included) goes to `POST /session/:id/command` (body fields
      `name` and `text` since OpenCode 2.0.8) with its file attachments. The
@@ -135,12 +174,12 @@ persisted "sending" flag would strand a message forever.
      context behind for the retry to duplicate;
    - otherwise `POST /session/:id/prompt` with the user's text, files and
      agent mention.
-   Success removes the item, persists, broadcasts, and marks the user
-   message sent for notifications. Failure keeps the item, backs off
+   Success removes the item, persists, broadcasts, and calls `onPromptSent`.
+   Failure keeps the item, backs off
    2 s → 60 s (doubling per consecutive failure of that item), and re-arms.
 6. The next item goes out after the next busy → idle cycle.
 
-A 2xx HTML app-shell response is a failed dispatch, not acceptance. The queued item stays persisted and uses the existing retry backoff. Project knowledge is recorded as delivered only after the prompt or command is accepted.
+A 2xx HTML app-shell response is a failed dispatch, not acceptance. The queued item stays persisted and uses the existing retry backoff.
 
 ## Holds
 
@@ -185,6 +224,11 @@ by the route family's 50 MB JSON limit.
 ## UI ownership
 
 `packages/ui/src/stores/messageQueueStore.ts` is the projection: see its
-section in `packages/ui/src/stores/DOCUMENTATION.md`. VS Code intentionally
+section in `packages/ui/src/stores/DOCUMENTATION.md`. A session in an isolated
+space is queued in this module inside that space, not on the host: the host's
+runtime sees the host's events only and never delivers into a space. The host
+forwards the space's `openchamber:message-queue.updated` changes to the
+browsers, see "Sessions and events" in
+`packages/web/server/lib/spaces/DOCUMENTATION.md`. VS Code intentionally
 does not use this module; with all OpenChamber webviews closed, queued
 messages there are not delivered.

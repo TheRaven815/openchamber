@@ -1,6 +1,7 @@
 
 import { OPENCHAMBER_SDK_API_VERSION, OPENCHAMBER_SDK_CHANNEL } from './api-version.ts';
 import type { FileEditorChange, FileEditorDocument, FileSnapshotRequest, FileSnapshotResultPayload } from './file-editor.ts';
+import type { GuestRunningShellsSnapshot, GuestShellOutputRequest, GuestShellOutputResult, GuestShellStopResult, GuestShellsSubscription } from './shells.ts';
 import type { GuestSessionWorktree, GuestStorageRequest, GuestStorageResult, GuestWorkspaceQuery, GuestWorkspaceSnapshot, GuestWorkspaceSubscription, GuestWorkspaceUpdate, GuestWorktree } from './workspace.ts';
 import type { GuestStatusControl, GuestStatusControlEvent } from './status-controls.ts';
 import type { GuestPopoverClosedEvent, GuestPopoverContext, GuestPopoverRequest } from './popover.ts';
@@ -171,9 +172,22 @@ export type GenerateRequest = {
 
 export type GenerateResult = { text: string };
 
+/**
+ * The outcome of a `generate` whose frame was gone when the model answered:
+ * the panel closed or its frame reloaded first. `request` is what that frame
+ * sent. The host keeps it for a frame of the same extension on the same
+ * surface and project, and hands it over once (`onLateGenerateResult`).
+ */
+export type LateGenerateResult = { request: GenerateRequest } & (
+  | { ok: true; result: GenerateResult }
+  | { ok: false; code: HostRequestErrorCode; error: string }
+);
+
 export type HostResultPayload =
   | GuestStorageResult
   | GuestWorkspaceSnapshot
+  | GuestShellOutputResult
+  | GuestShellStopResult
   | GuestRequestResult
   | StartSessionResult
   | PromptResult
@@ -219,6 +233,8 @@ export type HostReadyContext = {
     deviceStorage?: true;
     statusControls?: true;
     popovers?: true;
+    /** The host keeps `generate` answers that arrive after their frame is gone (`onLateGenerateResult`). */
+    lateGenerateResults?: true;
   };
 };
 
@@ -382,7 +398,8 @@ export const GUEST_SESSION_AGENT_MAX = 80;
 export const GUEST_SETTING_VALUE_MAX = 2_000;
 export const GUEST_REQUEST_PATH_MAX = 2_000;
 export const GUEST_REQUEST_BODY_MAX = 64_000;
-export const GUEST_REQUEST_RESPONSE_MAX = 256_000;
+/** Bytes of a `request` / `serviceRequest` answer; a larger one is `RESPONSE_TOO_LARGE`, never cut off. */
+export const GUEST_REQUEST_RESPONSE_MAX = 8_000_000;
 export const GUEST_REQUEST_TIMEOUT_MS = 20_000;
 /** Guest file path, in characters. */
 export const GUEST_FILE_PATH_MAX = 1_024;
@@ -398,8 +415,23 @@ export const GUEST_GENERATE_SYSTEM_MAX = 8_000;
 export const GUEST_GENERATE_OUTPUT_TOKENS_MAX = 4_000;
 /** Characters in a `generate` answer. */
 export const GUEST_GENERATE_TEXT_MAX = 256_000;
-/** How long `generate` waits for the model before `HOST_TIMEOUT`. */
-export const GUEST_GENERATE_TIMEOUT_MS = 90_000;
+/**
+ * How long `generate` waits for the model before `HOST_TIMEOUT`.
+ *
+ * Must exceed the largest deadline the Small Model server can derive for a
+ * guest-shaped request, plus margin for the iframe → host bridge → HTTP chain.
+ * The server no longer cuts at a flat 60 s: it budgets 60 s base plus 40 ms per
+ * estimated token (~4 chars/token), capped at 900 s
+ * (`generationBudgetMs` in `packages/web/server/lib/small-model/index.js`,
+ * issue #5017). At the guest limits (`GUEST_GENERATE_PROMPT_MAX` +
+ * `GUEST_GENERATE_SYSTEM_MAX` = 72 000 chars ≈ 18 000 tokens) that is 780 s,
+ * so 960 s leaves the chain ~3 minutes.
+ */
+export const GUEST_GENERATE_TIMEOUT_MS = 960_000;
+/** How long the host keeps a `LateGenerateResult` nobody has taken. */
+export const GUEST_GENERATE_LATE_KEEP_MS = 60 * 60_000;
+/** `LateGenerateResult`s the host keeps per extension; a newer one drops the oldest. */
+export const GUEST_GENERATE_LATE_MAX = 8;
 /** Characters of one message's text on a `GuestMessageItem` or a `GuestSessionItem` message. */
 export const GUEST_ITEM_MESSAGE_TEXT_MAX = 200_000;
 /** `JSON.stringify` length ceiling for a `GuestSessionItem`; the host drops the oldest messages to stay under it. */
@@ -421,6 +453,8 @@ export const HOST_REQUEST_ERROR_CODES = [
   'NO_INTEGRATION',
   'NO_SERVICE',
   'SERVICE_FAILED',
+  'REQUEST_FAILED',
+  'RESPONSE_TOO_LARGE',
   'NO_SESSION',
   'SESSION_BUSY',
   'NOT_GRANTED',
@@ -603,13 +637,18 @@ export type HostFileOpenMessage = Envelope & { type: 'file-open'; payload: FileE
 export type HostFileSnapshotMessage = Envelope & { type: 'file-snapshot'; id: string; payload: FileSnapshotRequest };
 /** The snapshot with this `version` is on disk. */
 export type HostFileSavedMessage = Envelope & { type: 'file-saved'; payload: { version: string } };
+/** A kept `generate` outcome, pushed once to a frame that sent `generate-late-listen`. */
+export type HostGenerateLateMessage = Envelope & { type: 'generate-late'; payload: LateGenerateResult };
 export type HostResultMessage = Envelope & { type: 'result'; id: string } & (
   | { ok: true; payload?: HostResultPayload }
   | { ok: false; error: string; code: HostRequestErrorCode }
 );
 
+export type HostShellsMessage = Envelope & { type: 'shells'; payload: { subscriptionId: string; snapshot: GuestRunningShellsSnapshot } };
+
 export type HostMessage =
   | (Envelope & { type: 'workspace'; payload: GuestWorkspaceUpdate })
+  | HostShellsMessage
   | HostReadyMessage
   | HostDirectoryMessage
   | HostSessionMessage
@@ -624,6 +663,7 @@ export type HostMessage =
   | HostFileOpenMessage
   | HostFileSnapshotMessage
   | HostFileSavedMessage
+  | HostGenerateLateMessage
   | HostResultMessage;
 
 type GuestCall<Type extends string, Payload = never> = Envelope & { type: Type; id: string } & (
@@ -670,11 +710,22 @@ export type GuestFileChangeMessage = Envelope & { type: 'file-change'; payload: 
 export type GuestFileSaveMessage = Envelope & { type: 'file-save' };
 /** The editor cannot open this file; the host shows its source instead. Fire and forget. */
 export type GuestFileUnsupportedMessage = Envelope & { type: 'file-unsupported' };
+/** This frame takes kept `generate` outcomes; the host pushes them as `generate-late`. Fire and forget, repeated on every `ready`. */
+export type GuestGenerateLateListenMessage = Envelope & { type: 'generate-late-listen' };
+
+export type GuestShellsSubscribeMessage = GuestCall<'shells-subscribe', GuestShellsSubscription>;
+export type GuestShellsUnsubscribeMessage = GuestCall<'shells-unsubscribe', { subscriptionId: string }>;
+export type GuestShellOutputMessage = GuestCall<'shell-output', GuestShellOutputRequest>;
+export type GuestShellStopMessage = GuestCall<'shell-stop', { shellId: string }>;
 
 export type GuestMessage =
   | GuestCall<'workspace-read', GuestWorkspaceQuery>
   | GuestCall<'workspace-subscribe', GuestWorkspaceSubscription>
   | GuestCall<'workspace-unsubscribe', { subscriptionId: string }>
+  | GuestShellsSubscribeMessage
+  | GuestShellsUnsubscribeMessage
+  | GuestShellOutputMessage
+  | GuestShellStopMessage
   | GuestCall<'storage', GuestStorageRequest>
   | GuestCall<'open-session', { sessionId: string }>
   | GuestHelloMessage
@@ -710,7 +761,8 @@ export type GuestMessage =
   | GuestFileSnapshotResultMessage
   | GuestFileChangeMessage
   | GuestFileSaveMessage
-  | GuestFileUnsupportedMessage;
+  | GuestFileUnsupportedMessage
+  | GuestGenerateLateListenMessage;
 
 const serviceStatusSet: ReadonlySet<string> = new Set(SERVICE_STATUS_VALUES);
 
@@ -748,9 +800,11 @@ export const isGenerateResult = (
 
 const HOST_PUSH_TYPES: ReadonlySet<string> = new Set([
   'workspace',
+  'shells',
   'ready', 'directory', 'session', 'connection', 'settings', 'session-lifecycle', 'item', 'resolve', 'action',
   'status-control-event', 'popover-closed',
   'file-open', 'file-snapshot', 'file-saved',
+  'generate-late',
 ]);
 
 /** What a postMessage payload may carry before it is read as a host message. */

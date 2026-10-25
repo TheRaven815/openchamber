@@ -25,3 +25,65 @@ describe('repository-qualified PR sources', () => {
     expect(received).toEqual(['/repo', 42, readContext, { sourceRepo: source.sourceRepo }]);
   });
 });
+
+describe('GitLab namespace owners', () => {
+  it('accepts a subgroup namespace owner so MR walkthrough selection works below the root group', () => {
+    const source = parseSource({ kind: 'pr', number: 12, sourceRepo: { owner: 'group/subgroup', repo: 'repo' } });
+    expect(source.sourceRepo).toEqual({ owner: 'group/subgroup', repo: 'repo' });
+    expect(sourceKey(source)).toBe('pr:group/subgroup/repo:12');
+  });
+
+  it('accepts deeper nesting and dot/underscore segments as GitLab namespaces spell them', () => {
+    for (const owner of ['group/sub/sub', 'group.name/sub_group']) {
+      const source = parseSource({ kind: 'pr', number: 3, sourceRepo: { owner, repo: 'repo' } });
+      expect(source.sourceRepo.owner).toBe(owner);
+    }
+  });
+
+  it('keeps rejecting values that are not owner paths', () => {
+    for (const owner of ['group/../repo', '/group/repo', 'group/repo/', 'group//repo', '.', 'group/./repo']) {
+      expect(() => parseSource({ kind: 'pr', number: 3, sourceRepo: { owner, repo: 'repo' } }))
+        .toThrow('pr sources require a valid repository');
+    }
+  });
+});
+
+describe('PR sources naming a revision', () => {
+  const REVISION = 'c'.repeat(40);
+
+  it('scopes the key by the revision and keeps the current revision\'s key unchanged', () => {
+    const named = parseSource({ kind: 'pr', number: 42, revision: REVISION.toUpperCase() });
+    expect(named).toEqual({ kind: 'pr', number: 42, revision: REVISION });
+    expect(sourceKey(named)).toBe(`pr:42@${REVISION}`);
+    expect(sourceKey(parseSource({ kind: 'pr', number: 42 }))).toBe('pr:42');
+  });
+
+  it('refuses anything but a full SHA', () => {
+    for (const revision of ['abc', 'g'.repeat(40), 3, '']) {
+      expect(() => parseSource({ kind: 'pr', number: 42, revision })).toThrow('full revision SHA');
+    }
+  });
+
+  it('hands the revision to the diff loader', async () => {
+    let received;
+    await loadSourceSections('/repo', parseSource({ kind: 'pr', number: 42, revision: REVISION }), {
+      readContext: {},
+      getPullRequestDiff: async (...args) => {
+        received = args;
+        return { patch: '', meta: {} };
+      },
+    });
+    expect(received[3]).toEqual({ sourceRepo: null, revision: REVISION });
+  });
+});
+
+describe('top-level project PR sources', () => {
+  it('parses an empty owner and keys it by the joined path, as the UI does', () => {
+    const source = parseSource({ kind: 'pr', number: 7, sourceRepo: { owner: '', repo: 'demo' } });
+    expect(source.sourceRepo).toEqual({ owner: '', repo: 'demo' });
+    expect(sourceKey(source)).toBe('pr:demo:7');
+    expect(sourceKey(parseSource({ kind: 'pr', number: 7, sourceRepo: { owner: 'team/app', repo: 'sub' } }))).toBe('pr:team/app/sub:7');
+    expect(() => parseSource({ kind: 'pr', number: 7, sourceRepo: { repo: 'demo' } })).toThrow('valid repository');
+  });
+});
+

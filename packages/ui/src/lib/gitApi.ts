@@ -2,7 +2,7 @@
 import * as gitHttp from './gitApiHttp';
 import { mapWithConcurrency } from './concurrency';
 import { opencodeClient } from './opencode/client';
-import { renderMagicPrompt } from './magicPrompts';
+import { loadMagicPrompts } from './magicPrompts';
 import { requestSmallModel } from './smallModelRequest';
 import { materializeOpenDraftSession, useSessionUIStore } from '@/sync/session-ui-store';
 import { useSelectionStore } from '@/sync/selection-store';
@@ -10,7 +10,7 @@ import { useConfigStore } from '@/stores/useConfigStore';
 import { getRegisteredRuntimeAPIs } from '@/contexts/runtimeAPIRegistry';
 import { runtimeFetch } from '@/lib/runtime-fetch';
 import { notifyGitStatusInvalidated } from './gitStatusInvalidation';
-import type { SourceControlProvider } from '@/lib/source-control/types';
+import type { SourceControlProviderDescriptor } from '@/lib/source-control/providers/descriptor';
 
 export type {
   GitRemote,
@@ -80,6 +80,13 @@ export async function resolveGitPrimaryRoot(directory: string): Promise<string> 
   return result.root;
 }
 
+/** Where `directory` sits inside its repository's checkout; `''` at the root. Rejects when unknown. */
+export async function resolveGitRepositoryPrefix(directory: string): Promise<string> {
+  const runtime = getRuntimeGit();
+  if (runtime?.resolveRepositoryPrefix) return runtime.resolveRepositoryPrefix(directory);
+  return gitHttp.resolveGitRepositoryPrefix(directory);
+}
+
 export async function resolveGitTopLevel(directory: string): Promise<string> {
   const result = await gitHttp.resolveGitTopLevel(directory);
   return result.root;
@@ -91,21 +98,6 @@ export async function getGitCommitSummaries(
 ): Promise<Array<{ sha: string; short: string; subject: string }>> {
   const result = await gitHttp.getGitCommitSummaries(directory, shas);
   return result.commits;
-}
-
-export async function getGitDiff(directory: string, options: import('./api/types').GetGitDiffOptions): Promise<import('./api/types').GitPathDiffResponse> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtime.getGitDiff(directory, options);
-  return gitHttp.getGitDiff(directory, options);
-}
-
-export async function getGitFileDiff(
-  directory: string,
-  options: import('./api/types').GetGitFileDiffOptions
-): Promise<import('./api/types').GitFileDiffResponse> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtime.getGitFileDiff(directory, options);
-  return gitHttp.getGitFileDiff(directory, options);
 }
 
 export async function getGitRangeDiff(
@@ -135,16 +127,6 @@ export async function getBranchBase(
   return gitHttp.getBranchBase(directory, branch);
 }
 
-export async function revertGitFile(
-  directory: string,
-  filePath: string,
-  options?: { scope?: 'all' | 'working' }
-): Promise<void> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtimeStatusMutation(directory, runtime.revertGitFile(directory, filePath, options));
-  return gitHttp.revertGitFile(directory, filePath, options);
-}
-
 export async function stageGitFile(directory: string, filePath: string): Promise<void> {
   const runtime = getRuntimeGit();
   if (runtime?.stageGitFile) return runtimeStatusMutation(directory, runtime.stageGitFile(directory, filePath));
@@ -169,30 +151,6 @@ export async function unstageGitFiles(directory: string, filePaths: string[]): P
   return gitHttp.unstageGitFiles(directory, filePaths);
 }
 
-export async function stageGitHunk(directory: string, filePath: string, patch: string): Promise<void> {
-  const runtime = getRuntimeGit();
-  if (runtime?.stageGitHunk) return runtimeStatusMutation(directory, runtime.stageGitHunk(directory, filePath, patch));
-  return gitHttp.stageGitHunk(directory, filePath, patch);
-}
-
-export async function unstageGitHunk(directory: string, filePath: string, patch: string): Promise<void> {
-  const runtime = getRuntimeGit();
-  if (runtime?.unstageGitHunk) return runtimeStatusMutation(directory, runtime.unstageGitHunk(directory, filePath, patch));
-  return gitHttp.unstageGitHunk(directory, filePath, patch);
-}
-
-export async function revertGitHunk(directory: string, filePath: string, patch: string): Promise<void> {
-  const runtime = getRuntimeGit();
-  if (runtime?.revertGitHunk) return runtimeStatusMutation(directory, runtime.revertGitHunk(directory, filePath, patch));
-  return gitHttp.revertGitHunk(directory, filePath, patch);
-}
-
-export async function isLinkedWorktree(directory: string): Promise<boolean> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtime.isLinkedWorktree(directory);
-  return gitHttp.isLinkedWorktree(directory);
-}
-
 export async function getGitBranches(
   directory: string,
   options?: import('./api/types').GitBranchListOptions,
@@ -206,12 +164,6 @@ export async function getGitUnpushedBranchCounts(directory: string, branches: st
   const runtime = getRuntimeGit();
   if (runtime) return runtime.getGitUnpushedBranchCounts(directory, branches);
   return gitHttp.getGitUnpushedBranchCounts(directory, branches);
-}
-
-export async function deleteGitBranch(directory: string, payload: import('./api/types').GitDeleteBranchPayload): Promise<{ success: boolean }> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtimeStatusMutation(directory, runtime.deleteGitBranch(directory, payload));
-  return gitHttp.deleteGitBranch(directory, payload);
 }
 
 const COMMIT_DIFF_FILE_LIMIT = 30;
@@ -323,8 +275,9 @@ export async function generateCommitMessage(
   });
 
   const recentCommits = await collectRecentCommitSubjects(directory);
-  const visiblePrompt = await renderMagicPrompt('git.commit.generate.visible');
-  const hiddenPrompt = await renderMagicPrompt('git.commit.generate.instructions', {
+  const prompts = await loadMagicPrompts(directory);
+  const visiblePrompt = prompts.render('git.commit.generate.visible');
+  const hiddenPrompt = prompts.render('git.commit.generate.instructions', {
     selected_files: files.map((file) => `- ${file}`).join('\n'),
     recent_commits: recentCommits,
   });
@@ -342,6 +295,7 @@ export async function generateCommitMessage(
         ...(currentProviderId ? { preferredProviderID: currentProviderId } : {}),
         ...(currentModelId ? { preferredModelID: currentModelId } : {}),
       }),
+      directory,
     }, { notifyOnError: false });
 
     if (response.status === 404) {
@@ -427,13 +381,11 @@ const readOptionalRepoTextFile = async (directory: string, relativePath: string)
 // A repository that ships a PR template expects descriptions in its shape, so
 // the template wins over the built-in section layout. Missing template is the
 // normal case, not a failure: probing stops at the first file that has content.
-const collectPullRequestTemplate = async (directory: string, provider: SourceControlProvider | undefined): Promise<string> => {
-  // A GitLab project's own merge request template comes before any GitHub-style one it may also carry.
-  const gitlabTemplate = '.gitlab/merge_request_templates/Default.md';
-  const paths = provider === 'gitlab'
-    ? [gitlabTemplate, ...PULL_REQUEST_TEMPLATE_PATHS.filter((candidate) => candidate !== gitlabTemplate)]
-    : PULL_REQUEST_TEMPLATE_PATHS;
-  const noun = provider === 'gitlab' ? 'merge request' : 'pull request';
+const collectPullRequestTemplate = async (directory: string, provider: ChangeRequestProviderWords | undefined): Promise<string> => {
+  // A provider's own templates (GitLab's merge request template) come before any GitHub-style one the project may also carry.
+  const own = provider?.features.changeRequestTemplates ?? [];
+  const paths = [...own, ...PULL_REQUEST_TEMPLATE_PATHS.filter((candidate) => !own.includes(candidate))];
+  const noun = provider?.terminology.promptNoun ?? 'pull request';
   for (const relativePath of paths) {
     const content = await readOptionalRepoTextFile(directory, relativePath);
     const trimmed = content?.trim();
@@ -458,9 +410,12 @@ const collectPullRequestTemplate = async (directory: string, provider: SourceCon
   return '';
 };
 
+/** What a generation prompt says of the project's provider: its name, its English noun, its template paths. */
+type ChangeRequestProviderWords = Pick<SourceControlProviderDescriptor, 'label' | 'terminology' | 'features'>;
+
 export async function generatePullRequestDescription(
   directory: string,
-  payload: { base: string; head: string; context?: string; zenModel?: string; providerId?: string; modelId?: string; changeRequestProvider?: SourceControlProvider }
+  payload: { base: string; head: string; context?: string; zenModel?: string; providerId?: string; modelId?: string; changeRequestProvider?: ChangeRequestProviderWords }
 ): Promise<import('./api/types').GeneratedPullRequestDescription> {
   const startedAt = Date.now();
 
@@ -511,10 +466,13 @@ export async function generatePullRequestDescription(
     changedFiles: changedFiles.length,
   });
 
-  const visiblePrompt = await renderMagicPrompt('git.pr.generate.visible', {
-    change_request: payload.changeRequestProvider === 'gitlab' ? 'GitLab merge request' : 'GitHub pull request',
+  const prompts = await loadMagicPrompts(directory);
+  const visiblePrompt = prompts.render('git.pr.generate.visible', {
+    change_request: payload.changeRequestProvider
+      ? `${payload.changeRequestProvider.label} ${payload.changeRequestProvider.terminology.promptNoun}`
+      : 'pull request',
   });
-  const hiddenPrompt = await renderMagicPrompt('git.pr.generate.instructions', {
+  const hiddenPrompt = prompts.render('git.pr.generate.instructions', {
     base_branch: payload.base,
     head_branch: payload.head,
     commits: commits.map((commit) => {
@@ -545,6 +503,7 @@ export async function generatePullRequestDescription(
         ...(currentProviderId ? { preferredProviderID: currentProviderId } : {}),
         ...(currentModelId ? { preferredModelID: currentModelId } : {}),
       }),
+      directory,
     }, { notifyOnError: false });
 
     if (response.status === 404) {
@@ -748,7 +707,7 @@ const runStructuredGenerationInActiveSession = async ({
   return parsedOutput;
 };
 
-export async function listGitWorktrees(directory: string): Promise<import('./api/types').GitWorktreeInfo[]> {
+async function listGitWorktrees(directory: string): Promise<import('./api/types').GitWorktreeInfo[]> {
   const runtime = getRuntimeGit();
   if (runtime?.worktree?.list) {
     return runtime.worktree.list(directory);
@@ -757,7 +716,7 @@ export async function listGitWorktrees(directory: string): Promise<import('./api
   return gitHttp.listGitWorktrees(directory);
 }
 
-export async function validateGitWorktree(
+async function validateGitWorktree(
   directory: string,
   payload: import('./api/types').CreateGitWorktreePayload
 ): Promise<import('./api/types').GitWorktreeValidationResult> {
@@ -784,21 +743,7 @@ export async function getGitWorktreeBootstrapStatus(
   return gitHttp.getGitWorktreeBootstrapStatus(directory);
 }
 
-export async function previewGitWorktree(
-  directory: string,
-  payload: import('./api/types').CreateGitWorktreePayload
-): Promise<import('./api/types').GitWorktreeCreateResult> {
-  const runtime = getRuntimeGit();
-  if (runtime?.worktree?.preview) {
-    return runtime.worktree.preview(directory, payload);
-  }
-  if (runtime?.previewGitWorktree) {
-    return runtime.previewGitWorktree(directory, payload);
-  }
-  return gitHttp.previewGitWorktree(directory, payload);
-}
-
-export async function createGitWorktree(
+async function createGitWorktree(
   directory: string,
   payload: import('./api/types').CreateGitWorktreePayload
 ): Promise<import('./api/types').GitWorktreeCreateResult> {
@@ -812,7 +757,7 @@ export async function createGitWorktree(
   return gitHttp.createGitWorktree(directory, payload);
 }
 
-export async function deleteGitWorktree(
+async function deleteGitWorktree(
   directory: string,
   payload: import('./api/types').RemoveGitWorktreePayload
 ): Promise<{ success: boolean }> {
@@ -826,6 +771,19 @@ export async function deleteGitWorktree(
   return gitHttp.deleteGitWorktree(directory, payload);
 }
 
+/** Renames the task of the worktree at `directory`; the user's name stays over the agent's. */
+export async function setGitWorktreeTitle(
+  directory: string,
+  title: string,
+): Promise<import('./api/types').GitWorktreeTitleResult> {
+  const runtime = getRuntimeGit();
+  if (runtime?.worktree?.setTitle) {
+    return runtime.worktree.setTitle(directory, title);
+  }
+  if (runtime) throw new Error('Renaming a worktree task is not available here');
+  return gitHttp.setGitWorktreeTitle(directory, title);
+}
+
 export async function snapshotGitWorktree(
   directory: string,
   payload: import('./api/types').GitWorktreeSnapshotPayload
@@ -837,6 +795,30 @@ export async function snapshotGitWorktree(
   return gitHttp.snapshotGitWorktree(directory, payload);
 }
 
+/**
+ * Worktree archives exist where the runtime's git offers them: web and the
+ * desktop app, through the server. VS Code keeps its own list without them.
+ */
+export const canArchiveWorktrees = (): boolean => {
+  const runtime = getRuntimeGit();
+  return runtime ? Boolean(runtime.worktree?.archive && runtime.worktree.listArchives && runtime.worktree.restoreArchive && runtime.worktree.deleteArchive) : true;
+};
+
+const runtimeWorktreeArchives = () => {
+  const runtime = getRuntimeGit();
+  if (!runtime) {
+    return {
+      archive: gitHttp.archiveGitWorktree,
+      listArchives: gitHttp.listGitWorktreeArchives,
+      restoreArchive: gitHttp.restoreGitWorktreeArchive,
+      deleteArchive: gitHttp.deleteGitWorktreeArchive,
+    };
+  }
+  const { archive, listArchives, restoreArchive, deleteArchive } = runtime.worktree ?? {};
+  if (!archive || !listArchives || !restoreArchive || !deleteArchive) throw new Error('Worktree archives are not available here');
+  return { archive, listArchives, restoreArchive, deleteArchive };
+};
+
 export const git = {
   worktree: {
     list: listGitWorktrees,
@@ -844,45 +826,12 @@ export const git = {
     create: createGitWorktree,
     remove: deleteGitWorktree,
     snapshot: snapshotGitWorktree,
+    archive: (directory: string, payload: import('./api/types').ArchiveGitWorktreePayload) => runtimeWorktreeArchives().archive(directory, payload),
+    listArchives: (directory: string) => runtimeWorktreeArchives().listArchives(directory),
+    restoreArchive: (directory: string, id: string) => runtimeWorktreeArchives().restoreArchive(directory, id),
+    deleteArchive: (directory: string, payload: import('./api/types').DeleteGitWorktreeArchivePayload) => runtimeWorktreeArchives().deleteArchive(directory, payload),
   },
 };
-
-export async function createGitCommit(
-  directory: string,
-  message: string,
-  options: import('./api/types').CreateGitCommitOptions = {}
-): Promise<import('./api/types').GitCommitResult> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtimeStatusMutation(directory, runtime.createGitCommit(directory, message, options));
-  return gitHttp.createGitCommit(directory, message, options);
-}
-
-export async function gitPush(
-  directory: string,
-  options: { remote?: string; branch?: string; options?: string[] | Record<string, unknown> } = {}
-): Promise<import('./api/types').GitPushResult> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtimeStatusMutation(directory, runtime.gitPush(directory, options));
-  return gitHttp.gitPush(directory, options);
-}
-
-export async function gitPull(
-  directory: string,
-  options: import('./api/types').GitPullOptions = {}
-): Promise<import('./api/types').GitPullResult> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtimeStatusMutation(directory, runtime.gitPull(directory, options));
-  return gitHttp.gitPull(directory, options);
-}
-
-export async function gitFetch(
-  directory: string,
-  options: { remote?: string; branch?: string } = {}
-): Promise<{ success: boolean }> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtimeStatusMutation(directory, runtime.gitFetch(directory, options));
-  return gitHttp.gitFetch(directory, options);
-}
 
 export async function listGitStashes(directory: string): Promise<{ stashes: import('./api/types').GitStashEntry[] }> {
   const runtime = getRuntimeGit();
@@ -920,12 +869,6 @@ export async function dropGitStash(directory: string, options: { ref: string }):
   return gitHttp.dropGitStash(directory, options);
 }
 
-export async function checkoutBranch(directory: string, branch: string): Promise<{ success: boolean; branch: string }> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtimeStatusMutation(directory, runtime.checkoutBranch(directory, branch));
-  return gitHttp.checkoutBranch(directory, branch);
-}
-
 export async function createBranch(
   directory: string,
   name: string,
@@ -934,16 +877,6 @@ export async function createBranch(
   const runtime = getRuntimeGit();
   if (runtime) return runtimeStatusMutation(directory, runtime.createBranch(directory, name, startPoint));
   return gitHttp.createBranch(directory, name, startPoint);
-}
-
-export async function renameBranch(
-  directory: string,
-  oldName: string,
-  newName: string
-): Promise<{ success: boolean; branch: string }> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtimeStatusMutation(directory, runtime.renameBranch(directory, oldName, newName));
-  return gitHttp.renameBranch(directory, oldName, newName);
 }
 
 export async function getGitLog(
@@ -1008,46 +941,10 @@ export async function deleteGitIdentity(id: string): Promise<void> {
   return gitHttp.deleteGitIdentity(id);
 }
 
-export async function getCurrentGitIdentity(directory: string): Promise<import('./api/types').GitIdentitySummary | null> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtime.getCurrentGitIdentity(directory);
-  return gitHttp.getCurrentGitIdentity(directory);
-}
-
-export async function hasLocalIdentity(directory: string): Promise<boolean> {
-  const runtime = getRuntimeGit();
-  if (runtime?.hasLocalIdentity) return runtime.hasLocalIdentity(directory);
-  return gitHttp.hasLocalIdentity(directory);
-}
-
-export async function setGitIdentity(
-  directory: string,
-  profileId: string
-): Promise<{ success: boolean; profile: import('./api/types').GitIdentityProfile | null }> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtime.setGitIdentity(directory, profileId);
-  return gitHttp.setGitIdentity(directory, profileId);
-}
-
 export async function getGlobalGitIdentity(): Promise<import('./api/types').GitIdentitySummary | null> {
   const runtime = getRuntimeGit();
   if (runtime?.getGlobalGitIdentity) return runtime.getGlobalGitIdentity();
   return gitHttp.getGlobalGitIdentity();
-}
-
-export async function getRemotes(directory: string): Promise<import('./api/types').GitRemote[]> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtime.getRemotes(directory);
-  return gitHttp.getRemotes(directory);
-}
-
-export async function removeRemote(
-  directory: string,
-  payload: import('./api/types').GitRemoveRemotePayload
-): Promise<{ success: boolean }> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtimeStatusMutation(directory, runtime.removeRemote(directory, payload));
-  return gitHttp.removeRemote(directory, payload);
 }
 
 export async function rebase(
@@ -1057,12 +954,6 @@ export async function rebase(
   const runtime = getRuntimeGit();
   if (runtime) return runtimeStatusMutation(directory, runtime.rebase(directory, options));
   return gitHttp.rebase(directory, options);
-}
-
-export async function abortRebase(directory: string): Promise<{ success: boolean }> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtimeStatusMutation(directory, runtime.abortRebase(directory));
-  return gitHttp.abortRebase(directory);
 }
 
 export async function merge(
@@ -1112,76 +1003,23 @@ export async function resetToCommit(
   return gitHttp.resetToCommit(directory, hash, mode, force);
 }
 
-export async function abortMerge(directory: string): Promise<{ success: boolean }> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtimeStatusMutation(directory, runtime.abortMerge(directory));
-  return gitHttp.abortMerge(directory);
-}
-
-export async function continueRebase(directory: string): Promise<{ success: boolean; conflict: boolean; conflictFiles?: string[] }> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtimeStatusMutation(directory, runtime.continueRebase(directory));
-  return gitHttp.continueRebase(directory);
-}
-
-export async function continueMerge(directory: string): Promise<{ success: boolean; conflict: boolean; conflictFiles?: string[] }> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtimeStatusMutation(directory, runtime.continueMerge(directory));
-  return gitHttp.continueMerge(directory);
-}
-
-export async function stash(
-  directory: string,
-  options?: { message?: string; includeUntracked?: boolean }
-): Promise<{ success: boolean }> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtime.stash(directory, options);
-  return gitHttp.stash(directory, options);
-}
-
-export async function stashPop(directory: string): Promise<{ success: boolean }> {
-  const runtime = getRuntimeGit();
-  if (runtime) return runtime.stashPop(directory);
-  return gitHttp.stashPop(directory);
-}
-
-export async function getConflictDetails(directory: string): Promise<import('./api/types').MergeConflictDetails> {
-  const runtime = getRuntimeGit();
-  if (runtime?.getConflictDetails) return runtime.getConflictDetails(directory);
-  return gitHttp.getConflictDetails(directory);
-}
-
-export async function validateWorktreeDirectory(
-  directory: string,
-  worktreeRoot: string
-): Promise<{
+/**
+ * Whether `directory` exists inside the checkout at `worktreeRoot` once both
+ * are canonicalized, so a symlink out of the checkout reports `insideWorktreeRoot: false`.
+ */
+export async function validateWorktreeDirectory(directory: string, worktreeRoot: string): Promise<{
   valid: boolean;
   insideWorktreeRoot: boolean;
   resolvedWorktreeRoot: string | null;
   resolvedCwd: string | null;
 }> {
   const runtime = getRuntimeGit();
-  if (runtime?.validateWorktreeDirectory) {
-    return runtime.validateWorktreeDirectory(directory, worktreeRoot);
-  }
+  if (runtime?.validateWorktreeDirectory) return runtime.validateWorktreeDirectory(directory, worktreeRoot);
   return gitHttp.validateWorktreeDirectory(directory, worktreeRoot);
 }
 
-export async function canonicalizeWorktreeState(
-  directory: string
-): Promise<{
-  worktreeRoot: string | null;
-  cwd: string | null;
-  branch: string | null;
-  headState: 'branch' | 'detached' | 'unborn';
-  worktreeStatus: 'pending' | 'ready' | 'missing' | 'invalid' | 'not-a-repo';
-  legacy: boolean;
-  degraded: boolean;
-  attentionReason?: 'merge' | 'rebase' | 'cherry-pick' | 'revert' | 'bisect' | null;
-}> {
+export async function getConflictDetails(directory: string): Promise<import('./api/types').MergeConflictDetails> {
   const runtime = getRuntimeGit();
-  if (runtime?.canonicalizeWorktreeState) {
-    return runtime.canonicalizeWorktreeState(directory);
-  }
-  return gitHttp.canonicalizeWorktreeState(directory);
+  if (runtime?.getConflictDetails) return runtime.getConflictDetails(directory);
+  return gitHttp.getConflictDetails(directory);
 }

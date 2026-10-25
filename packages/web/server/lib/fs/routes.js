@@ -1,6 +1,16 @@
 import { createRealpathCache } from '../path-realpath-cache.js';
 import { redactGitText } from '../git/redaction.js';
 import { resolveByteRange } from './byte-range.js';
+import { injectPreviewBridge } from './preview-bridge.js';
+import { createWorkspaceFileNameIndex } from './workspace-file-names.js';
+import { createGitCheckIgnoreTimeoutMs } from './search.js';
+import {
+  CONTENT_SEARCH_DEFAULT_LIMIT,
+  CONTENT_SEARCH_MAX_LIMIT,
+  CONTENT_SEARCH_MAX_QUERY_LENGTH,
+  createContentSearchRuntime,
+} from './content-search.js';
+import { isString } from '../shared/guards.js';
 import nodeFsPromises from 'node:fs/promises';
 import nodePath from 'node:path';
 
@@ -126,12 +136,6 @@ const createGitReadCacheTtlMs = () => {
   const raw = Number(process.env.OPENCHAMBER_GIT_READ_CACHE_TTL_MS);
   if (Number.isFinite(raw) && raw >= 0) return raw;
   return 30 * 1000;
-};
-
-const createGitCheckIgnoreTimeoutMs = () => {
-  const raw = Number(process.env.OPENCHAMBER_GIT_CHECK_IGNORE_TIMEOUT_MS);
-  if (Number.isFinite(raw) && raw >= 0) return raw;
-  return 2500;
 };
 
 const createUploadMaxBytes = () => {
@@ -312,10 +316,31 @@ const resolveWorkspacePathFromWorktrees = async ({ targetPath, baseDirectory, pa
   return { ok: false, error: 'Path is outside of active workspace' };
 };
 
-const resolveWorkspacePathFromContext = async ({ req, targetPath, resolveProjectDirectory, path, os, fsPromises, normalizeDirectoryPath, managedRoots }) => {
+// Chats belong to no project, so with no project open the chats roots are the
+// only place a path may resolve. The config root stays behind a project.
+const resolveChatsPathWithoutProject = async ({ targetPath, chatsRoots, path, os, fsPromises, normalizeDirectoryPath }) => {
+  const resolveIn = (baseDirectory) => resolveWorkspacePath({ targetPath, baseDirectory, path, os, normalizeDirectoryPath, managedRoots: [] });
+  for (const root of chatsRoots) {
+    const lexical = resolveIn(root);
+    if (lexical.ok) return lexical;
+    if (lexical.error !== 'Path is outside of active workspace') return null;
+  }
+  for (const root of chatsRoots) {
+    try {
+      const canonical = resolveIn(await canonicalDirectoryPath(root, fsPromises, path));
+      if (canonical.ok) return canonical;
+    } catch (error) {
+      console.warn('Failed to resolve chats root:', error);
+    }
+  }
+  return null;
+};
+
+const resolveWorkspacePathFromContext = async ({ req, targetPath, resolveProjectDirectory, path, os, fsPromises, normalizeDirectoryPath, managedRoots, chatsRoots }) => {
   const resolvedProject = await resolveProjectDirectory(req);
   if (!resolvedProject.directory) {
-    return { ok: false, error: resolvedProject.error || 'Active workspace is required' };
+    const chatsPath = await resolveChatsPathWithoutProject({ targetPath, chatsRoots, path, os, fsPromises, normalizeDirectoryPath });
+    return chatsPath ?? { ok: false, error: resolvedProject.error || 'Active workspace is required' };
   }
 
   const resolved = resolveWorkspacePath({
@@ -388,22 +413,25 @@ const GIT_DIRS_SKIP_LIST = new Set(['node_modules', 'dist', 'build', '.venv', 't
 // Walks rootPath and returns every nested git repository path (a directory
 // containing a `.git` entry — a directory, a worktree pointer file, or a
 // symlink). A repository boundary stops descent: nested repos inside repos
-// are not reported. The root itself, when it is a repo, yields no results.
+// are not reported. The root's own `.git` is the exception and the walk goes
+// on below it: whether a root repository hides the ones inside it is the
+// client's call, made from the root's status (a root with no commits yet
+// hides nothing). Clients ask only for roots that are not repositories or
+// have no commits, so an established root is never walked.
 // Symlinked directories are followed, the way the file tree follows them: a
 // parent folder of links to repositories kept elsewhere is a common way to
 // group them into one project. Each real directory is walked once, so a link
 // loop or two links to one repository cannot repeat it, and repositories are
 // reported under the path the link gives them inside the project.
+// Breadth-first traversal checks shallow siblings before deeper subtrees can
+// exhaust the visit cap.
 const findGitDirectories = async ({ rootPath, fsPromises, path: pathModule, maxDepth, maxDirs }) => {
   const results = [];
   const walkedRealPaths = new Set();
+  const queue = [{ dir: rootPath, depth: 0 }];
   let visited = 0;
 
-  const walk = async (dir, depth) => {
-    if (visited >= maxDirs) {
-      return;
-    }
-
+  const scanDirectory = async (dir, depth) => {
     let realPath;
     try {
       realPath = await fsPromises.realpath(dir);
@@ -457,23 +485,21 @@ const findGitDirectories = async ({ rootPath, fsPromises, path: pathModule, maxD
       subdirectories.push(dirent.name);
     }
 
-    if (isRepoBoundary) {
-      if (dir !== rootPath) {
-        results.push(dir);
-      }
+    if (isRepoBoundary && dir !== rootPath) {
+      results.push(dir);
       return;
     }
 
     subdirectories.sort();
     for (const name of subdirectories) {
-      if (visited >= maxDirs) {
-        break;
-      }
-      await walk(pathModule.join(dir, name), depth + 1);
+      queue.push({ dir: pathModule.join(dir, name), depth: depth + 1 });
     }
   };
 
-  await walk(rootPath, 0);
+  for (let index = 0; index < queue.length && visited < maxDirs; index += 1) {
+    const { dir, depth } = queue[index];
+    await scanDirectory(dir, depth);
+  }
   return results;
 };
 
@@ -485,7 +511,7 @@ const deriveCloneDirectoryName = (remoteUrl) => {
   return match?.[1]?.trim() || '';
 };
 
-const resolveReadPathFromContext = async ({ req, targetPath, scope, resolveProjectDirectory, path, os, fsPromises, normalizeDirectoryPath, managedRoots }) => {
+const resolveReadPathFromContext = async ({ req, targetPath, scope, resolveProjectDirectory, path, os, fsPromises, normalizeDirectoryPath, managedRoots, chatsRoots }) => {
   if (req.query?.allowOutsideWorkspace === 'true') {
     const normalized = normalizeDirectoryPath(targetPath);
     if (!normalized || typeof normalized !== 'string') {
@@ -504,17 +530,15 @@ const resolveReadPathFromContext = async ({ req, targetPath, scope, resolveProje
     fsPromises,
     normalizeDirectoryPath,
     managedRoots,
+    chatsRoots,
   });
 };
 
-const runCommandInDirectory = ({ shell, shellFlag, command, resolvedCwd, spawn, buildAugmentedPath, commandTimeoutMs }) => {
+const runCommandInDirectory = ({ shell, shellFlag, command, resolvedCwd, spawn, execEnv, commandTimeoutMs }) => {
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
     let timedOut = false;
-
-    const envPath = buildAugmentedPath();
-    const execEnv = { ...process.env, PATH: envPath };
 
     const child = spawn(shell, [shellFlag, command], {
       cwd: resolvedCwd,
@@ -588,9 +612,12 @@ export const registerFsRoutes = (app, dependencies) => {
     resolveProjectDirectory,
     buildAugmentedPath,
     resolveGitBinaryForSpawn,
+    // Content search needs ripgrep; without a resolver the route answers 501.
+    resolveRipgrepBinary = async () => null,
     openchamberUserConfigRoot,
     managedChatsRoot,
     cloneRepository,
+    environmentRuntime = null,
   } = dependencies;
   // Chat worktrees may live outside every project workspace; both managed
   // roots stay valid filesystem targets.
@@ -598,6 +625,8 @@ export const registerFsRoutes = (app, dependencies) => {
     ? path.resolve(managedChatsRoot.trim())
     : path.join(openchamberUserConfigRoot, 'chats');
   const managedRoots = [path.resolve(openchamberUserConfigRoot), chatsRoot];
+  // A relocated chats root keeps the chats created under the config root valid.
+  const chatsRoots = [...new Set([chatsRoot, path.join(openchamberUserConfigRoot, 'chats')])];
   const previewGrants = createPreviewGrants({ crypto });
   const realpathCache = createRealpathCache({
     realpath: fsPromises.realpath.bind(fsPromises),
@@ -706,15 +735,20 @@ export const registerFsRoutes = (app, dependencies) => {
       }
     }
 
-    const runPromise = runCommandInDirectory({
+    const runPromise = (async () => runCommandInDirectory({
       shell,
       shellFlag,
       command,
       resolvedCwd,
       spawn,
-      buildAugmentedPath,
+      // The user's and the project's variables (lib/environment) on top of
+      // the terminal's PATH. Git reads the UI repeats on its own never run
+      // the project's environment command; anything else may.
+      execEnv: environmentRuntime
+        ? await environmentRuntime.applyToDirectory(resolvedCwd, { ...process.env, PATH: buildAugmentedPath() }, { refresh: !isCacheableGitReadCommand(command) })
+        : { ...process.env, PATH: buildAugmentedPath() },
       commandTimeoutMs,
-    }).then((result) => {
+    }))().then((result) => {
       // Only cache successful results — failures may be transient.
       if (cacheKey && result && result.success) {
         setGitReadCacheEntry(cacheKey, result);
@@ -814,6 +848,7 @@ export const registerFsRoutes = (app, dependencies) => {
           os,
           normalizeDirectoryPath,
           managedRoots,
+          chatsRoots,
         });
         if (!resolved.ok) {
           return res.status(400).json({ error: resolved.error });
@@ -969,6 +1004,113 @@ export const registerFsRoutes = (app, dependencies) => {
     }
   });
 
+  // A bare file name an agent wrote without its folder (`Foo.tsx:12`): the
+  // workspace files with that name. One cached git listing per workspace
+  // answers every name (see workspace-file-names.js).
+  const workspaceFileNames = createWorkspaceFileNameIndex({ spawn, resolveGitBinary: resolveGitBinaryForSpawn });
+  app.get('/api/fs/find-by-name', async (req, res) => {
+    const name = typeof req.query.name === 'string' ? req.query.name.trim() : '';
+    if (!name || name.length > 255 || name === '.' || name === '..' || /[/\\*?[\]:]/.test(name)) {
+      return res.status(400).json({ error: 'A plain file name is required' });
+    }
+    const project = await resolveProjectDirectory(req);
+    if (!project.directory) {
+      return res.status(400).json({ error: project.error || 'Active workspace is required' });
+    }
+    return res.json({ paths: await workspaceFileNames.find(project.directory, name) });
+  });
+
+  // Find in files: lines of workspace files containing a text or a regex,
+  // searched by ripgrep (content-search.js). Hitting the limit is a normal
+  // answer with `stopped: 'limit'`; a failed search is never an empty one.
+  // This module loads with Node built-ins only (see the packaged-desktop
+  // module-load test), so the query is read with the shared guards.
+  const contentSearch = createContentSearchRuntime({ spawn, path, resolveRipgrepBinary });
+  app.get('/api/fs/find-in-files', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const query = isString(req.query.query) ? String(req.query.query) : '';
+    if (!query.trim() || query.length > CONTENT_SEARCH_MAX_QUERY_LENGTH) {
+      return res.status(400).json({ error: 'A search query is required' });
+    }
+    const requestedLimit = isString(req.query.limit) ? Number.parseInt(String(req.query.limit), 10) : Number.NaN;
+    const limit = Number.isInteger(requestedLimit)
+      ? Math.min(Math.max(1, requestedLimit), CONTENT_SEARCH_MAX_LIMIT)
+      : CONTENT_SEARCH_DEFAULT_LIMIT;
+    const project = await resolveProjectDirectory(req);
+    if (!project.directory) {
+      return res.status(400).json({ error: project.error || 'Active workspace is required' });
+    }
+
+    // A client that moved on (a new keystroke, a closed panel) ends the
+    // ripgrep process instead of letting it finish for nobody.
+    const abort = new AbortController();
+    res.on('close', () => abort.abort());
+    const result = await contentSearch.searchFileContents(project.directory, {
+      resultRoot: project.requestedDirectory,
+      query,
+      regex: req.query.regex === 'true',
+      limit,
+      includeHidden: req.query.includeHidden === 'true',
+      respectGitignore: req.query.respectGitignore !== 'false',
+      signal: abort.signal,
+    });
+    switch (result.status) {
+      case 'ok':
+        return res.json({ matches: result.matches, stopped: result.stopped });
+      case 'unavailable':
+        return res.status(501).json({ error: 'ripgrep is not available on this server', reason: 'search-unavailable' });
+      case 'invalid-pattern':
+        return res.status(400).json({ error: result.message, reason: 'invalid-pattern' });
+      case 'aborted':
+        return undefined;
+      default:
+        return res.status(500).json({ error: result.message, reason: 'search-failed' });
+    }
+  });
+
+  app.post('/api/fs/directory-stats', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const requested = Array.isArray(req.body?.paths) ? req.body.paths : null;
+    const directoryPaths = requested
+      ? requested
+          .filter((value) => value !== null && value !== undefined)
+          .map((value) => String(value).trim())
+          .filter((value) => value.length > 0)
+      : [];
+    if (directoryPaths.length === 0) {
+      return res.status(400).json({ error: 'paths array is required' });
+    }
+    // Match the git project batch's cap so a probe cannot grow without bound.
+    if (directoryPaths.length > 200) {
+      return res.status(400).json({ error: 'Too many paths' });
+    }
+
+    // Same path policy and reason codes as /api/fs/directory-stat, answered for
+    // many directories in one round trip so a project list probe is not one
+    // request per project. Failures are per-path: an unreachable directory
+    // reports `unknown` and never fails the others.
+    const results = await Promise.all(directoryPaths.map(async (directoryPath) => {
+      try {
+        const resolvedPath = path.resolve(normalizeDirectoryPath(directoryPath));
+        const stats = await fsPromises.stat(resolvedPath);
+        if (!stats.isDirectory()) {
+          return { path: directoryPath, isDirectory: false, reason: 'not-directory' };
+        }
+        return { path: directoryPath, isDirectory: true };
+      } catch (error) {
+        if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+          return { path: directoryPath, isDirectory: false, reason: error.code === 'ENOENT' ? 'not-found' : 'not-directory' };
+        }
+        if (isOsPermissionError(error)) {
+          return { path: directoryPath, isDirectory: false, reason: 'denied' };
+        }
+        return { path: directoryPath, isDirectory: false, reason: 'unknown' };
+      }
+    }));
+
+    return res.json({ results });
+  });
+
   app.get('/api/fs/stat', async (req, res) => {
     const filePath = typeof req.query.path === 'string' ? req.query.path.trim() : '';
     const optional = req.query.optional === 'true';
@@ -987,6 +1129,7 @@ export const registerFsRoutes = (app, dependencies) => {
         fsPromises,
         normalizeDirectoryPath,
         managedRoots,
+        chatsRoots,
       });
       if (!resolved.ok) {
         if (req.query?.allowOutsideWorkspace === 'true') {
@@ -1037,6 +1180,7 @@ export const registerFsRoutes = (app, dependencies) => {
         fsPromises,
         normalizeDirectoryPath,
         managedRoots,
+        chatsRoots,
       });
       if (!resolved.ok) {
         if (req.query?.allowOutsideWorkspace === 'true') {
@@ -1101,6 +1245,7 @@ export const registerFsRoutes = (app, dependencies) => {
         fsPromises,
         normalizeDirectoryPath,
         managedRoots,
+        chatsRoots,
       });
       if (!resolved.ok) {
         if (req.query?.allowOutsideWorkspace === 'true') {
@@ -1135,32 +1280,49 @@ export const registerFsRoutes = (app, dependencies) => {
       res.setHeader('Referrer-Policy', 'no-referrer');
       res.setHeader('Accept-Ranges', 'bytes');
 
-      // A byte span is streamed from disk rather than read whole: the audio
-      // and video players ask for one on every seek, and a recording can be
-      // hundreds of megabytes.
+      // The file is streamed from disk, never read whole: the audio and video
+      // players ask for a span on every seek, and a recording or a PDF can be
+      // hundreds of megabytes the server would otherwise hold in memory.
       const range = resolveByteRange(req.headers?.range, stats.size);
       if (range.kind === 'unsatisfiable') {
         res.setHeader('Content-Range', `bytes */${stats.size}`);
         return res.status(416).end();
       }
+      res.type(mimeType);
+      // An empty file has no byte to read, and a read stream over `0..-1` would fail.
+      if (stats.size === 0) {
+        res.setHeader('Content-Length', '0');
+        return res.end();
+      }
+      // Opened before any span header is set, so a failed open answers a clean error.
+      const handle = await fsPromises.open(canonicalPath, 'r');
+      const span = range.kind === 'range' ? range : { start: 0, end: stats.size - 1 };
       if (range.kind === 'range') {
-        const handle = await fsPromises.open(canonicalPath, 'r');
         res.status(206);
-        res.setHeader('Content-Range', `bytes ${range.start}-${range.end}/${stats.size}`);
-        res.setHeader('Content-Length', String(range.end - range.start + 1));
-        res.type(mimeType);
-        // The handle closes with the stream, on success and on failure alike.
-        const stream = handle.createReadStream({ start: range.start, end: range.end });
+        res.setHeader('Content-Range', `bytes ${span.start}-${span.end}/${stats.size}`);
+      }
+      res.setHeader('Content-Length', String(span.end - span.start + 1));
+      // pipe() leaves the source paused when a media player disconnects.
+      // Destroy it too so autoClose releases the FileHandle before GC.
+      try {
+        const stream = handle.createReadStream({ start: span.start, end: span.end });
+        const onResponseClose = () => stream.destroy();
+        res.once('close', onResponseClose);
+        stream.once('close', () => res.removeListener('close', onResponseClose));
         stream.on('error', (error) => {
-          console.error('Failed to stream raw file range:', error);
+          console.error('Failed to stream raw file:', error);
           res.destroy(error);
         });
-        stream.pipe(res);
-        return undefined;
+        if (res.destroyed) {
+          stream.destroy();
+        } else {
+          stream.pipe(res);
+        }
+      } catch (error) {
+        await handle.close();
+        throw error;
       }
-
-      const content = await fsPromises.readFile(canonicalPath);
-      return res.type(mimeType).send(content);
+      return undefined;
     } catch (error) {
       const err = error;
       if (err && typeof err === 'object' && err.code === 'ENOENT') {
@@ -1189,6 +1351,7 @@ export const registerFsRoutes = (app, dependencies) => {
         fsPromises,
         normalizeDirectoryPath,
         managedRoots,
+        chatsRoots,
       });
       if (!resolved.ok) {
         return res.status(400).json({ error: resolved.error });
@@ -1246,7 +1409,9 @@ export const registerFsRoutes = (app, dependencies) => {
 
       const ext = path.extname(canonicalPath).toLowerCase();
       const mimeType = FILE_MIME_MAP[ext] || 'application/octet-stream';
-      const content = await fsPromises.readFile(canonicalPath);
+      const bytes = await fsPromises.readFile(canonicalPath);
+      // Lets the Files view annotate the page; see preview-bridge.js.
+      const content = mimeType === 'text/html' ? injectPreviewBridge(bytes) : bytes;
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('X-Content-Type-Options', 'nosniff');
       // Opened directly in a tab, the page is still an opaque-origin sandbox.
@@ -1290,6 +1455,7 @@ export const registerFsRoutes = (app, dependencies) => {
         os,
         normalizeDirectoryPath,
         managedRoots,
+        chatsRoots,
       });
       if (!resolved.ok) {
         return res.status(400).json({ error: resolved.error });
@@ -1361,6 +1527,7 @@ export const registerFsRoutes = (app, dependencies) => {
         os,
         normalizeDirectoryPath,
         managedRoots,
+        chatsRoots,
       });
       if (!resolved.ok) {
         return res.status(400).json({ error: resolved.error });
@@ -1469,6 +1636,7 @@ export const registerFsRoutes = (app, dependencies) => {
         os,
         normalizeDirectoryPath,
         managedRoots,
+        chatsRoots,
       });
       if (!resolved.ok) {
         return res.status(400).json({ error: resolved.error });
@@ -1508,6 +1676,7 @@ export const registerFsRoutes = (app, dependencies) => {
         os,
         normalizeDirectoryPath,
         managedRoots,
+        chatsRoots,
       });
       if (!resolvedOld.ok) {
         return res.status(400).json({ error: resolvedOld.error });
@@ -1522,6 +1691,7 @@ export const registerFsRoutes = (app, dependencies) => {
         os,
         normalizeDirectoryPath,
         managedRoots,
+        chatsRoots,
       });
       if (!resolvedNew.ok) {
         return res.status(400).json({ error: resolvedNew.error });
@@ -1531,12 +1701,32 @@ export const registerFsRoutes = (app, dependencies) => {
         return res.status(400).json({ error: 'Source and destination must share the same workspace root' });
       }
 
+      if (
+        resolvedOld.resolved !== resolvedNew.resolved
+        && isPathWithinRoot(resolvedNew.resolved, resolvedOld.resolved, path, os)
+      ) {
+        return res.status(400).json({ error: 'Cannot move a folder into itself' });
+      }
+
+      // fs.rename silently replaces an existing file. A destination that is the
+      // source itself is a case-only rename on a case-insensitive filesystem.
+      const [sourceStats, destinationStats] = await Promise.all([
+        fsPromises.lstat(resolvedOld.resolved),
+        fsPromises.lstat(resolvedNew.resolved).catch((error) => {
+          if (error?.code === 'ENOENT') return null;
+          throw error;
+        }),
+      ]);
+      if (destinationStats && (destinationStats.dev !== sourceStats.dev || destinationStats.ino !== sourceStats.ino)) {
+        return res.status(409).json({ error: 'Destination path already exists', reason: 'already-exists' });
+      }
+
       await fsPromises.rename(resolvedOld.resolved, resolvedNew.resolved);
       return res.json({ success: true, path: resolvedNew.resolved });
     } catch (error) {
       const err = error;
       if (err && typeof err === 'object' && err.code === 'ENOENT') {
-        return res.status(404).json({ error: 'Source path not found' });
+        return res.status(404).json({ error: 'Source path not found', reason: 'not-found' });
       }
       if (isOsPermissionError(err)) {
         return sendOsPermissionDenied(res, 'Access denied');
@@ -1566,8 +1756,11 @@ export const registerFsRoutes = (app, dependencies) => {
       } else if (platform === 'win32') {
         const stat = await fsPromises.stat(resolved);
         const escapedPath = resolved.replace(/'/g, "''");
-        const explorerArg = stat.isDirectory() ? escapedPath : `/select,${escapedPath}`;
-        const command = `Start-Process -FilePath explorer.exe -ArgumentList '${explorerArg}'`;
+        // A folder opens through its default handler, so a replacement file
+        // manager gets it; only Explorer can select a file inside its folder.
+        const command = stat.isDirectory()
+          ? `Start-Process -FilePath '${escapedPath}'`
+          : `Start-Process -FilePath explorer.exe -ArgumentList '/select,${escapedPath}'`;
         await new Promise((resolve, reject) => {
           const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', command], {
             windowsHide: true,
@@ -1629,6 +1822,7 @@ export const registerFsRoutes = (app, dependencies) => {
         os,
         normalizeDirectoryPath,
         managedRoots,
+        chatsRoots,
       });
       if (!resolvedForWorkspace.ok) {
         console.warn(`Rejected /api/fs/exec outside workspace: ${resolvedForWorkspace.error}`);
@@ -1869,6 +2063,7 @@ export const registerFsRoutes = (app, dependencies) => {
         os,
         normalizeDirectoryPath,
         managedRoots,
+        chatsRoots,
       });
       if (!resolved.ok) {
         return res.status(400).json({ error: resolved.error });

@@ -1,7 +1,10 @@
+import { z } from 'zod';
 import { createVSCodeAPIs } from './api';
 import { createRemovalTombstones } from './inlineCommentRemovals';
 import { resolveCommentTarget } from './inlineCommentTarget';
-import { onCommand, onThemeChange, postBridgeNotification, proxyApiRequest, proxySessionMessageRequest, sendBridgeMessage, sendBridgeMessageWithOptions, startSseProxy, stopSseProxy } from './api/bridge';
+import { fetchLastAssistantMessageText } from './notificationMessage';
+import { findMessagePageItem } from '@openchamber/ui/lib/opencode/messagePaging';
+import { BridgeRequestError, onCommand, onThemeChange, postBridgeNotification, proxyApiRequest, proxySessionMessageRequest, sendBridgeMessage, sendBridgeMessageWithOptions, startSseProxy, stopSseProxy } from './api/bridge';
 import { vscodeStreamPerfCount, vscodeStreamPerfMeasure, vscodeStreamPerfObserve } from './api/streamPerf';
 import { extractBodyBase64, extractBodyText, extractJsonBody, hasInitBody } from './requestBodyTransport';
 import type { RuntimeAPIs } from '@openchamber/ui/lib/api/types';
@@ -13,15 +16,17 @@ import {
   type VSCodeThemeKind,
   type VSCodeThemePayload,
 } from '@openchamber/ui/lib/theme/vscode/adapter';
-import { getBootstrapMessages, readStoredLocaleForBootstrap } from '@openchamber/ui/lib/i18n';
+import { formatMessage, getBootstrapMessages, readStoredLocaleForBootstrap, useI18nStore, type I18nKey } from '@openchamber/ui/lib/i18n';
 import type { VSCodeActiveEditorFile } from '@/sync/input-store';
 import { usePermissionStore } from '@openchamber/ui/stores/permissionStore';
 import { permissionPolicyWireSchema, policySnapshotFromWire } from '@openchamber/ui/stores/utils/permissionAutoAccept';
 import { processVSCodePermissionAutoAccept } from '@openchamber/ui/sync/vscode-permission-auto-accept';
-import type { AssistantMessage, Part } from '@openchamber/ui/lib/opencode/model';
+import type { AssistantMessage } from '@openchamber/ui/lib/opencode/model';
 import { syncEventSessionID, type SyncEvent } from '@openchamber/ui/lib/opencode/events';
 import { focusChatInput } from '@openchamber/ui/components/chat/composer/editor/dom';
 import { hostViewerStateSchema, reportHostViewerState } from '@openchamber/ui/lib/surfaceAttention';
+import { vscodeSettingsNavigationSchema } from '@openchamber/ui/lib/settings/vscodeNavigation';
+import { applyVSCodeSettingsNavigation } from '@openchamber/ui/apps/vscodeSettingsNavigation';
 
 type ConnectionStatus = 'connecting' | 'connected' | 'error' | 'disconnected';
 
@@ -41,6 +46,7 @@ declare global {
       platform?: string;
       arch?: string;
       viewMode?: 'sidebar' | 'editor';
+      panelType?: 'chat' | 'settings';
       initialSessionId?: string | null;
       initialComposer?: 'parallel' | null;
     };
@@ -48,7 +54,6 @@ declare global {
     __OPENCHAMBER_VSCODE_SHIKI_THEMES__?: { light?: Record<string, unknown>; dark?: Record<string, unknown> } | null;
     __OPENCHAMBER_CONNECTION__?: { status: ConnectionStatus; error?: string; cliAvailable?: boolean };
     __OPENCHAMBER_HOME__?: string;
-    __OPENCHAMBER_VSCODE_WINDOW_FOCUSED__?: boolean;
   }
 }
 
@@ -64,6 +69,14 @@ try {
 }
 
 window.__OPENCHAMBER_RUNTIME_APIS__ = createVSCodeAPIs();
+
+const reportSettingsShortcutFocus = () => {
+  postBridgeNotification('webview:settings-focus', { focused: document.hasFocus() });
+};
+window.addEventListener('focus', reportSettingsShortcutFocus);
+window.addEventListener('blur', reportSettingsShortcutFocus);
+document.addEventListener('focusin', reportSettingsShortcutFocus);
+reportSettingsShortcutFocus();
 
 const bootstrapLocale = readStoredLocaleForBootstrap();
 const bootstrapMessages = getBootstrapMessages(bootstrapLocale);
@@ -332,15 +345,27 @@ const unsupportedWebRouteResponse = (feature: string): Response => {
   return jsonResponse({ error: `${feature} is not supported in VS Code` }, 501);
 };
 
-/** Answers a local API route from a bridge call; validation failures come back as 400, the rest as 500. */
-const bridgeJsonRoute = async (bridgeType: string, payload: unknown): Promise<Response> => {
+/**
+ * Answers a local API route from a bridge call; validation failures come back
+ * as 400, the rest as 500. A host failure whose code is in `answeredCodes`
+ * comes back as 409 with that code, the way the web server's route answers it.
+ */
+const bridgeJsonRoute = async (bridgeType: string, payload: unknown, answeredCodes: readonly string[] = []): Promise<Response> => {
   try {
     return jsonResponse(await sendBridgeMessage(bridgeType, payload), 200);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Request failed';
+    if (error instanceof BridgeRequestError && error.code && answeredCodes.includes(error.code)) {
+      return jsonResponse({ error: message, code: error.code }, 409);
+    }
     return jsonResponse({ error: message }, /must be|is required|session id/.test(message) ? 400 : 500);
   }
 };
+
+// The host could not write metadata because the session's folder is gone; the
+// UI then offers archive. Mirrors `SESSION_DIRECTORY_MISSING_CODE` in
+// packages/vscode/src/bridge-system-runtime.ts.
+const SESSION_DIRECTORY_MISSING_CODE = 'SESSION_DIRECTORY_MISSING';
 
 const pluginConfigErrorStatus = (message: string): number => {
   const lower = message.toLowerCase();
@@ -348,6 +373,14 @@ const pluginConfigErrorStatus = (message: string): number => {
   if (lower.includes('not found')) return 404;
   if (lower.includes('required') || lower.includes('invalid') || lower.includes('must ')) return 400;
   return 500;
+};
+
+// Entry writes answer like the web server's plugin routes: a spec the
+// extension refused comes back as 400 with its code, so the dialog can say so
+// under the field.
+const pluginEntryErrorResponse = (message: string, code: string | undefined): Response => {
+  const status = code === 'UNLOADABLE_SPEC' ? 400 : pluginConfigErrorStatus(message);
+  return jsonResponse({ error: message, code }, status);
 };
 
 const isNullBodyStatus = (status: number): boolean => status === 204 || status === 205 || status === 304;
@@ -436,7 +469,7 @@ const handleLocalApiRequest = async (input: RequestInfo | URL, url: URL, init: R
     if (method === 'GET') return bridgeJsonRoute('api:sessions/metadata:get', { sessionId });
     const body = await extractJsonBody(input, init, method);
     const patch = body && typeof body === 'object' && !Array.isArray(body) ? (body as { patch?: unknown }).patch : undefined;
-    return bridgeJsonRoute('api:sessions/metadata:set', { sessionId, patch });
+    return bridgeJsonRoute('api:sessions/metadata:set', { sessionId, patch }, [SESSION_DIRECTORY_MISSING_CODE]);
   }
 
   if (/^\/api\/projects\/[^/]+\/scheduled-tasks(?:\/[^/]+)?$/.test(normalizedPathname)) {
@@ -474,7 +507,6 @@ const handleLocalApiRequest = async (input: RequestInfo | URL, url: URL, init: R
     return new Response(
       JSON.stringify({
         statusSessions: {},
-        attentionSessions: {},
         activitySessions: activity || {},
         serverTime: Date.now(),
       }),
@@ -485,7 +517,7 @@ const handleLocalApiRequest = async (input: RequestInfo | URL, url: URL, init: R
     );
   }
 
-  if (/^\/api\/sessions\/[^/]+\/(view|unview)$/.test(normalizedPathname) && method === 'POST') {
+  if (/^\/api\/sessions\/[^/]+\/view$/.test(normalizedPathname) && method === 'POST') {
     return new Response(JSON.stringify({ success: true }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -543,13 +575,22 @@ const handleLocalApiRequest = async (input: RequestInfo | URL, url: URL, init: R
     // extension host's activity watcher. Its phases collapse busy and retry
     // into `busy` and it settles sessions itself through `cooldown`, so every
     // busy entry is current as of now.
-    type ActivitySnapshot = Record<string, { type: 'idle' | 'busy' | 'cooldown' }>;
+    type ActivitySnapshot = Record<string, { type: 'idle' | 'busy' | 'cooldown'; startedAgoMs?: number }>;
     const activity = await sendBridgeMessage<ActivitySnapshot>('api:session-activity:get')
       .catch((): ActivitySnapshot => ({}));
     const now = Date.now();
-    const sessions: Record<string, { status: 'busy'; lastUpdateAt: number }> = {};
+    type StatusEntry = { status: 'busy'; lastUpdateAt: number; turnStartedAt?: number };
+    const sessions: Record<string, StatusEntry> = {};
     for (const [sessionId, entry] of Object.entries(activity || {})) {
-      if (entry?.type === 'busy') sessions[sessionId] = { status: 'busy', lastUpdateAt: now };
+      if (entry?.type !== 'busy') continue;
+      const status: StatusEntry = { status: 'busy', lastUpdateAt: now };
+      // The extension host reports the age, not a timestamp, because its clock
+      // and this webview's may differ on a remote window. Anchoring the age
+      // here keeps the count on this device's clock.
+      if (entry.startedAgoMs !== undefined) {
+        status.turnStartedAt = now - Math.max(0, entry.startedAgoMs);
+      }
+      sessions[sessionId] = status;
     }
     // The extension host keeps no pending-request map; directory stores and
     // its own auto-accept path cover requests in VS Code.
@@ -558,19 +599,6 @@ const handleLocalApiRequest = async (input: RequestInfo | URL, url: URL, init: R
         sessions,
         pending: {},
         serverTime: now,
-      }),
-      {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      },
-    );
-  }
-
-  if (normalizedPathname === '/api/sessions/attention' && method === 'GET') {
-    return new Response(
-      JSON.stringify({
-        sessions: {},
-        serverTime: Date.now(),
       }),
       {
         status: 200,
@@ -593,18 +621,17 @@ const handleLocalApiRequest = async (input: RequestInfo | URL, url: URL, init: R
     );
   }
 
-  if (/^\/api\/sessions\/[^/]+\/attention$/.test(normalizedPathname) && method === 'GET') {
-    const sessionId = normalizedPathname.split('/')[3] || '';
-    return new Response(
-      JSON.stringify({
-        error: 'Session not found or no attention state available',
-        sessionId,
-      }),
-      {
-        status: 404,
-        headers: { 'Content-Type': 'application/json' },
-      },
-    );
+  // The web server answers this route; here the extension host reads the same
+  // provider and model lists from OpenCode (`bridge-small-model-runtime.ts`).
+  if (normalizedPathname === '/api/small-model' && method === 'GET') {
+    const directory = getRequestDirectoryHint(url, input, init);
+    try {
+      const data = await sendBridgeMessage('api:small-model:get', { directory });
+      return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return new Response(JSON.stringify({ error: message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
   }
 
   if (normalizedPathname === '/api/tts/status' && method === 'GET') {
@@ -718,6 +745,17 @@ const handleLocalApiRequest = async (input: RequestInfo | URL, url: URL, init: R
     return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }
 
+  if (pathname === '/api/config/disabled-agents') {
+    const directory = getRequestDirectoryHint(url, input, init);
+    try {
+      const data = await sendBridgeMessage('api:config/disabled-agents', { directory });
+      return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return new Response(JSON.stringify({ error: message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+  }
+
   if (pathname.startsWith('/api/config/agents/')) {
     // The web routes hang `/config` and `/permissions` off the agent name; the
     // bridge takes the sub-resource as its own field, so split it back out.
@@ -763,6 +801,18 @@ const handleLocalApiRequest = async (input: RequestInfo | URL, url: URL, init: R
     const body = await extractJsonBody(input, init, method);
     try {
       const data = await sendBridgeMessage('api:config/websearch', body);
+      return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return new Response(JSON.stringify({ error: message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+  }
+
+  if (pathname === '/api/config/skill-switch' && method === 'PUT') {
+    const body = await extractJsonBody(input, init, method);
+    const directory = getRequestDirectoryHint(url, input, init);
+    try {
+      const data = await sendBridgeMessage('api:config/skill-switch', { ...body, directory });
       return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -871,11 +921,23 @@ const handleLocalApiRequest = async (input: RequestInfo | URL, url: URL, init: R
     return 200;
   };
 
-  // Skills catalog: /api/config/skills/catalog
+  // Skills catalog: /api/config/skills/catalog lists the sources,
+  // /api/config/skills/catalog/source scans one of them.
   if (pathname === '/api/config/skills/catalog') {
+    try {
+      const data = await sendBridgeMessage('api:config/skills:catalog');
+      return new Response(JSON.stringify(data), { status: skillsCatalogStatusFromPayload(data), headers: { 'Content-Type': 'application/json' } });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return new Response(JSON.stringify({ ok: false, error: { kind: 'unknown', message } }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+  }
+
+  if (pathname === '/api/config/skills/catalog/source') {
+    const sourceId = url.searchParams.get('sourceId') ?? '';
     const refresh = url.searchParams.get('refresh') === 'true';
     try {
-      const data = await sendBridgeMessage('api:config/skills:catalog', { refresh });
+      const data = await sendBridgeMessage('api:config/skills:catalog/source', { sourceId, refresh });
       return new Response(JSON.stringify(data), { status: skillsCatalogStatusFromPayload(data), headers: { 'Content-Type': 'application/json' } });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -954,27 +1016,32 @@ const handleLocalApiRequest = async (input: RequestInfo | URL, url: URL, init: R
     }
   }
 
-  if (pathname === '/api/magic-prompts') {
-    if (method === 'GET') {
-      const data = await sendBridgeMessage('api:magic-prompts:get');
-      return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
-    }
-    if (method === 'DELETE') {
-      const data = await sendBridgeMessage('api:magic-prompts:reset-all');
-      return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
-    }
-  }
-
-  if (pathname.startsWith('/api/magic-prompts/')) {
-    const id = decodeURIComponent(pathname.slice('/api/magic-prompts/'.length));
-    if (method === 'PUT') {
-      const body = await extractJsonBody(input, init, method);
-      const data = await sendBridgeMessage('api:magic-prompts:save', { id, text: body?.text });
-      return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
-    }
-    if (method === 'DELETE') {
-      const data = await sendBridgeMessage('api:magic-prompts:reset', { id });
-      return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  // Magic Prompts: the extension host answers with the server's statuses and
+  // bodies. Selectors stay in the query string, every value of a name is
+  // forwarded so a repeated one is refused there, and the routing directory
+  // plays no part in which file is read or written; a prompt read names its
+  // directory as `sessionDirectory`.
+  const isMagicPromptCollection = pathname === '/api/magic-prompts' && (method === 'GET' || method === 'DELETE');
+  const isMagicPromptItem = pathname.startsWith('/api/magic-prompts/') && (method === 'PUT' || method === 'DELETE');
+  if (isMagicPromptCollection || isMagicPromptItem) {
+    const readRequest = async () => ({
+      method,
+      id: isMagicPromptItem ? decodeURIComponent(pathname.slice('/api/magic-prompts/'.length)) : null,
+      query: {
+        projectId: url.searchParams.getAll('projectId'),
+        scope: url.searchParams.getAll('scope'),
+        sessionDirectory: url.searchParams.getAll('sessionDirectory'),
+      },
+      body: method === 'GET' ? undefined : await extractJsonBody(input, init, method),
+    });
+    // A malformed id encoding or JSON body is the client's error.
+    const request = await readRequest().catch(() => null);
+    if (!request) return jsonResponse({ error: 'Invalid magic prompt request' }, 400);
+    try {
+      const { status, body } = await sendBridgeMessage<{ status: number; body: unknown }>('api:magic-prompts', request);
+      return jsonResponse(body, status);
+    } catch (error) {
+      return jsonResponse({ error: error instanceof Error ? error.message : 'Magic prompt request failed' }, 500);
     }
   }
 
@@ -1031,7 +1098,7 @@ const handleLocalApiRequest = async (input: RequestInfo | URL, url: URL, init: R
       return jsonResponse(data);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return jsonResponse({ error: message }, pluginConfigErrorStatus(message));
+      return pluginEntryErrorResponse(message, error instanceof BridgeRequestError ? error.code : undefined);
     }
   }
 
@@ -1050,7 +1117,7 @@ const handleLocalApiRequest = async (input: RequestInfo | URL, url: URL, init: R
       return jsonResponse(data);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return jsonResponse({ error: message }, pluginConfigErrorStatus(message));
+      return pluginEntryErrorResponse(message, error instanceof BridgeRequestError ? error.code : undefined);
     }
   }
 
@@ -1202,7 +1269,7 @@ const handleLocalApiRequest = async (input: RequestInfo | URL, url: URL, init: R
     }
   }
 
-  const quotaCredentialMatch = pathname.match(/^\/api\/quota\/credentials\/(exe-dev|ollama-cloud|cursor|zenmux)(?:\/(validate|import))?$/);
+  const quotaCredentialMatch = pathname.match(/^\/api\/quota\/credentials\/(exe-dev|cursor|zenmux)(?:\/(validate|import))?$/);
   if (quotaCredentialMatch) {
     try {
       const body = method === 'PUT' ? await extractJsonBody(input, init, method) : undefined;
@@ -1770,10 +1837,9 @@ onCommand('newSession', (payload) => {
   window.dispatchEvent(new CustomEvent('openchamber:navigate', { detail: { view: 'chat' } }));
 });
 
-// Listen for showSettings command from extension title bar button
-onCommand('showSettings', () => {
-  // Dispatch event to navigate to settings view in VSCodeLayout
-  window.dispatchEvent(new CustomEvent('openchamber:navigate', { detail: { view: 'settings' } }));
+onCommand('showSettings', (payload) => {
+  const navigation = vscodeSettingsNavigationSchema.safeParse(payload);
+  if (navigation.success) applyVSCodeSettingsNavigation(navigation.data);
 });
 
 // Run the same full OpenCode reload flow the app uses after an update: shows the
@@ -1785,84 +1851,27 @@ onCommand('reloadOpenCode', () => {
   });
 });
 
-const getNotificationClaimKey = (payload: { title?: unknown; body?: unknown; sessionId?: unknown; tag?: unknown } | undefined): string => {
-  const tag = typeof payload?.tag === 'string' ? payload.tag.trim() : '';
-  if (tag) return tag;
-  return [payload?.sessionId, payload?.title, payload?.body]
-    .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
-    .map((value) => value.trim())
-    .join('|');
+// The extension host shows the notification and decides whether the chat is in
+// view: Chromium never displays a `new Notification()` from a webview frame.
+const showOpenChamberNotification = (payload: { title: string; body: string; sessionId: string; requireHidden: boolean }) => {
+  void sendBridgeMessage('api:notifications:show', payload).catch(() => undefined);
 };
 
-const claimOpenChamberNotification = async (payload: { title?: unknown; body?: unknown; sessionId?: unknown; tag?: unknown } | undefined): Promise<boolean> => {
-  const key = getNotificationClaimKey(payload);
-  if (!key) return true;
-  try {
-    const result = await sendBridgeMessage<{ claimed?: boolean }>('api:notifications:claim', { key });
-    return result?.claimed === true;
-  } catch {
-    return true;
-  }
-};
+const openSessionPayloadSchema = z.object({ sessionId: z.string().min(1) });
 
-const showOpenChamberNotification = (payload: { title?: unknown; body?: unknown; sessionId?: unknown; tag?: unknown; requireHidden?: unknown } | undefined) => {
-  if (typeof Notification === 'undefined') {
-    return false;
-  }
-
-  const show = async () => {
-    const isVSCodeWindowFocused = window.__OPENCHAMBER_VSCODE_WINDOW_FOCUSED__ ?? document.hasFocus();
-    if (payload?.requireHidden === true && isVSCodeWindowFocused) {
-      return false;
-    }
-    if (Notification.permission !== 'granted') {
-      return false;
-    }
-
-    const title = typeof payload?.title === 'string' && payload.title.trim().length > 0
-      ? payload.title.trim()
-      : 'OpenChamber';
-    const body = typeof payload?.body === 'string' ? payload.body : '';
-    const sessionId = typeof payload?.sessionId === 'string' && payload.sessionId.trim().length > 0
-      ? payload.sessionId.trim()
-      : '';
-    if (!await claimOpenChamberNotification({ ...payload, title, body, sessionId })) {
-      return false;
-    }
-
-    const notification = new Notification(title, { body });
-    notification.onclick = () => {
-      if (sessionId) {
-        import('@/sync/session-ui-store').then(({ useSessionUIStore }) => {
-          useSessionUIStore.getState().setCurrentSession(sessionId);
-        });
-      }
-      window.dispatchEvent(new CustomEvent('openchamber:navigate', { detail: { view: 'chat' } }));
-    };
-    return true;
-  };
-
-  if (Notification.permission === 'default') {
-    void Notification.requestPermission().then((permission) => {
-      if (permission === 'granted') {
-        void show();
-      }
-    });
-    return true;
-  }
-
-  void show();
-  return true;
-};
-
-onCommand('showNotification', (payload) => {
-  showOpenChamberNotification(payload as { title?: unknown; body?: unknown; sessionId?: unknown; requireHidden?: unknown } | undefined);
+// "Open Session" on a notification.
+onCommand('openSession', (payload) => {
+  const sessionId = openSessionPayloadSchema.safeParse(payload).data?.sessionId;
+  if (!sessionId) return;
+  void import('@/sync/session-ui-store').then(({ useSessionUIStore }) => {
+    useSessionUIStore.getState().setCurrentSession(sessionId);
+  });
+  window.dispatchEvent(new CustomEvent('openchamber:navigate', { detail: { view: 'chat' } }));
 });
 
 onCommand('viewerStateChanged', (payload) => {
   const parsed = hostViewerStateSchema.safeParse(payload);
   if (!parsed.success) return;
-  window.__OPENCHAMBER_VSCODE_WINDOW_FOCUSED__ = parsed.data.windowFocused;
   // The webview document's own focus is not whether the user sees the chat.
   reportHostViewerState(parsed.data);
 });
@@ -1932,39 +1941,52 @@ const formatNotificationLabel = (raw: string, fallback: string): string => {
   return raw.split(/[-_\s]+/).filter(Boolean).map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
 };
 
-const extractNotificationTextFromParts = (parts: readonly Part[] | undefined): string => {
-  if (!parts) return '';
-  return parts
-    .map((part) => (part.type === 'text' ? part.text : ''))
-    .filter(Boolean)
-    .join('\n')
-    .trim();
-};
+type NotificationTemplateKey = 'completion' | 'subtask' | 'error' | 'question';
 
-const fetchLastAssistantMessageText = async (sessionId: string, messageId?: string): Promise<string> => {
-  if (!sessionId) return '';
+// The same defaults the settings page shows as placeholders. An empty field
+// means "no custom text", so the notification follows the interface language.
+const NOTIFICATION_TEMPLATE_DEFAULT_KEYS = {
+  completion: {
+    title: 'settings.notifications.page.template.defaults.completion.title',
+    message: 'settings.notifications.page.template.defaults.completion.message',
+  },
+  subtask: {
+    title: 'settings.notifications.page.template.defaults.subtask.title',
+    message: 'settings.notifications.page.template.defaults.subtask.message',
+  },
+  error: {
+    title: 'settings.notifications.page.template.defaults.error.title',
+    message: 'settings.notifications.page.template.defaults.error.message',
+  },
+  question: {
+    title: 'settings.notifications.page.template.defaults.question.title',
+    message: 'settings.notifications.page.template.defaults.question.message',
+  },
+} satisfies Record<NotificationTemplateKey, { title: I18nKey; message: I18nKey }>;
 
-  try {
-    // Newest first: the message we want is at the front, not the back.
-    const page = await opencodeClient.getSessionMessages(sessionId, { limit: 5 });
-    const target = messageId
-      ? page.items.find((item) => item.info.id === messageId && item.info.role === 'assistant')
-      : page.items.find((item) => item.info.role === 'assistant' && item.info.finish === 'stop');
-    return target ? extractNotificationTextFromParts(target.parts) : '';
-  } catch {
-    return '';
-  }
-};
+const notificationText = (key: I18nKey): string => (
+  formatMessage(useI18nStore.getState().dictionary, key)
+);
+
+const notificationTemplateDefaults = (key: NotificationTemplateKey) => ({
+  title: notificationText(NOTIFICATION_TEMPLATE_DEFAULT_KEYS[key].title),
+  message: notificationText(NOTIFICATION_TEMPLATE_DEFAULT_KEYS[key].message),
+});
 
 const getNotificationTemplate = (
   settings: { notificationTemplates?: Record<string, { title?: string; message?: string }> },
-  key: 'completion' | 'subtask' | 'error' | 'question',
-  fallback: { title: string; message: string },
+  key: NotificationTemplateKey,
+  // A caller whose event has its own wording (a permission ask) passes those
+  // defaults, so an empty field falls back to it and not to the shared label.
+  overrides?: { title: string; message: string },
 ) => {
   const candidate = settings.notificationTemplates?.[key];
+  const title = candidate?.title ?? '';
+  const message = candidate?.message ?? '';
+  const defaults = overrides ?? notificationTemplateDefaults(key);
   return {
-    title: typeof candidate?.title === 'string' ? candidate.title : fallback.title,
-    message: typeof candidate?.message === 'string' ? candidate.message : fallback.message,
+    title: title.trim().length > 0 ? title : defaults.title,
+    message: message.trim().length > 0 ? message : defaults.message,
   };
 };
 
@@ -2016,16 +2038,22 @@ window.addEventListener('openchamber:vscode-notification-event', (event) => {
     }
     const requireHidden = settings.notificationMode !== 'always';
     const assistant = notificationAssistantMessage(syncEvent);
-    const errorMessage = syncEvent.type === 'session.error'
-      ? syncEvent.properties.error.message
-      : assistant?.error?.message ?? '';
-    const rawLastMessage = errorMessage || await fetchLastAssistantMessageText(sessionId, assistant?.id);
-    const lastMessage = prepareNotificationLastMessage(rawLastMessage, settings);
-    const variables = buildNotificationVariables(syncEvent, directory, sessionId, lastMessage);
-
     const finish = assistant?.finish;
     const isCompletion = syncEvent.type === 'session.idle' || finish === 'stop';
     const isError = syncEvent.type === 'session.error' || finish === 'error';
+    // Every sync event reaches this listener, streaming deltas included. Only
+    // the completion and error notifications show `{last_message}`, so only
+    // they may walk message pages; any other event reads nothing.
+    const showsLastMessage = isCompletion || isError;
+    if (!showsLastMessage && syncEvent.type !== 'form.created' && syncEvent.type !== 'permission.asked') return;
+    const errorMessage = syncEvent.type === 'session.error'
+      ? syncEvent.properties.error.message
+      : assistant?.error?.message ?? '';
+    const rawLastMessage = showsLastMessage
+      ? errorMessage || await fetchLastAssistantMessageText(findMessagePageItem, sessionId, assistant?.id)
+      : '';
+    const lastMessage = prepareNotificationLastMessage(rawLastMessage, settings);
+    const variables = buildNotificationVariables(syncEvent, directory, sessionId, lastMessage);
 
     if (isCompletion) {
       const session = await opencodeClient.getSession(sessionId, directory).catch(() => undefined);
@@ -2036,12 +2064,14 @@ window.addEventListener('openchamber:vscode-notification-event', (event) => {
       const lastAt = readyNotificationCooldowns.get(sessionId) ?? 0;
       if (now - lastAt < READY_NOTIFICATION_COOLDOWN_MS) return;
       readyNotificationCooldowns.set(sessionId, now);
-      const template = getNotificationTemplate(settings, isSubtask ? 'subtask' : 'completion', { title: '{agent_name} is ready', message: '{model_name} completed the task' });
-      const title = resolveTemplate(template.title, variables) || 'Agent is ready';
+      const templateKey: NotificationTemplateKey = isSubtask ? 'subtask' : 'completion';
+      const defaults = notificationTemplateDefaults(templateKey);
+      const template = getNotificationTemplate(settings, templateKey);
+      const title = resolveTemplate(template.title, variables) || resolveTemplate(defaults.title, variables);
       const body = resolveTemplate(template.message, variables);
       showOpenChamberNotification({
         title,
-        body: shouldApplyTemplateMessage(template.message, body, variables) ? body : `${variables.model_name} completed the task`,
+        body: shouldApplyTemplateMessage(template.message, body, variables) ? body : resolveTemplate(defaults.message, variables),
         sessionId,
         requireHidden,
       });
@@ -2054,12 +2084,13 @@ window.addEventListener('openchamber:vscode-notification-event', (event) => {
       const lastAt = errorNotificationCooldowns.get(sessionId) ?? 0;
       if (now - lastAt < READY_NOTIFICATION_COOLDOWN_MS) return;
       errorNotificationCooldowns.set(sessionId, now);
-      const template = getNotificationTemplate(settings, 'error', { title: 'Tool error', message: '{last_message}' });
-      const title = resolveTemplate(template.title, variables) || 'Tool error';
+      const defaults = notificationTemplateDefaults('error');
+      const template = getNotificationTemplate(settings, 'error');
+      const title = resolveTemplate(template.title, variables) || resolveTemplate(defaults.title, variables);
       const body = resolveTemplate(template.message, variables);
       showOpenChamberNotification({
         title,
-        body: shouldApplyTemplateMessage(template.message, body, variables) ? body : 'An error occurred',
+        body: shouldApplyTemplateMessage(template.message, body, variables) ? body : notificationText('notifications.error.bodyFallback'),
         sessionId,
         requireHidden,
       });
@@ -2071,12 +2102,13 @@ window.addEventListener('openchamber:vscode-notification-event', (event) => {
       if (!settings.notifyOnQuestion) return;
       const header = syncEvent.properties.form.title;
       const questionVariables = { ...variables, last_message: header };
-      const template = getNotificationTemplate(settings, 'question', { title: 'Input needed', message: '{last_message}' });
-      const title = resolveTemplate(template.title, questionVariables) || header || 'Input needed';
+      const defaults = notificationTemplateDefaults('question');
+      const template = getNotificationTemplate(settings, 'question');
+      const title = resolveTemplate(template.title, questionVariables) || header || resolveTemplate(defaults.title, questionVariables);
       const body = resolveTemplate(template.message, questionVariables);
       showOpenChamberNotification({
         title,
-        body: shouldApplyTemplateMessage(template.message, body, questionVariables) ? body : header || 'Agent is waiting for your response',
+        body: shouldApplyTemplateMessage(template.message, body, questionVariables) ? body : notificationText('notifications.question.bodyFallback'),
         sessionId,
         requireHidden,
       });
@@ -2088,10 +2120,14 @@ window.addEventListener('openchamber:vscode-notification-event', (event) => {
       const request = syncEvent.properties;
       const accepted = await processVSCodePermissionAutoAccept(request, directory ?? undefined);
       if (accepted) return;
-      const fallbackMessage = request.message || request.action || 'Agent is waiting for your approval';
+      const fallbackMessage = request.message || request.action || notificationText('notifications.permission.bodyFallback');
       const permissionVariables = { ...variables, last_message: fallbackMessage };
-      const template = getNotificationTemplate(settings, 'question', { title: 'Permission required', message: '{last_message}' });
-      const title = resolveTemplate(template.title, permissionVariables) || 'Permission required';
+      const defaults = {
+        ...notificationTemplateDefaults('question'),
+        title: notificationText('notifications.permission.title'),
+      };
+      const template = getNotificationTemplate(settings, 'question', defaults);
+      const title = resolveTemplate(template.title, permissionVariables) || resolveTemplate(defaults.title, permissionVariables);
       const body = resolveTemplate(template.message, permissionVariables);
       showOpenChamberNotification({
         title,
@@ -2105,7 +2141,8 @@ window.addEventListener('openchamber:vscode-notification-event', (event) => {
 
 // Listen for settings sync command from extension (broadcast to all VS Code webviews)
 onCommand('settingsSynced', () => {
-  import('@openchamber/ui/lib/persistence').then(({ syncDesktopSettings }) => {
+  import('@openchamber/ui/lib/persistence').then(({ invalidateSettingsCache, syncDesktopSettings }) => {
+    invalidateSettingsCache();
     void syncDesktopSettings({ adoptTheme: false });
   });
 });

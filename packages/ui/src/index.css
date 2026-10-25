@@ -11,6 +11,9 @@
    without resolving the relative `url(fonts/...)` references, leaving the
    KaTeX font files unbundled (openchamber/openchamber#1880). */
 @source "./**/*.{ts,tsx,css}";
+@source "../node_modules/streamdown/dist/**/*.js";
+@source "../node_modules/@streamdown/math/dist/**/*.js";
+@source "../node_modules/@streamdown/cjk/dist/**/*.js";
 
 /* KaTeX theme overrides for light/dark mode */
 .katex {
@@ -31,16 +34,75 @@
   color: var(--destructive);
 }
 
+/* Math reads left to right in every locale, so the scroll range starts at
+   the formula's beginning in right-to-left languages too. */
+.markdown-content .katex-display {
+  direction: ltr;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-block: 0.25em;
+}
+
+/* Keep oversized centered formulas inside the reachable scroll range. */
+.markdown-content .katex-display > .katex {
+  width: max-content;
+  min-width: 100%;
+  text-align: center;
+}
+
 @custom-variant dark (&:is(.dark *));
 
-/* Hover-revealed row actions cross-fade over a row's right end instead of
+/* The interface's own start edge and the way toward its end. Text whose
+   direction differs from the interface (a dir="auto" title, a path truncated
+   from its start with direction: rtl) aligns with oc-ui-start-align, so it lines up
+   with the rows around it in either layout. */
+:root {
+  --oc-ui-start: left;
+  --oc-to-inline-end: to right;
+}
+
+:root[dir="rtl"] {
+  --oc-ui-start: right;
+  --oc-to-inline-end: to left;
+}
+
+@utility oc-ui-start-align {
+  text-align: var(--oc-ui-start);
+}
+
+/* Hover-revealed row actions cross-fade over a row's end instead of
    re-laying the row out: the text they cover fades away under them. The
-   masked element sits --oc-actions-inset from its nearest @container's left
-   edge; the actions reach --oc-actions-reserve in from that container's right
-   edge. */
+   masked element sits --oc-actions-inset from its nearest @container's start
+   edge; the actions reach --oc-actions-reserve in from that container's end
+   edge. Both are rem at the default density: the buttons and offsets they
+   describe are spacing tokens, so they also scale with --padding-scale. */
 @utility oc-actions-mask {
-  --oc-actions-edge: calc(100cqw - var(--oc-actions-inset, 0px) - var(--oc-actions-reserve, 0px));
-  mask-image: linear-gradient(to right, #000 calc(var(--oc-actions-edge) - 14px), transparent calc(var(--oc-actions-edge) - 2px));
+  --oc-actions-edge: calc(100cqw - (var(--oc-actions-inset, 0px) + var(--oc-actions-reserve, 0px)) * var(--padding-scale, 1));
+  mask-image: linear-gradient(var(--oc-to-inline-end), #000 calc(var(--oc-actions-edge) - 0.875rem), transparent calc(var(--oc-actions-edge) - 0.125rem));
+
+  /* A title whose own direction differs from the interface (dir="auto") starts
+     on the side the actions cover, so fading there would hide its first
+     letters. It moves out of the way instead. */
+  &:where(:root[dir="rtl"] *):dir(ltr),
+  &:where(:root:not([dir="rtl"]) *):dir(rtl) {
+    mask-image: none;
+    padding-inline-start: calc(var(--oc-actions-reserve, 0px) * var(--padding-scale, 1));
+  }
+}
+
+/* A PR or issue reference coloured by its state (--oc-ref-tint). It is side
+   context, so it rests a little blended into the muted text, its state still
+   plain to read, and takes its full colour on hover or focus, its own or that
+   of an enclosing .oc-ref-tint-scope row. */
+@utility oc-ref-tint {
+  color: color-mix(in oklab, var(--oc-ref-tint) 75%, var(--muted-foreground));
+
+  &:hover,
+  &:focus-visible,
+  :where(.oc-ref-tint-scope:hover, .oc-ref-tint-scope:focus-within) & {
+    color: var(--oc-ref-tint);
+  }
 }
 
 /* Buttons should never look selectable. */
@@ -90,7 +152,7 @@ button,
    off the message root: it also contains code, tables and their controls. */
 .markdown-content,
 .markdown-content :where(p, h1, h2, h3, h4, h5, h6, li, blockquote, td:not([align]), th:not([align]), div.whitespace-pre-wrap),
-.markdown-content details[data-md-details] > summary > span:last-child {
+.markdown-content details > summary {
   unicode-bidi: plaintext;
   text-align: start;
 }
@@ -103,9 +165,9 @@ button,
 /* A technical fragment is one LTR run, even inside an RTL list or quote. */
 .markdown-content :where(
   pre, code, kbd, samp,
-  [data-component="markdown-code"],
-  [data-markdown="table-wrapper"],
-  [data-markdown="mermaid-block"],
+  [data-streamdown="code-block"],
+  [data-streamdown="table-wrapper"],
+  [data-streamdown="mermaid-block"],
   .katex,
   [data-openchamber-file-link="true"],
   [data-openchamber-agent-mention="true"],
@@ -152,6 +214,12 @@ button,
 ::highlight(oc-chat-search-current) {
   background-color: var(--primary);
   color: var(--primary-foreground);
+}
+
+/* The inline comment editor sits in a band tinted like the selected lines it
+   comments on. A diff passes its selected row's own fill instead. */
+.oc-inline-comment-band {
+  background-color: var(--interactive-selection);
 }
 
 .pierre-diff-wrapper {
@@ -299,7 +367,9 @@ button,
   color: color-mix(in srgb, var(--syntax-comment) 85%, var(--syntax-foreground) 15%);
 }
 
-:root.vscode-runtime [data-chat-input="true"] .cm-placeholder {
+/* The composer draws its placeholder as a pseudo-element of the empty line
+   (editor/theme.ts); in VS Code it takes the editor's placeholder colour. */
+:root.vscode-runtime [data-chat-input="true"] .cm-content.cm-composer-empty .cm-line::before {
   color: var(--vscode-input-placeholderForeground, var(--muted-foreground));
 }
 
@@ -322,6 +392,26 @@ div[data-chat-input-footer="true"] {
   /* The band at the scroller's end that floating chrome covers. The end fade
      sits above it, so content dissolves before it reaches that chrome. */
   --scroll-shadow-end-inset: 0px;
+  /* Set per scroller: the chat transcript sets a composer-sized end fade,
+     which no scroller nested in it (tool output, reasoning) may pick up. */
+  --scroll-shadow-end-size: var(--scroll-shadow-size);
+}
+
+/* Registered as non-inherited: only the element that sets them reads them (a
+   masked scroller above, the chat's end fade band below; the band's inset
+   falls back to the 0px initial value). Inherited, a change high in the
+   chat (data-live-tail flips at the start and end of every reply) restyled
+   every element of the transcript. */
+@property --scroll-shadow-end-inset {
+  syntax: '<length>';
+  inherits: false;
+  initial-value: 0px;
+}
+
+@property --scroll-shadow-end-size {
+  syntax: '<length>';
+  inherits: false;
+  initial-value: 48px;
 }
 
 /* The chat composer floats over the transcript's tail (plus any panel docked
@@ -335,13 +425,60 @@ div[data-chat-input-footer="true"] {
    so rows thin out under the glass and beside a composer narrower than the
    transcript (wide layout) instead of meeting the window's edge at full
    strength. In flow (draft, expanded editor) the inset is unset and the
-   fade stays at the scroller's edge. */
-.chat-scroll {
-  --scroll-shadow-end-size: calc(var(--chat-composer-inset, 0px) + var(--chat-floating-panel-clearance, 0px) + var(--scroll-shadow-size));
+   fade stays at the scroller's edge.
+
+   The chat draws its edge fades as two bands over the scroller rather than a
+   mask on it: a mask made the GPU recomposite the whole transcript every
+   frame it scrolled or grew. Each band is painted in the chat's background
+   (`bg-background` on the column, the only thing behind the scroller), with
+   alpha 1 - a where the mask had alpha a; over an opaque background that
+   composites to the same pixels. The bands are later siblings of the
+   scroller (ChatContainer) and follow its scroll-shadow attributes through
+   `~`, so they switch in the same style pass the mask did. They sit under the
+   overlay scrollbar, the prompt rail and the composer, none of which the mask
+   covered either. */
+.chat-scroll-fade {
+  --scroll-shadow-size: 48px;
+  position: absolute;
+  inset-inline: 0;
+  z-index: 1;
+  pointer-events: none;
 }
 
-[data-live-tail="true"] .chat-scroll {
-  --scroll-shadow-end-inset: calc(var(--chat-composer-inset, 0px) + var(--chat-floating-panel-clearance, 0px));
+.chat-scroll-fade--top {
+  display: none;
+  top: 0;
+  height: var(--scroll-shadow-top-size, var(--scroll-shadow-size));
+  background-image: linear-gradient(
+    to bottom,
+    var(--background) var(--scroll-shadow-top-clear-size, 0px),
+    transparent 100%
+  );
+}
+
+.chat-scroll[data-top-scroll="true"] ~ .chat-scroll-fade--top,
+.chat-scroll[data-top-bottom-scroll="true"] ~ .chat-scroll-fade--top {
+  display: block;
+}
+
+/* Always on, as the mask's end fade was: the band covers the inset under the
+   composer solid and ramps in over the end size above it. */
+.chat-scroll-fade--end {
+  --scroll-shadow-end-size: calc(var(--chat-composer-inset, 0px) + var(--chat-floating-panel-clearance, 0px) + var(--scroll-shadow-size));
+  bottom: 0;
+  height: calc(var(--scroll-shadow-end-inset) + var(--scroll-shadow-end-size));
+  background-image: linear-gradient(
+    to bottom,
+    transparent 0px,
+    var(--background) var(--scroll-shadow-end-size)
+  );
+}
+
+/* The solid part also covers the status row floating above the composer
+   (`--chat-status-row-clearance`, set by ChatContainer while the session
+   works), so a line that lands there sits under the band, not beside the row. */
+[data-live-tail="true"] .chat-scroll-fade--end {
+  --scroll-shadow-end-inset: calc(var(--chat-composer-inset, 0px) + var(--chat-floating-panel-clearance, 0px) + var(--chat-status-row-clearance, 0px));
   --scroll-shadow-end-size: var(--scroll-shadow-size);
 }
 
@@ -353,8 +490,7 @@ div[data-chat-input-footer="true"] {
   mask-size: 100% 100%;
 }
 
-[data-scroll-shadow="true"][data-orientation="vertical"][data-top-bottom-scroll="true"],
-.chat-scroll[data-scroll-shadow="true"][data-orientation="vertical"][data-top-scroll="true"] {
+[data-scroll-shadow="true"][data-orientation="vertical"][data-top-bottom-scroll="true"]:not(.chat-scroll) {
   mask-image: linear-gradient(
     to bottom,
     transparent 0%,
@@ -405,8 +541,7 @@ div[data-chat-input-footer="true"] {
   opacity: 1;
 }
 
-[data-scroll-shadow="true"][data-orientation="vertical"][data-bottom-scroll="true"],
-.chat-scroll[data-scroll-shadow="true"][data-orientation="vertical"]:not([data-top-scroll="true"]):not([data-top-bottom-scroll="true"]) {
+[data-scroll-shadow="true"][data-orientation="vertical"][data-bottom-scroll="true"]:not(.chat-scroll) {
   mask-image: linear-gradient(
     to bottom,
     #000 0%,
@@ -422,15 +557,6 @@ div[data-chat-input-footer="true"] {
 }
 
 
-@keyframes spin-once {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
-}
-
 @keyframes oc-migrate-up {
   0% {
     opacity: 1;
@@ -439,27 +565,6 @@ div[data-chat-input-footer="true"] {
   100% {
     opacity: 0;
     transform: translateY(-10px);
-  }
-}
-
-@keyframes gradient-shimmer {
-  0% {
-    stop-color: currentColor;
-  }
-  50% {
-    stop-color: color-mix(in srgb, currentColor 60%, white 40%);
-  }
-  100% {
-    stop-color: currentColor;
-  }
-}
-
-@keyframes shimmer-position {
-  0% {
-    x: -100%;
-  }
-  100% {
-    x: 100%;
   }
 }
 
@@ -508,8 +613,8 @@ button svg,
  * value only WebKit parses, which keeps the rule where it was written for.
  */
 @supports (font: -apple-system-body) {
-  button svg:not(.animate-spin):not(.activity-spinner),
-  [role="button"] svg:not(.animate-spin):not(.activity-spinner) {
+  button svg:not(.animate-spin),
+  [role="button"] svg:not(.animate-spin) {
     transform: translateZ(0);
     -webkit-transform: translateZ(0);
   }
@@ -531,6 +636,18 @@ button svg.remixicon circle[fill],
 button svg path,
 [role="button"] svg path {
   fill: currentColor !important;
+}
+
+/*
+ * Icons that point somewhere (back, next, disclosure, panel side, send) mirror
+ * in a right-to-left layout. The flip sits on the inner <use>, so classes that
+ * transform or scale the <svg> keep working. :dir() follows the nearest dir
+ * attribute, which keeps physical arrows inside dir="ltr" content (terminal
+ * keys) unmirrored. The flip applies before the <svg>'s own rotation, so a
+ * chevron that turns a quarter turn to open needs `rtl:` to turn the other way.
+ */
+svg.remixicon[data-directional]:dir(rtl) > use {
+  transform: matrix(-1, 0, 0, 1, 24, 0);
 }
 
 /* Safari/WebKit animation fixes - outside @layer for higher specificity */
@@ -562,42 +679,20 @@ svg.animate-spin {
   }
 }
 
-@keyframes pulse-opacity {
-  0%,
-  100% {
-    opacity: 0.4;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-
-@keyframes pulse-opacity-dim {
-  0%,
-  100% {
-    opacity: 0;
-  }
-  50% {
-    opacity: 0.7;
-  }
-}
-
 .app-region-drag {
   -webkit-app-region: drag;
 }
 
 /* Native drag regions still intercept pointer input beneath portal dialogs.
-   Restore them when the last dialog closes. */
-.oc-dialog-open .app-region-drag {
+   Restore them when the last dialog closes. Open menus do the same, so a
+   click on the title bar reaches the page and dismisses the menu. */
+.oc-dialog-open .app-region-drag,
+.oc-menu-open .app-region-drag {
   -webkit-app-region: no-drag;
 }
 
 .app-region-no-drag {
   -webkit-app-region: no-drag;
-}
-
-.animate-spin-once {
-  animation: spin-once 0.5s linear forwards;
 }
 
 /* Custom scrollbar styles */
@@ -626,8 +721,8 @@ svg.animate-spin {
 
 .dark {
   color-scheme: dark;
-  --oc-scrollbar-thumb: oklch(0.6 0.02 80 / 0.3);
-  --oc-scrollbar-thumb-hover: oklch(0.6 0.02 80 / 0.5);
+  --oc-scrollbar-thumb: oklch(0.6 0.02 80 / 0.18);
+  --oc-scrollbar-thumb-hover: oklch(0.6 0.02 80 / 0.36);
 }
 
 [data-scrollbar="chat"]::-webkit-scrollbar-thumb {
@@ -809,11 +904,45 @@ html:not(.dark) .chat-scroll {
   margin: 0;
 }
 
-/* Pierre diff viewer styling */
-.pierre-diff-wrapper {
+/* The collapsed session sidebar sliding out over the chat on hover
+   (Sidebar.tsx). `--oc-peek-offset` is the start side's sign. */
+@keyframes oc-sidebar-peek-in {
+  from {
+    transform: translateX(var(--oc-peek-offset));
+    opacity: 0;
+  }
+}
+
+@keyframes oc-sidebar-peek-out {
+  to {
+    transform: translateX(var(--oc-peek-offset));
+    opacity: 0;
+  }
+}
+
+/* Every Pierre instance (Changes view, tool cards, the tool dialog, the Files
+   view) renders into the shadow root of a `diffs-container`. Setting the font
+   and line height on that host resolves `--text-code` where the instance sits, so local
+   overrides such as the Files view's editor font size and the mobile code
+   size apply too. */
+diffs-container {
   --diffs-font-family: var(--font-mono, ui-monospace, monospace);
   --diffs-font-size: var(--text-code);
+  /* 24px at the default 12px code size. Tool cards and the tool dialog wrap
+     lines, so Pierre measures their rows and the height can scale. */
+  --diffs-line-height: calc(var(--text-code) * 2);
+}
+
+/* The Changes view and the walkthrough virtualize with fixed 24px rows
+   (`VIRTUAL_METRICS.lineHeight` in PierreDiffViewer.tsx). Without wrapping,
+   Pierre does not measure rows, so a taller row would make long diffs jump
+   while scrolling. */
+.pierre-diff-wrapper diffs-container {
   --diffs-line-height: 24px;
+}
+
+/* Pierre diff viewer styling */
+.pierre-diff-wrapper {
   --diffs-tab-size: 2;
   --diffs-header-font-family: var(--font-sans, system-ui, sans-serif);
   --diffs-min-number-column-width: 4ch;
@@ -900,7 +1029,7 @@ html:not(.dark) .chat-scroll {
     display: none;
   }
   :root:not(.mobile-pointer):not(.vscode-runtime) .header-tab-badge {
-    margin-left: -0.125rem;
+    margin-inline-start: -0.125rem;
   }
 }
 
@@ -1014,31 +1143,84 @@ html:not(.dark) .chat-scroll {
   }
 }
 
-/* Diff toolbar: the walkthrough label goes first. Review is the primary action
-   in this row, so it keeps its label longest; the walkthrough is reachable from
-   the rail as well and reads fine as an icon. */
-@container diff-toolbar (max-width: 36rem) {
-  .diff-toolbar__walkthrough-label {
-    display: none;
-  }
-
-  .diff-toolbar__walkthrough-button {
-    padding-inline: 0.5rem;
-  }
+/* Git panel header: gives up room in steps while its row does not fit, as
+   measured by useToolbarFit in GitHeader. The repository picker shrinks
+   first; the branch picker keeps its width until that is not enough. Then
+   the sync button drops its word, keeping its icon, counts and tooltip; the
+   counts go last. */
+[data-git-header-branch-shrinks] .branch-selector__trigger {
+  flex-shrink: 1;
 }
 
-/* Then the rest, once the panel is genuinely tight. */
-@container diff-toolbar (max-width: 28rem) {
-  .diff-toolbar__scope-count,
-  .diff-toolbar__review-label,
-  .diff-toolbar__expand-label {
-    display: none;
-  }
+[data-git-header-compact] .sync-actions__label,
+[data-git-header-tight] .sync-actions__text {
+  display: none;
+}
 
-  .diff-toolbar__review-button,
-  .diff-toolbar__expand-button {
-    padding-inline: 0.5rem;
-  }
+/* Diff toolbar: labels collapse to icons only when the row does not fit, as
+   measured by useDiffToolbarFit. The walkthrough label goes first. Review is
+   the primary action in this row, so it keeps its label longest; the
+   walkthrough is reachable from the rail as well and reads fine as an icon. */
+[data-diff-toolbar-compact-walkthrough] .diff-toolbar__walkthrough-label,
+[data-diff-toolbar-compact] .diff-toolbar__walkthrough-label,
+[data-diff-toolbar-compact] .diff-toolbar__scope-count,
+[data-diff-toolbar-compact] .diff-toolbar__review-label,
+[data-diff-toolbar-compact] .diff-toolbar__expand-label {
+  display: none;
+}
+
+/* Icon only, the button is square: as wide as the 28px row is tall. */
+[data-diff-toolbar-compact-walkthrough] .diff-toolbar__walkthrough-button,
+[data-diff-toolbar-compact] .diff-toolbar__walkthrough-button,
+[data-diff-toolbar-compact] .diff-toolbar__review-button,
+[data-diff-toolbar-compact] .diff-toolbar__expand-button {
+  padding-inline: 0.375rem;
+}
+
+/* When even the icons do not fit, the view options move from the end into
+   "More actions": side-by-side, whitespace, line wrap, then the tree view;
+   last, if the row still does not fit, the walkthrough. DiffView lists in the
+   menu the ones whose step is set. */
+.diff-toolbar__more,
+[data-diff-toolbar-more-layout] .diff-toolbar__layout-toggle,
+[data-diff-toolbar-more-whitespace] .diff-toolbar__whitespace-toggle,
+[data-diff-toolbar-more-wrap] .diff-toolbar__wrap-toggle,
+[data-diff-toolbar-more-tree] .diff-toolbar__tree-toggle,
+[data-diff-toolbar-more-walkthrough] .diff-toolbar__walkthrough-button {
+  display: none;
+}
+
+[data-diff-toolbar-more-layout] .diff-toolbar__more {
+  display: inline-flex;
+}
+
+/* Walkthrough header: gives up room in steps while its row does not fit, as
+   measured by useToolbarFit; each step keeps the ones before it. Labels go
+   first; then the model, the language, the guide and Changes move into "More";
+   then the step arrows and Generate, which "More" and the step list still
+   reach; last the scope keeps only its icon. The model picker's label and
+   chevron are its direct span and last svg. */
+.walkthrough-header__more,
+.walkthrough-header__source-icon {
+  display: none;
+}
+
+[data-walkthrough-header-compact] .walkthrough-header__label,
+[data-walkthrough-header-compact] .walkthrough-header__model > span,
+[data-walkthrough-header-compact] .walkthrough-header__model > svg:last-child,
+[data-walkthrough-header-tight] .walkthrough-header__option,
+[data-walkthrough-header-minimal] .walkthrough-header__step-arrow,
+[data-walkthrough-header-minimal] .walkthrough-header__generate,
+[data-walkthrough-header-narrow] .walkthrough-header__source-label {
+  display: none;
+}
+
+[data-walkthrough-header-tight] .walkthrough-header__more {
+  display: inline-flex;
+}
+
+[data-walkthrough-header-narrow] .walkthrough-header__source-icon {
+  display: inline;
 }
 
 /* Pull request actions: the walkthrough label goes first, since merge controls
@@ -1186,11 +1368,43 @@ html:not(.dark) .chat-scroll {
   line-height: inherit;
 }
 
+/* Lists retain an outside marker and a logical gutter in mixed-direction prose. */
+.markdown-content ul,
+.markdown-content ol {
+  list-style-position: outside;
+  padding-inline-start: 1.5rem;
+}
+
+.markdown-content li {
+  padding-block: 0;
+}
+
+.markdown-content li > p {
+  display: block;
+}
+
+.markdown-content li > ul,
+.markdown-content li > ol {
+  margin-block: 0;
+  padding-inline-start: 1.5rem;
+}
+
 /* Documents rendered with their raw HTML (the Files preview) lay images out
    the way GitHub does: inline beside text and other badges, not one block per
    line as Tailwind preflight makes them. */
 .markdown-content[data-markdown-html] img {
   display: inline;
+}
+
+/* A clip fits the column at its own ratio, no taller than a drawn picture. */
+.markdown-content video {
+  display: block;
+  max-width: 100%;
+  max-height: 30rem;
+  height: auto;
+  margin: var(--markdown-paragraph-spacing) 0;
+  border-radius: 6px;
+  background: black;
 }
 
 /* Block rhythm: every block carries the same margin on both sides, so the
@@ -1206,28 +1420,79 @@ html:not(.dark) .chat-scroll {
   margin: var(--markdown-paragraph-spacing) 0;
 }
 
-/* The markdown renderer wraps each block in a display:contents [data-md-block]
-   element, so the message-level [&_.markdown-content>*:first-child]:mt-0 /
-   [&_.markdown-content>*:last-child]:mb-0 nullifiers target the wrapper
-   (where margin is ignored), not the block. Trim the outer blocks directly so
-   messages gain no extra space at the top or bottom. The last block is found
-   by the renderer's [data-md-last] marker, not [data-md-block]:last-child: a
-   structural pseudo-class in that position makes every append to <body> (each
-   tooltip and menu portal) restyle the whole app. */
-.markdown-content > [data-md-block]:first-child > :first-child,
-.markdown-content > :first-child:not([data-md-block]) {
-  margin-top: 0;
+/* The native root and arrival wrappers add no rhythm of their own. Static
+   mode renders blocks directly; streaming mode wraps each official Block. */
+.markdown-content > [data-oc-streamdown],
+.markdown-content [data-oc-streamdown] > [data-oc-markdown-block] {
+  margin-block: 0;
 }
 
-.markdown-content > [data-md-last] > :last-child,
-.markdown-content > :last-child:not([data-md-block]) {
-  margin-bottom: 0;
+.markdown-content [data-oc-streamdown] > :where(:not([data-oc-markdown-block])),
+.markdown-content [data-oc-markdown-block] > * {
+  --oc-block-margin-start: var(--markdown-paragraph-spacing);
+  --oc-block-margin-end: var(--markdown-paragraph-spacing);
+  margin-block-start: var(--markdown-paragraph-spacing);
+  margin-block-end: var(--markdown-paragraph-spacing);
+}
+
+.markdown-content [data-oc-streamdown] > h1,
+.markdown-content [data-oc-streamdown] > h2,
+.markdown-content [data-oc-streamdown] > h3,
+.markdown-content [data-oc-streamdown] > h4,
+.markdown-content [data-oc-streamdown] > h5,
+.markdown-content [data-oc-streamdown] > h6,
+.markdown-content [data-oc-markdown-block] > h1,
+.markdown-content [data-oc-markdown-block] > h2,
+.markdown-content [data-oc-markdown-block] > h3,
+.markdown-content [data-oc-markdown-block] > h4,
+.markdown-content [data-oc-markdown-block] > h5,
+.markdown-content [data-oc-markdown-block] > h6 {
+  --oc-block-margin-start: 1.25rem;
+  --oc-block-margin-end: 0.5rem;
+  margin-block-start: 1.25rem;
+  margin-block-end: 0.5rem;
+}
+
+.markdown-content [data-oc-streamdown] > :first-child:not([data-oc-markdown-block]) {
+  margin-block-start: 0 !important;
+}
+
+.markdown-content [data-oc-streamdown] > :last-child:not([data-oc-markdown-block]) {
+  margin-block-end: 0 !important;
+}
+
+/* Keep wrapper-edge detection separate from content-edge matching. The combined
+   wrapper:last-child > :last-child selector caused broad subtree invalidation
+   on code-token insertions in Chrome session-switch traces. Local variables
+   carry the edge override without requiring Streamdown block metadata or DOM
+   writes. Reset on every wrapper so nested documents cannot inherit an edge.
+   Non-edge blocks retain their paragraph/heading margins through the defaults. */
+.markdown-content [data-oc-markdown-block] {
+  --oc-block-edge-start: initial;
+  --oc-block-edge-end: initial;
+}
+
+.markdown-content [data-oc-streamdown] > [data-oc-markdown-block]:first-child {
+  --oc-block-edge-start: 0px;
+}
+
+.markdown-content [data-oc-streamdown] > [data-oc-markdown-block]:last-child {
+  --oc-block-edge-end: 0px;
+}
+
+.markdown-content [data-oc-markdown-block] > :first-child {
+  margin-block-start: var(--oc-block-edge-start, var(--oc-block-margin-start)) !important;
+}
+
+.markdown-content [data-oc-markdown-block] > :last-child {
+  margin-block-end: var(--oc-block-edge-end, var(--oc-block-margin-end)) !important;
 }
 
 /* Tool cards (code size) and reasoning (meta size, dimmed) are intentionally
    compact — keep their paragraphs tight, matching prior behavior. */
 .markdown-content.markdown-tool p,
 .markdown-content.markdown-reasoning p {
+  --oc-block-margin-end: 0px;
   margin-bottom: 0;
 }
 
@@ -1238,14 +1503,6 @@ html:not(.dark) .chat-scroll {
 
 .form-markdown > .markdown-content.markdown-tool {
   font-size: inherit !important;
-}
-
-.form-markdown > .markdown-content > [data-md-block]:first-child > :first-child {
-  margin-top: 0;
-}
-
-.form-markdown > .markdown-content > [data-md-last] > :last-child {
-  margin-bottom: 0;
 }
 
 /* Reasoning markdown renders at meta size, dimmed. */
@@ -1274,8 +1531,7 @@ html:not(.dark) .chat-scroll {
 .markdown-content.markdown-reasoning b,
 .markdown-content.markdown-reasoning em,
 .markdown-content.markdown-reasoning del,
-.markdown-content.markdown-reasoning [data-markdown="strong"],
-.markdown-content.markdown-reasoning [data-markdown="bold"] {
+.markdown-content.markdown-reasoning [data-streamdown="strong"] {
   color: var(--surface-muted-foreground) !important;
 }
 
@@ -1291,8 +1547,7 @@ html:not(.dark) .chat-scroll {
 
 .markdown-content.markdown-reasoning strong,
 .markdown-content.markdown-reasoning b,
-.markdown-content.markdown-reasoning [data-markdown="strong"],
-.markdown-content.markdown-reasoning [data-markdown="bold"] {
+.markdown-content.markdown-reasoning [data-streamdown="strong"] {
   font-weight: inherit !important;
   color: inherit !important;
   font-style: inherit !important;
@@ -1337,18 +1592,15 @@ html:not(.dark) .chat-scroll {
 
 /* GitHub writes `<summary><h3>Findings</h3></summary>`: like GitHub, the
    heading keeps its size but sits on the chevron's line without margins. */
-.markdown-content details[data-md-details] > summary > span:last-child > :is(h1, h2, h3, h4, h5, h6, p) {
+.markdown-content details > summary h1,
+.markdown-content details > summary h2,
+.markdown-content details > summary h3,
+.markdown-content details > summary h4,
+.markdown-content details > summary h5,
+.markdown-content details > summary h6,
+.markdown-content details > summary p {
   display: inline;
   margin: 0;
-}
-
-.markdown-content details[data-md-details] > summary:has(> span:last-child > :is(h1, h2, h3, h4, h5, h6)) {
-  align-items: center;
-}
-
-.markdown-content details[data-md-details] > summary:has(> span:last-child > :is(h1, h2, h3, h4, h5, h6)) > [data-md-disclosure-icon] {
-  align-self: center;
-  margin-top: 0;
 }
 
 /* Code font */
@@ -1362,7 +1614,7 @@ html:not(.dark) .chat-scroll {
    quiet chip. The colour keeps the theme's value with a touch of transparency,
    and the chip fades into the background further, so neither shouts like the
    original full-strength style. */
-.markdown-content code[data-markdown="inline-code"] {
+.markdown-content code[data-streamdown="inline-code"] {
   background-color: var(--markdown-inline-code-bg, var(--surface-subtle)) !important;
   color: var(--markdown-inline-code, var(--foreground)) !important;
   padding: 0.1rem 0.35rem;
@@ -1372,7 +1624,7 @@ html:not(.dark) .chat-scroll {
 }
 
 @supports (color: color-mix(in lab, red, red)) {
-  .markdown-content code[data-markdown="inline-code"] {
+  .markdown-content code[data-streamdown="inline-code"] {
     background-color: color-mix(in srgb, var(--markdown-inline-code-bg, var(--surface-subtle)) 50%, transparent) !important;
     color: color-mix(in srgb, var(--markdown-inline-code, var(--foreground)) 90%, transparent) !important;
   }
@@ -1413,8 +1665,11 @@ html:not(.dark) .chat-scroll {
 
 /* Markdown blockquote - use theme colors */
 .markdown-content blockquote {
+  border-inline-end: 0;
   border-inline-start: 2px solid var(--markdown-blockquote-border, var(--border));
+  padding-inline-end: 0;
   padding-inline-start: 0.8rem;
+  font-style: normal;
   color: var(--markdown-blockquote, var(--muted-foreground));
 }
 
@@ -1424,7 +1679,8 @@ html:not(.dark) .chat-scroll {
 }
 
 /* Markdown bold/italic/strikethrough - use theme colors */
-.markdown-content strong {
+.markdown-content strong,
+.markdown-content [data-streamdown="strong"] {
   color: var(--markdown-bold, var(--foreground));
 }
 
@@ -1436,8 +1692,7 @@ html:not(.dark) .chat-scroll {
    jumping to the full foreground (mirrors the reasoning-scope rules below). */
 .markdown-content blockquote strong,
 .markdown-content blockquote b,
-.markdown-content blockquote [data-markdown="strong"],
-.markdown-content blockquote [data-markdown="bold"] {
+.markdown-content blockquote [data-streamdown="strong"] {
   color: inherit;
 }
 
@@ -1450,83 +1705,162 @@ html:not(.dark) .chat-scroll {
   color: var(--markdown-strikethrough, var(--muted-foreground));
 }
 
-/* Streamdown code blocks: ensure light/dark Shiki vars work even when Tailwind doesn't scan Streamdown's internal class names. */
-.markdown-content [data-markdown="code-block-body"] {
+/* Native table chrome keeps the existing compact toolbar and framed canvas. */
+.markdown-content [data-streamdown="table-wrapper"] {
+  width: fit-content;
+  max-width: 100%;
+  min-width: 0;
+  margin: var(--markdown-paragraph-spacing) 0;
+  padding: 0;
+  gap: 0.5rem;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.markdown-content [data-streamdown="table-wrapper"] > div:has(> table) {
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 0.5rem;
+  background: var(--surface-elevated);
+}
+
+.markdown-content [data-streamdown="table"] {
+  width: auto;
+  margin: 0;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.markdown-content [data-streamdown="table-header"] {
+  background: transparent;
+}
+
+.markdown-content [data-streamdown="table-row"] {
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+}
+
+.markdown-content tbody > [data-streamdown="table-row"]:last-child {
+  border-bottom: 0;
+}
+
+.markdown-content [data-streamdown="table-cell"],
+.markdown-content [data-streamdown="table-header-cell"] {
+  min-width: 120px;
+  padding: 0.625rem 1rem;
+  border-inline-end: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  vertical-align: middle;
+  font-size: inherit;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  color: color-mix(in srgb, var(--foreground) 90%, transparent);
+}
+
+.markdown-content [data-streamdown="table-header-cell"] {
+  color: var(--foreground);
+}
+
+.markdown-content td:last-child,
+.markdown-content th:last-child {
+  border-inline-end: 0;
+}
+
+/* A table that is still streaming is not measured: it keeps its natural width
+   (or shrinks to the column when cells wrap) until the reply settles. */
+.markdown-content [data-table-wrap="false"] [data-streamdown="table"][data-oc-table-layout="pending"] {
+  width: max-content;
+}
+
+.markdown-content [data-streamdown="table"][data-oc-table-layout="pending"] code {
+  white-space: nowrap;
+}
+
+.markdown-content [data-streamdown="table"][data-oc-table-layout="natural"] {
+  width: max-content;
+  table-layout: auto;
+}
+
+.markdown-content [data-streamdown="table"][data-oc-table-layout="natural"] td,
+.markdown-content [data-streamdown="table"][data-oc-table-layout="natural"] th {
+  white-space: nowrap;
+}
+
+.markdown-content [data-streamdown="table"][data-oc-table-layout="natural"] code {
+  white-space: nowrap;
+}
+
+/* Exclude headings from the first intrinsic layout when body rows exist.
+   The layout effect commits the measured colgroup before the first paint. */
+.markdown-content [data-streamdown="table"][data-oc-table-layout="natural"]:has(> tbody > tr) > thead {
+  display: none;
+}
+
+.markdown-content [data-streamdown="table"][data-oc-table-layout="fixed"] code {
+  white-space: var(--oc-table-code-wrap, normal);
+  overflow-wrap: anywhere;
+}
+
+/* Both the initial token shell and highlighted body use native token rows. */
+.markdown-content [data-streamdown="code-block-body"] {
   font-size: var(--text-code);
   background-color: transparent;
   color: var(--shiki-light, inherit);
 }
 
-.markdown-content [data-markdown="code-block-body"] span[style*="--sdm-c"] {
-  color: var(--sdm-c) !important;
-}
-
-.markdown-content [data-markdown="code-block-body"] span[style*="--sdm-tbg"] {
-  background-color: var(--sdm-tbg) !important;
-}
-
-.markdown-content [data-markdown="code-block-body"] span[style*="--shiki-light"] {
-  color: var(--shiki-light) !important;
-}
-
-.markdown-content [data-markdown="code-block-body"] span[style*="--shiki-light-bg"] {
-  background-color: var(--shiki-light-bg) !important;
-}
-
-.dark .markdown-content [data-markdown="code-block-body"] {
+.dark .markdown-content [data-streamdown="code-block-body"] {
   background-color: transparent;
   color: var(--shiki-dark, var(--shiki-light, inherit));
 }
 
-.dark .markdown-content [data-markdown="code-block-body"] span[style*="--shiki-dark"] {
-  color: var(--shiki-dark) !important;
-}
-
-.dark .markdown-content [data-markdown="code-block-body"] span[style*="--shiki-dark-bg"] {
-  background-color: var(--shiki-dark-bg) !important;
-}
-
 /* Reduce code block header height */
-[data-markdown="code-block-header"] {
+[data-streamdown="code-block-header"] {
   --foreground: var(--surface-foreground);
   color: var(--foreground);
   margin: 0;
   padding: 0.375rem 0.75rem;
+  height: auto;
+  min-height: 2rem;
+  font-size: 0.8125rem;
   display: flex;
   align-items: center;
   justify-content: space-between;
   width: 100%;
-  padding-right: 5.25rem;
+  padding-inline-end: 5.25rem;
   border: 0;
-  border-bottom: 1px solid var(--interactive-border);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   border-radius: 0;
-  background: var(--surface-muted);
+  background: transparent;
+}
+
+[data-streamdown="code-block-header"] > span {
+  margin: 0;
 }
 
 /* Disable Streamdown's code block virtualization and keep block chrome fixed */
-.markdown-content [data-markdown="code-block"] {
+.markdown-content [data-streamdown="code-block"] {
   content-visibility: visible !important;
   contain-intrinsic-size: none !important;
   position: relative;
   display: flex;
   flex-direction: column;
+  gap: 0;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  margin: var(--markdown-paragraph-spacing) 0;
   padding: 0 !important;
   box-sizing: border-box;
   inline-size: 100%;
   max-inline-size: 100%;
   min-inline-size: 0;
   overflow: hidden;
-  --foreground: var(--syntax-foreground);
+  --foreground: var(--surface-elevated-foreground);
   color: var(--foreground);
-  background: var(--syntax-background);
-  border: 1px solid var(--interactive-border);
-  border-radius: 0.75rem;
+  background: var(--surface-elevated);
+  border-radius: 1rem;
 }
 
-.markdown-content [data-markdown="code-block"] > div:not([data-markdown]) {
+.markdown-content [data-streamdown="code-block"] > div:has(> [data-streamdown="code-block-actions"]) {
   position: absolute;
   top: 0;
-  right: 0;
+  inset-inline-end: 0;
   margin-top: 0;
   height: 2rem;
   z-index: 6;
@@ -1534,7 +1868,7 @@ html:not(.dark) .chat-scroll {
 }
 
 /* Streamdown code block body: scroll text content within the card body */
-.markdown-content [data-markdown="code-block-body"] {
+.markdown-content [data-streamdown="code-block-body"] {
   display: block;
   inline-size: 100%;
   min-width: 0;
@@ -1550,51 +1884,77 @@ html:not(.dark) .chat-scroll {
   border-radius: 0;
 }
 
-.markdown-content [data-markdown="code-block-body"] pre {
+.markdown-content [data-streamdown="code-block-body"] pre {
   display: block;
   width: 100%;
   min-width: 100%;
   max-width: 100%;
   margin: 0 !important;
-  padding: 0.75rem !important;
+  padding: 0.625rem 0.75rem !important;
   border: 0 !important;
   border-radius: 0 !important;
   box-shadow: none !important;
   background: transparent !important;
 }
 
-.markdown-content [data-markdown="code-block-body"] > * {
+.markdown-content [data-streamdown="code-block-body"] > pre {
   border: 0 !important;
   border-radius: 0 !important;
   box-shadow: none !important;
   background: transparent !important;
 }
 
-.markdown-content [data-markdown="code-block-body"] code {
+.markdown-content [data-streamdown="code-block-body"] code {
   white-space: pre;
   overflow-wrap: normal;
   word-break: normal;
   background: transparent !important;
 }
 
-/* The marked renderer uses its own code-body wrapper instead of Streamdown's. */
-.markdown-content [data-md-code-body],
-.markdown-content [data-md-code-body] pre,
-.markdown-content [data-md-code-body] code,
-.markdown-content [data-md-code-body] [data-md-code-lines] {
-  background: transparent !important;
-}
-
-.markdown-content [data-md-code-lines] {
+/* Native counters keep numbers out of source text. Only numbered blocks
+   reserve a gutter; noLineNumbers fences keep their full content width. */
+.markdown-content [data-streamdown="code-block-body"] code:has(> .before\:content-\[counter\(line\)\]) {
   display: block;
-  min-width: 100%;
+  padding-inline-start: 2.75rem;
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--border) 50%, transparent),
+    color-mix(in srgb, var(--border) 50%, transparent)
+  );
+  background-repeat: no-repeat;
+  background-position: calc(2rem - 1px) 0;
+  background-size: 1px 100%;
 }
 
-.markdown-content [data-md-code-line] {
-  display: grid;
-  grid-template-columns: 2rem minmax(0, 1fr);
-  column-gap: 0.75rem;
-  min-width: 100%;
+.markdown-content [data-streamdown="code-block-body"] code > .before\:content-\[counter\(line\)\]::before {
+  content: counter(line) / '';
+  float: left;
+  width: 2rem;
+  margin-inline-start: -2.75rem;
+  margin-inline-end: 0;
+  /* The 1px stands for the rule, which sits inside the column. */
+  padding-inline-end: calc(0.75rem + 1px);
+  font-size: inherit;
+  color: color-mix(in srgb, var(--muted-foreground) 45%, transparent);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.markdown-content[data-code-wrap="true"] [data-streamdown="code-block-body"] {
+  overflow-x: hidden;
+}
+
+.markdown-content[data-code-wrap="true"] [data-streamdown="code-block-body"] pre,
+.markdown-content[data-code-wrap="true"] [data-streamdown="code-block-body"] code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.markdown-content[data-code-wrap="false"] [data-streamdown="code-block-body"] pre,
+.markdown-content[data-code-wrap="false"] [data-streamdown="code-block-body"] code {
+  white-space: pre;
+  overflow-wrap: normal;
 }
 
 /* First uncached open of a session shows a hydration skeleton; the real
@@ -1614,9 +1974,9 @@ html:not(.dark) .chat-scroll {
   animation: oc-chat-hydration-reveal 100ms ease-out both;
 }
 
-/* Timeline root while a freshly opened session still has provisional first
-   paints (see timelineRevealGate.ts): hidden until every hold releases, then
-   revealed as a whole. */
+/* Timeline root while a freshly opened session is still being put in place
+   (see timelineRevealGate.ts): hidden until every hold releases and the list
+   heights settle, then revealed as a whole. */
 [data-timeline-reveal='pending'] {
   opacity: 0;
 }
@@ -1656,51 +2016,57 @@ html:not(.dark) .chat-scroll {
   }
 }
 
-/* While streaming defers the per-line gutter markup, hold its horizontal
-   footprint (2rem column + 0.75rem gap) so the finished pass only fills in
-   the numbers instead of shifting every code line. */
-.markdown-content pre[data-md-gutter-reserved] > code {
-  display: block;
-  padding-left: 2.75rem;
+/* Tool titles write themselves in: a soft edge sweeps left to right and the
+   text fades in behind it, about 280ms, like the per-character fade it
+   replaces. One animation per title. mask-position is not composited, so each
+   frame repaints this text box alone; the mask image lives only in the
+   keyframes, so once the sweep ends the title carries no mask at all. The
+   mask is three element widths wide (opaque, ramp, clear) and slides from
+   showing its clear third to showing its opaque third. */
+@keyframes oc-text-generate {
+  from {
+    -webkit-mask-image: linear-gradient(to right, #000 33.333%, transparent 66.667%);
+    mask-image: linear-gradient(to right, #000 33.333%, transparent 66.667%);
+    -webkit-mask-position: 100% 0;
+    mask-position: 100% 0;
+  }
+  to {
+    -webkit-mask-image: linear-gradient(to right, #000 33.333%, transparent 66.667%);
+    mask-image: linear-gradient(to right, #000 33.333%, transparent 66.667%);
+    -webkit-mask-position: 0% 0;
+    mask-position: 0% 0;
+  }
 }
 
-.markdown-content [data-md-code-line-number] {
-  align-self: stretch;
-  padding-right: 0.75rem;
-  border-right: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
-  color: color-mix(in srgb, var(--muted-foreground) 45%, transparent);
-  font-variant-numeric: tabular-nums;
-  text-align: right;
-  user-select: none;
-  white-space: nowrap;
+.oc-text-generate {
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-size: 300% 100%;
+  mask-size: 300% 100%;
+  animation: oc-text-generate 280ms ease-out;
 }
 
-.markdown-content [data-md-code-line-number]::before {
-  content: attr(data-md-code-line-number);
+@media (prefers-reduced-motion: reduce) {
+  .oc-text-generate {
+    animation: none;
+  }
 }
 
-.markdown-content [data-md-code-line-content] {
-  min-width: 0;
-}
-
-.markdown-content [data-md-code-line-break] {
-  display: none;
-}
-
-[data-message-image-export="true"] [data-md-code-body] {
+[data-message-image-export="true"] [data-streamdown="code-block-body"] {
   overflow: visible !important;
 }
 
-[data-message-image-export="true"] [data-md-code-line-content] {
+[data-message-image-export="true"] [data-streamdown="code-block-body"] pre,
+[data-message-image-export="true"] [data-streamdown="code-block-body"] code {
   white-space: pre-wrap !important;
   overflow-wrap: anywhere !important;
 }
 
-[data-message-image-export="true"] [data-md-code-actions] {
+[data-message-image-export="true"] [data-streamdown="code-block-actions"] {
   display: none !important;
 }
 
-.markdown-content [data-markdown="code-block-actions"] {
+.markdown-content [data-streamdown="code-block-actions"] {
   pointer-events: auto;
   transition: opacity 0.15s ease;
   border: 0 !important;
@@ -1709,7 +2075,7 @@ html:not(.dark) .chat-scroll {
   gap: 0.125rem;
 }
 
-.markdown-content [data-markdown="code-block-actions"] button {
+.markdown-content [data-streamdown="code-block-actions"] button {
   border: 0 !important;
   background: transparent !important;
   box-shadow: none !important;
@@ -1718,26 +2084,13 @@ html:not(.dark) .chat-scroll {
   min-height: 1.5rem;
 }
 
-.markdown-content [data-markdown="code-block-actions"] button svg {
+.markdown-content [data-streamdown="code-block-actions"] button svg {
   width: 0.875rem;
   height: 0.875rem;
 }
 
-@media (hover: hover) and (pointer: fine) {
-  .markdown-content [data-markdown="code-block"] [data-markdown="code-block-actions"] {
-    opacity: 0;
-    pointer-events: none;
-  }
-
-  .markdown-content [data-markdown="code-block"]:hover [data-markdown="code-block-actions"],
-  .markdown-content [data-markdown="code-block"]:focus-within [data-markdown="code-block-actions"] {
-    opacity: 1;
-    pointer-events: auto;
-  }
-}
-
 /* Mermaid block: position context for controls wrapper. */
-[data-markdown="mermaid-block"] {
+[data-streamdown="mermaid-block"] {
   position: relative;
   border-radius: 0.75rem;
   border: 1px solid var(--interactive-border);
@@ -1745,35 +2098,35 @@ html:not(.dark) .chat-scroll {
   padding: 0.5rem;
 }
 
-[data-markdown="mermaid-block"] [data-markdown="mermaid-scroll"] {
+[data-streamdown="mermaid-block"] [data-streamdown="mermaid-scroll"] {
   overflow: auto;
   min-width: 0;
 }
 
 /* Like code-block actions: hidden until hover only where a pointer can
    hover; on touch screens the zoom controls stay visible. */
-[data-markdown="mermaid-block"] [data-markdown="mermaid-toolbar"] {
+[data-streamdown="mermaid-block"] [data-streamdown="mermaid-toolbar"] {
   transition: opacity 0.15s ease;
 }
 
 @media (hover: hover) and (pointer: fine) {
-  [data-markdown="mermaid-block"] [data-markdown="mermaid-toolbar"] {
+  [data-streamdown="mermaid-block"] [data-streamdown="mermaid-toolbar"] {
     opacity: 0;
     pointer-events: none;
   }
 
-  [data-markdown="mermaid-block"]:hover [data-markdown="mermaid-toolbar"],
-  [data-markdown="mermaid-block"]:focus-within [data-markdown="mermaid-toolbar"] {
+  [data-streamdown="mermaid-block"]:hover [data-streamdown="mermaid-toolbar"],
+  [data-streamdown="mermaid-block"]:focus-within [data-streamdown="mermaid-toolbar"] {
     opacity: 1;
     pointer-events: auto;
   }
 }
 
-[data-markdown="mermaid-block"][data-mermaid-render="svg"] [data-markdown="mermaid-scroll"] {
+[data-streamdown="mermaid-block"][data-mermaid-render="svg"] [data-streamdown="mermaid-scroll"] {
   overflow: hidden;
 }
 
-[data-markdown="mermaid-block"] [data-markdown="mermaid-viewport"] {
+[data-streamdown="mermaid-block"] [data-streamdown="mermaid-viewport"] {
   width: 100%;
   min-width: 0;
   height: min(24rem, 70vh);
@@ -1784,17 +2137,17 @@ html:not(.dark) .chat-scroll {
   background: var(--surface-elevated);
 }
 
-[data-markdown="mermaid-block"] [data-markdown="mermaid"] {
+[data-streamdown="mermaid-block"] [data-streamdown="mermaid"] {
   width: 100%;
   height: 100%;
   display: block;
 }
 
-[data-markdown="mermaid-block"][data-mermaid-panning="true"] [data-markdown="mermaid-viewport"] {
+[data-streamdown="mermaid-block"][data-mermaid-panning="true"] [data-streamdown="mermaid-viewport"] {
   cursor: grabbing;
 }
 
-[data-markdown="mermaid-block"] [data-markdown="mermaid-ascii"] {
+[data-streamdown="mermaid-block"] [data-streamdown="mermaid-ascii"] {
   margin: 0;
   white-space: pre;
   width: max-content;
@@ -1804,13 +2157,19 @@ html:not(.dark) .chat-scroll {
   background: transparent;
 }
 
-[data-markdown="mermaid-block"] [data-markdown="mermaid"] svg {
+[data-streamdown="mermaid-block"] [data-streamdown="mermaid"] svg {
   width: 100% !important;
   height: 100% !important;
   min-width: 0;
   max-width: none !important;
   display: block;
   background: var(--surface-elevated);
+}
+
+/* Reserve the viewport while the initial batched fit runs. Visibility keeps
+   SVG bounds measurable, and offline exports do not opt into this gate. */
+[data-oc-mermaid-viewer] > svg:not([data-oc-mermaid-fitted]) {
+  visibility: hidden;
 }
 
 /* Fullscreen Mermaid popup: scale diagrams to fill available viewport panel area. */
@@ -1824,7 +2183,14 @@ html:not(.dark) .chat-scroll {
   width: 100%;
 }
 
-.markdown-mermaid-fullscreen [data-markdown="mermaid-block"] {
+/* Streamdown adds a root between the fullscreen container and the diagram.
+   Carry the definite height through it so percentage viewport heights resolve. */
+.markdown-mermaid-fullscreen [data-oc-streamdown] {
+  height: 100%;
+  min-height: 0;
+}
+
+.markdown-mermaid-fullscreen [data-streamdown="mermaid-block"] {
   width: 100%;
   height: 100%;
   min-height: 100%;
@@ -1834,17 +2200,17 @@ html:not(.dark) .chat-scroll {
   background: var(--surface-elevated);
 }
 
-.markdown-mermaid-fullscreen [data-markdown="mermaid-block"] [data-markdown="mermaid-scroll"] {
+.markdown-mermaid-fullscreen [data-streamdown="mermaid-block"] [data-streamdown="mermaid-scroll"] {
   width: 100%;
   height: 100%;
   overflow: auto;
 }
 
-.markdown-mermaid-fullscreen [data-markdown="mermaid-block"][data-mermaid-render="svg"] [data-markdown="mermaid-scroll"] {
+.markdown-mermaid-fullscreen [data-streamdown="mermaid-block"][data-mermaid-render="svg"] [data-streamdown="mermaid-scroll"] {
   overflow: hidden;
 }
 
-.markdown-mermaid-fullscreen [data-markdown="mermaid-block"] [data-markdown="mermaid-viewport"] {
+.markdown-mermaid-fullscreen [data-streamdown="mermaid-block"] [data-streamdown="mermaid-viewport"] {
   width: 100%;
   height: 100%;
   min-width: 100%;
@@ -1852,13 +2218,13 @@ html:not(.dark) .chat-scroll {
   overflow: hidden;
 }
 
-.markdown-mermaid-fullscreen [data-markdown="mermaid-block"] [data-markdown="mermaid"] {
+.markdown-mermaid-fullscreen [data-streamdown="mermaid-block"] [data-streamdown="mermaid"] {
   width: 100%;
   height: 100%;
   display: block;
 }
 
-.markdown-mermaid-fullscreen [data-markdown="mermaid-block"] [data-markdown="mermaid-ascii"] {
+.markdown-mermaid-fullscreen [data-streamdown="mermaid-block"] [data-streamdown="mermaid-ascii"] {
   margin: 0;
   white-space: pre;
   width: max-content;
@@ -1869,7 +2235,7 @@ html:not(.dark) .chat-scroll {
   background: transparent;
 }
 
-.markdown-mermaid-fullscreen [data-markdown="mermaid-block"] [data-markdown="mermaid"] svg {
+.markdown-mermaid-fullscreen [data-streamdown="mermaid-block"] [data-streamdown="mermaid"] svg {
   width: 100% !important;
   height: 100% !important;
   max-width: none !important;
@@ -1963,115 +2329,22 @@ textarea[data-terminal-hidden-input="true"]::placeholder {
   }
 }
 
-@keyframes oc-busy-pulse {
-  0%, 100% {
-    opacity: 0.2;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-
-.animate-busy-pulse {
-  animation: oc-busy-pulse 1.2s ease-in-out infinite;
+/*
+ * The dim half of a waiting indicator's 1 s bright/dim toggle
+ * (`useWaitingBlink`). No transition: a fade would draw every frame of it.
+ */
+.waiting-dim {
+  opacity: 0.4;
 }
 
 /*
- * The staggered dots of a busy indicator that stays on screen for as long as
- * the agent works. A smooth opacity pulse is composited, yet it still makes
- * the compositor and the GPU process draw sixty frames a second: about ten
- * percent of a core on an otherwise still page. Three steps per half cycle
- * last 200ms each, the same as the stagger between dots, so every dot changes
- * on the same five frames a second, which halves that cost. Keep the stagger
- * a multiple of one step or the dots stop sharing frames.
+ * A surface kept mounted while hidden is inert (a closed side panel at
+ * opacity 0): its CSS animations pause there instead of drawing every frame
+ * nobody sees. Clock-driven indicators pause through `PauseClock`.
  */
-.animate-busy-wave {
-  animation: oc-busy-pulse 1.2s steps(3, jump-none) infinite;
-}
-
-@keyframes oc-status-logo {
-  0%, 100% {
-    opacity: 0.6;
-  }
-  50% {
-    opacity: 1;
-  }
-}
-
-.animate-status-logo {
-  animation: oc-status-logo 4s steps(10, jump-none) infinite;
-}
-
-@keyframes activity-spin {
-  100% {
-    transform: rotate(360deg);
-  }
-}
-
-/* Running-session spinner (opt-in). steps() limits rotation changes to 20 per
-   second. This still adds compositor work while a running indicator is visible.
-   Technique from VS Code's codicon-modifier-spin. */
-.activity-spinner {
-  animation: activity-spin 1.5s steps(30) infinite;
-  transform-box: fill-box;
-  transform-origin: center center;
-}
-
-@keyframes navrail-dot-wave {
-  0%, 100% {
-    transform: scale(0.72);
-    opacity: 0.52;
-  }
-  50% {
-    transform: scale(1);
-    opacity: 1;
-  }
-}
-
-.animate-navrail-dot-wave {
-  animation: navrail-dot-wave 1.2s ease-in-out infinite;
-}
-
-@keyframes border-glow-pulse {
-  0%, 100% {
-    border-color: var(--interactive-border);
-    outline-color: transparent;
-  }
-  12.5% {
-    border-color: color-mix(in srgb, var(--primary) 22%, var(--interactive-border));
-    outline-color: color-mix(in srgb, var(--primary) 8%, transparent);
-  }
-  25% {
-    border-color: color-mix(in srgb, var(--primary) 40%, var(--interactive-border));
-    outline-color: color-mix(in srgb, var(--primary) 16%, transparent);
-  }
-  37.5% {
-    border-color: color-mix(in srgb, var(--primary) 62%, var(--interactive-border));
-    outline-color: color-mix(in srgb, var(--primary) 26%, transparent);
-  }
-  50% {
-    border-color: color-mix(in srgb, var(--primary) 78%, var(--interactive-border));
-    outline-color: color-mix(in srgb, var(--primary) 34%, transparent);
-  }
-  62.5% {
-    border-color: color-mix(in srgb, var(--primary) 62%, var(--interactive-border));
-    outline-color: color-mix(in srgb, var(--primary) 26%, transparent);
-  }
-  75% {
-    border-color: color-mix(in srgb, var(--primary) 40%, var(--interactive-border));
-    outline-color: color-mix(in srgb, var(--primary) 16%, transparent);
-  }
-  87.5% {
-    border-color: color-mix(in srgb, var(--primary) 22%, var(--interactive-border));
-    outline-color: color-mix(in srgb, var(--primary) 8%, transparent);
-  }
-}
-
-.animate-border-glow-pulse {
-  outline: 1px solid transparent;
-  outline-offset: 1px;
-  will-change: border-color, outline-color;
-  animation: border-glow-pulse 3.8s linear infinite;
+[inert],
+[inert] * {
+  animation-play-state: paused !important;
 }
 
 @keyframes marquee-scroll {
@@ -2084,11 +2357,14 @@ textarea[data-terminal-hidden-input="true"]::placeholder {
   100% { transform: translateX(-50%); }
 }
 
+/*
+ * A name too long for the header scrolls past once when the file opens, then
+ * stands still: the track holds the name twice, so it ends where it began.
+ */
 .open-file-name-marquee-track {
   display: inline-flex;
   min-width: max-content;
-  animation: open-file-name-marquee-scroll var(--open-file-name-marquee-duration, 14s) linear infinite;
-  will-change: transform;
+  animation: open-file-name-marquee-scroll var(--open-file-name-marquee-duration, 14s) linear 1;
 }
 
 .open-file-name-marquee-item {
@@ -2101,18 +2377,12 @@ textarea[data-terminal-hidden-input="true"]::placeholder {
   white-space: nowrap;
 }
 
-.marquee-text--auto {
-  animation: marquee-scroll 6s linear infinite alternate;
-  will-change: transform;
-}
-
 .group:hover .marquee-text--active,
 .marquee-text--active:hover {
   animation: marquee-scroll 5s linear infinite alternate;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .marquee-text--auto,
   .open-file-name-marquee-track,
   .group:hover .marquee-text--active,
   .marquee-text--active:hover {
@@ -2137,10 +2407,8 @@ textarea[data-terminal-hidden-input="true"]::placeholder {
     display: none;
   }
 
-  .animate-busy-pulse,
-  .animate-busy-wave,
-  .animate-status-logo {
-    animation: none;
+  .waiting-dim {
+    opacity: 1;
   }
 
 }
@@ -2201,4 +2469,10 @@ html.desktop-runtime .markdown-content [data-openchamber-file-link="true"] {
 .session-tab-title {
   -webkit-mask-image: linear-gradient(to right, black calc(100% - 14px), transparent);
   mask-image: linear-gradient(to right, black calc(100% - 14px), transparent);
+}
+
+/* A right-to-left title (dir="auto") runs out on its left side. */
+.session-tab-title:has([dir="auto"]:dir(rtl)) {
+  -webkit-mask-image: linear-gradient(to left, black calc(100% - 14px), transparent);
+  mask-image: linear-gradient(to left, black calc(100% - 14px), transparent);
 }

@@ -6,6 +6,7 @@
 export interface VSCodeBootstrapConfig {
   workspaceFolder?: string;
   workspaceFolders?: unknown;
+  panelType?: 'chat' | 'settings';
   /** "parallel" on the tab the "Run on several models" command opens. */
   initialComposer?: unknown;
 }

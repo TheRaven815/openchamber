@@ -1,3 +1,5 @@
+import { cancelWhenLayoutSettled, isLayoutAnimating, runWhenLayoutSettled } from '@/lib/layoutAnimation';
+
 type OffsetTurn = {
     id: string;
     top: number;
@@ -11,10 +13,14 @@ type ScrollSpyInput = {
     MutationObserver?: typeof globalThis.MutationObserver;
 };
 
-// Reading line offset below the container top. The active turn is the last
-// one whose top edge sits at or above this line — a monotonic rule that stays
-// stable while scrolling inside a long turn (no visibility-ratio flip-flop).
-const READ_LINE_OFFSET_PX = 100;
+// Where the reading line sits in the viewport, as a share of its height. The
+// active turn is the last one whose top edge sits at or above this line — a
+// monotonic rule that stays stable while scrolling inside a long turn (no
+// visibility-ratio flip-flop). Half the viewport keeps the choice on the turn
+// the reader is actually looking at: the previous turn peeking in at the top
+// no longer holds the reading position once the turn below owns the larger
+// part of the screen. Lower it (0.4) to make a turn current sooner.
+const READ_LINE_VIEWPORT_FACTOR = 0.5;
 
 // The chat treats its bottom spacer as part of the pinned zone. Match that
 // boundary here so the rail reaches the final prompt even when its top never
@@ -76,6 +82,13 @@ export const createScrollSpy = (input: ScrollSpyInput) => {
         if (frame !== undefined) {
             return;
         }
+        // Reading every turn's offset forces a transcript layout; while a side
+        // column animates its width that would be one per frame. The active
+        // turn is read once the width settles.
+        if (isLayoutAnimating()) {
+            runWhenLayoutSettled(schedule);
+            return;
+        }
         frame = raf(() => {
             frame = undefined;
             update();
@@ -111,7 +124,10 @@ export const createScrollSpy = (input: ScrollSpyInput) => {
 
         const next = isInBottomAnchorZone(container)
             ? offsets[offsets.length - 1]?.id
-            : pickOffsetTurnId(offsets, container.scrollTop + READ_LINE_OFFSET_PX);
+            : pickOffsetTurnId(
+                offsets,
+                container.scrollTop + container.clientHeight * READ_LINE_VIEWPORT_FACTOR,
+            );
         if (!next || next === active) {
             return;
         }
@@ -223,6 +239,7 @@ export const createScrollSpy = (input: ScrollSpyInput) => {
             caf(frame);
         }
         frame = undefined;
+        cancelWhenLayoutSettled(schedule);
         clearTimeout(roDebounce);
         roDebounce = undefined;
         clear();

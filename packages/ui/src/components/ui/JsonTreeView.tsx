@@ -1,12 +1,15 @@
 import React from 'react';
+import stripJsonComments from 'strip-json-comments';
 
 import { Button } from '@/components/ui/button';
 import { Icon } from "@/components/icon/Icon";
 import { JsonTreeViewer } from './JsonTreeViewer';
 import { useI18n } from '@/lib/i18n';
+import { cn } from '@/lib/utils';
 
 interface JsonTreeViewProps {
   jsonString: string;
+  format?: 'json' | 'jsonc';
   className?: string;
   maxHeight?: string;
   initiallyExpandedDepth?: number;
@@ -14,6 +17,7 @@ interface JsonTreeViewProps {
 
 const JsonTreeView = React.memo(function JsonTreeView({
   jsonString,
+  format = 'json',
   className,
   maxHeight = '100%',
   initiallyExpandedDepth = 2,
@@ -29,14 +33,17 @@ const JsonTreeView = React.memo(function JsonTreeView({
         setParseError(t('jsonTreeView.error.emptyJson'));
         return null;
       }
-      const parsed = JSON.parse(trimmed);
+      const source = format === 'jsonc'
+        ? stripJsonComments(trimmed, { trailingCommas: true })
+        : trimmed;
+      const parsed = JSON.parse(source);
       setParseError(null);
       return parsed;
     } catch (err) {
       setParseError(err instanceof Error ? err.message : t('jsonTreeView.error.invalidJson'));
       return null;
     }
-  }, [jsonString, t]);
+  }, [jsonString, format, t]);
 
   const handleExpandAll = React.useCallback(() => {
     viewerRef.current?.expandAll();
@@ -62,8 +69,8 @@ const JsonTreeView = React.memo(function JsonTreeView({
   }
 
   return (
-    <div className={className}>
-      <div className="flex items-center gap-1 border-b border-[var(--interactive-border)] px-2 py-1">
+    <div className={cn('flex min-h-0 flex-col', className)}>
+      <div className="flex shrink-0 items-center gap-1 border-b border-[var(--interactive-border)] px-2 py-1">
         <Button
           variant="ghost"
           size="xs"
@@ -84,7 +91,7 @@ const JsonTreeView = React.memo(function JsonTreeView({
         </Button>
       </div>
       <div
-        className="oc-surface-code bg-[var(--syntax-background)] py-1"
+        className="oc-surface-code min-h-0 flex-1 bg-[var(--syntax-background)] py-1"
         style={{ maxHeight, overflow: 'auto' }}
       >
         <JsonTreeViewer

@@ -338,7 +338,10 @@ describe("session cache retention", () => {
     expect(env.messages("s0")).toBeDefined()
   })
 
-  for (const [surface, expected] of [["desktop", 200], ["mobile", 150]] as const) {
+  // One extension sized from the prompt density of the first page, with 20%
+  // headroom, capped by the surface's record ceiling. 13-record turns: desktop
+  // reads 100 + 72 (13 turns), mobile 50 + 150 (15 turns, at its 200 ceiling).
+  for (const [surface, expected, limits] of [["desktop", 172, [100, 72]], ["mobile", 200, [50, 150]]] as const) {
     test(`${surface}: cold navigation expands toward ten turns and publishes once`, async () => {
       const env = setup(surface, (id) => transcript(id, 20, 12))
       const store = env.childStores.ensureChild("/repo", { bootstrap: false })
@@ -347,10 +350,37 @@ describe("session cache retention", () => {
         if (state.message.a !== previous.message.a) publications.push(state.message.a?.length ?? 0)
       }))
       await env.select("a")
+      expect(env.requests.map((request) => request.limit)).toEqual([...limits])
       expect(publications).toEqual([expected])
       expect(env.loader.getSnapshot(env.target("a")).complete).toBe(false)
     })
   }
+
+  for (const surface of ["desktop", "mobile"] as const) {
+    test(`${surface}: a last turn longer than the window is read back to its prompt and published once`, async () => {
+      const env = setup(surface, (id) => transcript(id, 3, 400))
+      const store = env.childStores.ensureChild("/repo", { bootstrap: false })
+      const publications: number[] = []
+      cleanups.push(store.subscribe((state, previous) => {
+        if (state.message.a !== previous.message.a) publications.push(state.message.a?.length ?? 0)
+      }))
+      await env.select("a")
+      expect(publications).toHaveLength(1)
+      expect(env.messages("a")?.some((message) => message.id === "msg_a_2_user")).toBe(true)
+      expect(env.messages("a")?.some((message) => message.id === "msg_a_1_user")).toBe(false)
+      expect(env.loader.getSnapshot(env.target("a")).complete).toBe(false)
+    })
+  }
+
+  test("an evicted session whose last turn outgrew the window reopens with that turn", async () => {
+    const env = setup("desktop", (id) => transcript(id, 3, 400), IDLE_TTL_MS)
+    await env.select("a")
+    await env.select("b")
+    await waitIdle()
+    expect(env.messages("a")).toBeUndefined()
+    await env.select("a")
+    expect(env.messages("a")?.some((message) => message.id === "msg_a_2_user")).toBe(true)
+  })
 
   test("a short session loads completely without expansion past its end", async () => {
     const env = setup("desktop", (id) => transcript(id, 2, 30))
@@ -409,6 +439,17 @@ describe("session cache retention", () => {
     expect(env.requests).toHaveLength(before + 3)
     expect(env.messages("a")).toHaveLength(initial + 300)
     expect(env.loader.getSnapshot(env.target("a")).complete).toBe(false)
+  })
+
+  test("an older turn longer than the alignment bound is read back to its prompt", async () => {
+    const env = setup("desktop", (id) => transcript(id, 4, 500))
+    await env.select("a")
+    expect(env.messages("a")?.some((message) => message.id === "msg_a_2_user")).toBe(false)
+    const initial = env.messages("a")?.length ?? 0
+    await env.loader.loadOlder(env.target("a"))
+    const ids = env.messages("a")?.map((message) => message.id) ?? []
+    expect(ids).toContain("msg_a_2_user")
+    expect(ids.length - initial).toBeLessThan(600)
   })
 
   test("a failed page preserves the previous history and its retry cursor", async () => {

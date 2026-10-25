@@ -22,7 +22,8 @@ import {
 } from './mcpImport';
 import { useMcpStore } from '@/stores/useMcpStore';
 import { McpOAuthSignIn } from './McpOAuthSignIn';
-import { MCP_DRAFT_OAUTH_UNSET, readCarriedOAuth, type McpOAuthCarried } from './mcpDraft';
+import { MCP_DRAFT_OAUTH_UNSET, normalizeMcpServerName, readCarriedOAuth, type McpOAuthCarried } from './mcpDraft';
+import { useIntegrationPolicyBlock } from '@/components/sections/shared/useIntegrationPolicyBlock';
 import { useSettingsDirectory } from '@/hooks/useSettingsDirectory';
 import { cn } from '@/lib/utils';
 import { SettingsPageLayout } from '@/components/sections/shared/SettingsPageLayout';
@@ -41,7 +42,6 @@ import {
   SettingsFieldRow,
   SettingsCheckboxRow,
   SettingsGroupTitle,
-  SETTINGS_SELECT_SIZE,
   SETTINGS_FIELD_LABEL_CLASS,
 } from '@/components/sections/shared/SettingsSection';
 import { SettingsInfoHint } from '@/components/sections/shared/SettingsInfoHint';
@@ -233,7 +233,7 @@ const CommandTextarea: React.FC<CommandTextareaProps> = ({
             <code className="typography-micro text-foreground/80 whitespace-pre">
               {value.map((a, i) => (
                 <span key={i} className="block">
-                  <span className="text-muted-foreground select-none mr-2">[{i}]</span>
+                  <span className="text-muted-foreground select-none me-2">[{i}]</span>
                   {a}
                 </span>
               ))}
@@ -409,7 +409,7 @@ const EnvEditor: React.FC<EnvEditorProps> = ({
                 value={entry.value}
                 onChange={(e) => updateRow(idx, 'value', e.target.value)}
                 placeholder={valuePlaceholder}
-                className="font-mono typography-meta pr-8 w-full"
+                className="font-mono typography-meta pe-8 w-full"
                 autoComplete="new-password"
                 data-bwignore="true"
                 data-1p-ignore="true"
@@ -419,7 +419,7 @@ const EnvEditor: React.FC<EnvEditorProps> = ({
               <button
                 type="button"
                 onClick={() => toggleReveal(idx)}
-                className="absolute right-2 text-muted-foreground/60 hover:text-muted-foreground"
+                className="absolute inset-e-2 text-muted-foreground/60 hover:text-muted-foreground"
                 title={revealedKeys.has(idx) ? hideValueTitle : showValueTitle}
               >
                 {revealedKeys.has(idx)
@@ -476,6 +476,7 @@ const StatusBadge: React.FC<{
     connected: { text: 'text-[var(--status-success)]', bg: 'bg-[var(--status-success)]/10' },
     failed: { text: 'text-[var(--status-error)]', bg: 'bg-[var(--status-error)]/10' },
     needs_auth: { text: 'text-[var(--status-warning)]', bg: 'bg-[var(--status-warning)]/10' },
+    blocked: { text: 'text-[var(--status-warning)]', bg: 'bg-[var(--status-warning)]/10' },
   };
 
   const colors = colorClassMap[status] ?? { text: 'text-muted-foreground', bg: '' };
@@ -509,6 +510,8 @@ const getStatusDescription = (
       return error?.trim() || t('settings.mcp.page.status.description.needsAuth');
     case 'disabled':
       return t('settings.mcp.page.status.description.disabled');
+    case 'blocked':
+      return t('settings.mcp.page.status.description.blockedByPolicy');
     default:
       return t('settings.mcp.page.status.description.default');
   }
@@ -517,18 +520,19 @@ const getStatusDescription = (
 const statusCardClass = (status: string | undefined): string => {
   switch (status) {
     case 'failed':
-      return 'border-[var(--status-error-border)] bg-[var(--status-error-background)]';
+      return 'bg-[var(--status-error-background)]';
     case 'needs_auth':
-      return 'border-[var(--status-warning-border)] bg-[var(--status-warning-background)]';
+    case 'blocked':
+      return 'bg-[var(--status-warning-background)]';
     default:
-      return 'border-[var(--interactive-border)] bg-[var(--surface-elevated)]';
+      return 'oc-tile';
   }
 };
 
 // Only error/warning states get the full card; a healthy server needs no
 // explanation beyond the badge next to its name.
 const shouldShowFullStatusCard = (status: string | undefined): boolean =>
-  status === 'failed' || status === 'needs_auth';
+  status === 'failed' || status === 'needs_auth' || status === 'blocked';
 
 const buildMcpRuntimeActionKey = (name: string | null, directory?: string | null): string => {
   const normalizedDirectory = typeof directory === 'string' && directory.trim()
@@ -569,6 +573,7 @@ export const McpPage: React.FC = () => {
   // Settings browses whichever project its own selector points at; the app
   // stays where it is.
   const currentDirectory = useSettingsDirectory();
+  const isBlocked = useIntegrationPolicyBlock(currentDirectory);
 
   // The page opens on the server grid. A selection made before it mounts (the
   // settings search, the mobile "add server" shortcut) still opens that server;
@@ -968,20 +973,17 @@ export const McpPage: React.FC = () => {
 
     setIsCreating(true);
     try {
+      // A rejected create throws with the server's reason, shown by the catch below.
       const result = await createMcp(buildDraft(name), currentDirectory);
-      if (result.ok) {
-        setMcpDraft(null);
-        setSelectedMcp(name);
-        await refreshStatus({ directory: currentDirectory, silent: true });
-        if (result.reloadFailed) {
-          toast.warning(result.message || t('settings.mcp.page.toast.serverCreatedReloadFailed'), {
-            description: result.warning || t('settings.mcp.page.toast.retryRefreshHint'),
-          });
-        } else {
-          toast.success(result.message || t('settings.mcp.page.toast.serverCreatedReloading'));
-        }
+      setMcpDraft(null);
+      setSelectedMcp(name);
+      await refreshStatus({ directory: currentDirectory, silent: true });
+      if (result.reloadFailed) {
+        toast.warning(result.message || t('settings.mcp.page.toast.serverCreatedReloadFailed'), {
+          description: result.warning || t('settings.mcp.page.toast.retryRefreshHint'),
+        });
       } else {
-        toast.error(t('settings.mcp.page.toast.saveFailed'));
+        toast.success(result.message || t('settings.mcp.page.toast.serverCreatedReloading'));
       }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t('settings.mcp.page.toast.unexpectedError'));
@@ -1127,7 +1129,12 @@ export const McpPage: React.FC = () => {
   const runtimeDiagnostic = selectedMcpName ? mcpDiagnostics[selectedMcpName] : undefined;
   // The runtime's own report wins; the store's diagnostic is the fallback for a
   // server OpenCode never reported on.
-  const effectiveStatusName = runtimeStatus ? readMcpStatusName(runtimeStatus) : runtimeDiagnostic?.status;
+  // A server a policy blocks never reaches OpenCode's list, so any status it
+  // had is stale; `blocked` is this page's own state for it.
+  const blocked = selectedMcpName ? isBlocked(`mcp:${selectedMcpName}`) : false;
+  const effectiveStatusName = blocked
+    ? 'blocked'
+    : runtimeStatus ? readMcpStatusName(runtimeStatus) : runtimeDiagnostic?.status;
   const effectiveStatusError = runtimeStatus ? readMcpStatusError(runtimeStatus) : runtimeDiagnostic?.error;
   const isConnected = readMcpStatusName(runtimeStatus) === 'connected';
 
@@ -1140,6 +1147,8 @@ export const McpPage: React.FC = () => {
         return t('settings.mcp.page.status.label.failed');
       case 'needs_auth':
         return t('settings.mcp.page.status.label.needsAuth');
+      case 'blocked':
+        return t('settings.mcp.grid.status.blockedByPolicy');
       default:
         return status;
     }
@@ -1176,7 +1185,7 @@ export const McpPage: React.FC = () => {
             size="xs"
             className="!font-normal"
             onClick={handleToggleConnect}
-            disabled={isConnecting || !enabled}
+            disabled={isConnecting || !enabled || blocked}
           >
             {isConnecting ? t('settings.mcp.page.actions.working') : isConnected ? t('settings.mcp.page.actions.disconnect') : t('settings.mcp.page.actions.connect')}
           </Button>
@@ -1205,7 +1214,7 @@ export const McpPage: React.FC = () => {
         {/* Runtime Status - Simplified for connected, expanded for errors */}
         {!isNewServer && shouldShowFullStatusCard(effectiveStatusName) && (
           <SettingsSection divider={false}>
-            <div className={cn('rounded-lg border p-3', statusCardClass(effectiveStatusName))}>
+            <div className={cn('rounded-lg p-3', statusCardClass(effectiveStatusName))}>
               <div className="space-y-4">
                 <div className="min-w-0 space-y-1">
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -1235,7 +1244,7 @@ export const McpPage: React.FC = () => {
                       size="xs"
                       className="!font-normal"
                       onClick={() => void handleTestConnection()}
-                      disabled={isTestingConnection || !enabled}
+                      disabled={isTestingConnection || !enabled || blocked}
                     >
                       {isTestingConnection ? t('settings.mcp.page.actions.testing') : t('settings.mcp.page.actions.testConnection')}
                     </Button>
@@ -1278,13 +1287,13 @@ export const McpPage: React.FC = () => {
               >
                   <Input
                     value={draftName}
-                    onChange={(e) => setDraftName(e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, '-'))}
+                    onChange={(e) => setDraftName(normalizeMcpServerName(e.target.value))}
                     placeholder={t('settings.mcp.page.server.namePlaceholder')}
                     className="h-7 w-48 min-w-0 max-w-full shrink font-mono px-2"
                     autoFocus
                   />
                   <Select value={draftScope} onValueChange={(value) => setDraftScope(value as McpScope)}>
-                    <SelectTrigger size={SETTINGS_SELECT_SIZE} className="!h-7 min-w-0 max-w-full gap-1.5 px-2">
+                    <SelectTrigger className="!h-7 min-w-0 max-w-full gap-1.5 px-2">
                       <Icon
                         name={draftScope === 'user' ? 'user-3' : 'folder'}
                         className="h-3.5 w-3.5 shrink-0"
@@ -1331,23 +1340,29 @@ export const McpPage: React.FC = () => {
           settingsItem="mcp.command"
           // The section's content wrapper carries no spacing of its own, so the
           // kind tabs, the field and its hint would otherwise sit flush.
-          contentClassName="space-y-2"
+          contentClassName="space-y-3"
         >
             {/* Pasting a link or a command still flips this for you, but the
                 choice is a control you can see and press. As one sentence with
                 an inline link it was, in practice, undiscoverable. */}
-            <SortableTabsStrip
-              items={connectionKindTabs}
-              activeId={mcpType}
-              onSelect={(id) => {
-                setMcpType(id as 'local' | 'remote');
-                requestSave();
-              }}
-              layoutMode="fit"
-              variant="active-pill"
-              activePillLowercase={false}
-              className="h-10"
-            />
+            {/* Sized by its two labels, like any segmented choice: stretched
+                across the pane each half read as a wide empty bar. */}
+            <div className="flex">
+              <SortableTabsStrip
+                items={connectionKindTabs}
+                activeId={mcpType}
+                onSelect={(id) => {
+                  setMcpType(id as 'local' | 'remote');
+                  requestSave();
+                }}
+                layoutMode="scrollable"
+                intrinsicWidth
+                variant="active-pill"
+                pillSize="form"
+                activePillButtonClassName="px-3"
+                className="h-8 flex-none"
+              />
+            </div>
 
             {mcpType === 'local' ? (
               <CommandTextarea
@@ -1381,7 +1396,7 @@ export const McpPage: React.FC = () => {
                 onOpenChange={setIsAdvancedRemoteOptionsOpen}
               >
                 <CollapsibleTrigger className="flex w-full items-center justify-between py-0.5 group">
-                  <div className="flex items-center gap-1.5 text-left">
+                  <div className="flex items-center gap-1.5 text-start">
                     <span className="typography-ui-label font-normal text-foreground">{t('settings.mcp.page.advanced.configure')}</span>
                     {/* What is actually set, so a collapsed section is never a
                         blank promise. Everything at its default says nothing. */}
@@ -1414,8 +1429,7 @@ export const McpPage: React.FC = () => {
                         }}
                       >
                         <SelectTrigger
-                          size={SETTINGS_SELECT_SIZE}
-                          className="!h-7 w-full max-w-[16rem] px-2"
+                          className="!h-7 w-fit max-w-[16rem] px-2"
                           aria-label={t('settings.mcp.page.advanced.protocol')}
                         >
                           <span className="truncate">{t(MCP_PROTOCOL_LABEL_KEYS[protocol])}</span>
@@ -1507,8 +1521,7 @@ export const McpPage: React.FC = () => {
                         }}
                       >
                         <SelectTrigger
-                          size={SETTINGS_SELECT_SIZE}
-                          className="!h-7 w-full max-w-[16rem] px-2"
+                          className="!h-7 w-fit max-w-[16rem] px-2"
                           aria-label={t('settings.mcp.page.advanced.codemode')}
                         >
                           <span className="truncate">{t(MCP_CODEMODE_LABEL_KEYS[codemode])}</span>
@@ -1528,7 +1541,7 @@ export const McpPage: React.FC = () => {
                       <SettingsGroupTitle as="div" className="mb-2">
                         {t('settings.mcp.page.advanced.requestHeaders')}
                         {headerEntries.length > 0 && (
-                          <span className="ml-1.5 typography-micro text-muted-foreground font-normal">({headerEntries.length})</span>
+                          <span className="ms-1.5 typography-micro text-muted-foreground font-normal">({headerEntries.length})</span>
                         )}
                       </SettingsGroupTitle>
                       <EnvEditor

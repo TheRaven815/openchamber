@@ -28,6 +28,7 @@ import {
   toPublicGuest,
 } from './catalog.js';
 import { runGuestFileOperation } from './files.js';
+import { createGuestFrameGrants } from './frame-grants.js';
 import { injectGuestAssetTokens, parseGuestUrlToken } from './html-tokens.js';
 import { injectGuestDocumentStyles } from './html-styles.js';
 import { installGuest, installGuestFromZipBuffer, parseInstallRequest, uninstallGuest } from './install.js';
@@ -206,6 +207,20 @@ const declaredSettings = (guest) => {
   return new Map(fields.map((field) => [field.id, field]));
 };
 
+/**
+ * One `onGuestDeactivated` listener from several: every listener runs, and
+ * one that fails is logged under its name and never skips the others.
+ * @param {Array<{ name: string, listener: (event: { guestId: string, guestName: string, removed?: boolean }) => unknown }>} listeners
+ */
+export const settleGuestDeactivationListeners = (listeners) => async (event) => {
+  const results = await Promise.allSettled(listeners.map(async ({ listener }) => listener(event)));
+  results.forEach((result, index) => {
+    if (result.status === 'rejected') {
+      console.warn(`Failed to ${listeners[index].name}:`, result.reason?.message ?? result.reason);
+    }
+  });
+};
+
 export const registerGuestRoutes = (app, {
   openchamberDataDir,
   openchamberVersion,
@@ -213,12 +228,34 @@ export const registerGuestRoutes = (app, {
   resolveOptionalProjectDirectory,
   getSmallModelService,
   onGuestDeactivated = async () => false,
+  // After a package may have gained a role: approval, enable, install or
+  // replace, update. The listener reads the catalog itself.
+  onGuestActivated = async () => undefined,
   surfaceViewerHeaders = () => null,
+  // The tracker registry: a host-auth guest borrows its tracker's sign-in.
+  trackers = null,
 }) => {
   const persistPath = extensionsPersistPath(openchamberDataDir);
   const authPath = guestAuthPersistPath(openchamberDataDir);
+  const frameGrants = createGuestFrameGrants();
   const versionOptions = { openchamberVersion };
   const installOptions = () => ({ openchamberVersion, gitBinary: resolveGitBinaryForSpawn() });
+
+  // The change already happened; a listener that fails must not turn it into an error answer.
+  const activated = async (guestId) => {
+    try {
+      await onGuestActivated({ guestId });
+    } catch (error) {
+      console.warn('Failed to apply an extension activation:', error?.message ?? error);
+    }
+  };
+  const deactivated = async (event) => {
+    try {
+      await onGuestDeactivated(event);
+    } catch (error) {
+      console.warn('Failed to apply an extension deactivation:', error?.message ?? error);
+    }
+  };
 
   const loadGuest = async (id) => {
     if (!isGuestPanelId(id)) {
@@ -247,6 +284,7 @@ export const registerGuestRoutes = (app, {
         return res.status(400).json({ error: hasUrl ? 'invalid-url' : 'invalid-path' });
       }
       const result = await installGuest(request, persistPath, installOptions());
+      if (result.ok) await activated(result.guest.id);
       sendInstallResult(res, result);
     } catch (error) {
       console.error('Failed to install guest:', error);
@@ -266,6 +304,7 @@ export const registerGuestRoutes = (app, {
       }
       const replace = req.query?.replace === 'true';
       const result = await installGuestFromZipBuffer(body.buffer, persistPath, { openchamberVersion, replace });
+      if (result.ok) await activated(result.guest.id);
       sendInstallResult(res, result);
     } catch (error) {
       console.error('Failed to install uploaded guest:', error);
@@ -311,6 +350,7 @@ export const registerGuestRoutes = (app, {
         }
         return res.status(400).json(body);
       }
+      await activated(guest.id);
       const next = await loadGuest(guest.id);
       if (!next) {
         return res.status(404).json({ error: 'not-found' });
@@ -338,7 +378,7 @@ export const registerGuestRoutes = (app, {
       await forgetGuestAuth(id, authPath);
       // A role this package stood in for (the agent's browser) goes back to
       // the host's own, and the user is told rather than finding out mid-task.
-      await onGuestDeactivated({ guestId: id, guestName: removed?.name ?? id });
+      await deactivated({ guestId: id, guestName: removed?.name ?? id, removed: true });
       res.status(204).end();
     } catch (error) {
       console.error('Failed to uninstall guest:', error);
@@ -358,7 +398,7 @@ export const registerGuestRoutes = (app, {
       const stored = await takeUsableGuestAuth(guest, authPath);
       const auth = resolveIntegrationAuth(guest.integration ?? {});
       res.json({
-        ...await toGuestAuthResponse(guest.integration, stored),
+        ...await toGuestAuthResponse(guest.integration, stored, trackers),
         redirectUri: auth === 'oauth' && origin ? guestRedirectUri(origin, guest.id) : '',
       });
     } catch (error) {
@@ -408,7 +448,7 @@ export const registerGuestRoutes = (app, {
       }
       await saveGuestAccessToken({ guest, persistPath: authPath, token: parsed.data.token, username: parsed.data.username });
       const stored = await getGuestAuth(guest.id, authPath);
-      res.json(await toGuestAuthResponse(guest.integration, stored));
+      res.json(await toGuestAuthResponse(guest.integration, stored, trackers));
     } catch (error) {
       if (error instanceof GuestOAuthError) {
         const status = 400;
@@ -437,7 +477,7 @@ export const registerGuestRoutes = (app, {
         settings[key] = value.trim().slice(0, 2000);
       }
       const stored = await patchGuestAuth(guest.id, { settings }, authPath);
-      res.json(await toGuestAuthResponse(guest.integration, stored));
+      res.json(await toGuestAuthResponse(guest.integration, stored, trackers));
     } catch (error) {
       console.error('Failed to save guest settings:', error);
       res.status(500).json({ error: 'Failed to save guest settings' });
@@ -452,7 +492,7 @@ export const registerGuestRoutes = (app, {
       }
       const auth = resolveIntegrationAuth(guest.integration);
       if (auth === 'host') {
-        const started = await startHostGuestAuthorization(guest.integration);
+        const started = await startHostGuestAuthorization(guest.integration, trackers);
         if (!started) {
           return res.status(400).json({ error: 'NO_INTEGRATION' });
         }
@@ -507,10 +547,10 @@ export const registerGuestRoutes = (app, {
       if (!guest) {
         return res.status(404).json({ error: 'not-found' });
       }
-      await disconnectHostGuest(guest.integration);
+      await disconnectHostGuest(guest.integration, trackers);
       await disconnectGuestAuth(guest.id, authPath);
       const stored = await getGuestAuth(guest.id, authPath);
-      res.json(await toGuestAuthResponse(guest.integration, stored));
+      res.json(await toGuestAuthResponse(guest.integration, stored, trackers));
     } catch (error) {
       console.error('Failed to disconnect guest oauth:', error);
       res.status(500).json({ error: 'Failed to disconnect guest oauth' });
@@ -542,6 +582,7 @@ export const registerGuestRoutes = (app, {
       }
       const result = await proxyGuestRequest({
         guest,
+        trackers,
         persistPath: authPath,
         method: parsed.data.method,
         path: parsed.data.path,
@@ -551,7 +592,7 @@ export const registerGuestRoutes = (app, {
       res.json(result);
     } catch (error) {
       if (error instanceof GuestOAuthError) {
-        const status = error.code === 'DISCONNECTED' ? 409 : 400;
+        const status = error.code === 'DISCONNECTED' ? 409 : error.code === 'RESPONSE_TOO_LARGE' ? 502 : 400;
         return res.status(status).json({ error: error.code, message: error.message });
       }
       console.error('Failed to proxy guest request:', error);
@@ -585,7 +626,7 @@ export const registerGuestRoutes = (app, {
       res.json(result);
     } catch (error) {
       if (error instanceof GuestServiceError) {
-        const status = error.code === 'SERVICE_FAILED' || error.code === 'REQUEST_FAILED' ? 502 : 400;
+        const status = ['SERVICE_FAILED', 'REQUEST_FAILED', 'RESPONSE_TOO_LARGE'].includes(error.code) ? 502 : 400;
         return res.status(status).json({ error: error.code, message: error.message });
       }
       console.error('Failed to proxy guest service request:', error);
@@ -672,8 +713,10 @@ export const registerGuestRoutes = (app, {
         return res.status(400).json({ error: 'invalid-request' });
       }
       const { directory } = await resolveOptionalProjectDirectory(req);
-      // The host names the composer's provider; the model stays on it.
+      // The host names the composer's provider, which the model stays on, and
+      // its model, used when that provider has no small one.
       const provider = providerHeaderSchema.safeParse(req.get('x-openchamber-provider'));
+      const composerModel = providerHeaderSchema.safeParse(req.get('x-openchamber-model'));
       const { generateSmallModelText } = await getSmallModelService();
       let generated;
       try {
@@ -683,6 +726,7 @@ export const registerGuestRoutes = (app, {
           maxOutputTokens: parsed.data.maxOutputTokens,
           directory: directory || undefined,
           preferredProviderID: provider.success ? provider.data : undefined,
+          preferredModelID: provider.success && composerModel.success ? composerModel.data : undefined,
         });
       } catch (error) {
         const statusCode = Number(error?.statusCode) || 500;
@@ -748,7 +792,9 @@ export const registerGuestRoutes = (app, {
       await setCapabilityGrants(guest.id, persistPath, granted, granted.length > 0 ? scope : null);
       if (granted.length === 0) {
         await stopGuestService(guest.id);
-        await onGuestDeactivated({ guestId: guest.id, guestName: guest.name });
+        await deactivated({ guestId: guest.id, guestName: guest.name });
+      } else {
+        await activated(guest.id);
       }
       // Credentials were stored for one API origin and one pair of OAuth
       // endpoints. When a newer version points the integration somewhere
@@ -778,8 +824,10 @@ export const registerGuestRoutes = (app, {
         return res.status(400).json({ error: 'invalid-request' });
       }
       await setGuestEnabled(guest.id, persistPath, parsed.data.enabled);
-      if (!parsed.data.enabled) {
-        await onGuestDeactivated({ guestId: guest.id, guestName: guest.name });
+      if (parsed.data.enabled) {
+        await activated(guest.id);
+      } else {
+        await deactivated({ guestId: guest.id, guestName: guest.name });
       }
       const next = await loadGuest(guest.id);
       if (!next) {
@@ -823,66 +871,114 @@ export const registerGuestRoutes = (app, {
     }
   });
 
-  app.get('/api/guests/:id/{*filePath}', async (req, res) => {
+  // One extension file, as a frame loads it. `token` is the legacy query
+  // credential copied onto the page's relative URLs; `connectSource` is the
+  // one path the page may fetch from.
+  const sendGuestFile = async (res, guest, rawPath, { token = '', connectSource }) => {
+    let relativePath;
     try {
-      const id = req.params.id;
-      if (!isGuestPanelId(id)) {
-        return res.status(404).end();
+      relativePath = decodeURIComponent(Array.isArray(rawPath) ? rawPath.join('/') : (rawPath || ''));
+    } catch {
+      return res.status(404).end();
+    }
+    const served = await resolveGuestServedFile(guest.packageRoot, relativePath, {
+      hasRuntime: hasGuestFrame(guest),
+    });
+    if (!served) {
+      return res.status(404).end();
+    }
+    const { filePath, contentType } = served;
+    let raw;
+    try {
+      raw = await fs.readFile(filePath);
+    } catch {
+      return res.status(404).end();
+    }
+    const body = contentType.startsWith('text/html')
+      ? injectGuestDocumentStyles(injectGuestAssetTokens(raw.toString('utf8'), token))
+      : raw;
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'no-store');
+    // Guest files are third-party code served from the OpenChamber origin.
+    // The rail embeds them in a sandboxed iframe; `sandbox` makes the
+    // document sandboxed even when opened directly, so a guest page can
+    // never run with the user's session on the app origin. The rest keeps
+    // it off the network (`guestFramePolicy`).
+    // Origins the user approved for this exact list (`effectiveGrants`) open too.
+    const origins = guest.capabilityGrants?.includes('origins') && Array.isArray(guest.origins) ? guest.origins : [];
+    res.setHeader('Content-Security-Policy', `sandbox allow-scripts; ${guestFramePolicy(connectSource, origins)}`);
+    // The sandboxed frame's origin is `null`, and fonts (always) and fetch
+    // are CORS requests: without this its own package fonts and files are
+    // refused. `null`, not `*`: only opaque-origin documents may read them.
+    // The app UI's own origin, already allowed by the server's CORS layer,
+    // keeps its answer: the rail draws a package icon as a CSS mask, which is
+    // a CORS fetch from openchamber-ui:// or the dev origin.
+    if (!res.getHeader('Access-Control-Allow-Origin')) {
+      res.setHeader('Access-Control-Allow-Origin', 'null');
+    }
+    return res.send(body);
+  };
+
+  // A sandboxed document has no origin of its own to say `'self'` with, so
+  // its connections are named by the host the browser used.
+  const connectSourceFor = (req, packagePath) => {
+    const hostHeader = guestHostSchema.safeParse(req.headers.host);
+    return hostHeader.success ? `${hostHeader.data}${packagePath}` : null;
+  };
+
+  // A frame's own credential for `/api/guest-files/` (`frame-grants.js`).
+  // Minted under normal API auth, by the page that mounts the frame.
+  app.post('/api/guests/:id/frame-grant', async (req, res) => {
+    try {
+      const guest = await loadGuest(req.params.id);
+      if (!guest || !hasGuestFrame(guest)) {
+        return res.status(404).json({ error: 'not-found' });
       }
-      const guest = await findInstalledGuest(id, persistPath);
+      res.setHeader('Cache-Control', 'no-store');
+      res.json(frameGrants.mint(guest.id));
+    } catch (error) {
+      console.error('Failed to grant extension frame:', error);
+      res.status(500).json({ error: 'Failed to grant extension frame' });
+    }
+  });
+
+  // The path extension frames load from. The grant in the path is its only
+  // credential (`core-routes.js` lets these reads past API auth), and it
+  // opens nothing but that extension's own package files, so a sign-in
+  // proxy can leave this prefix alone without exposing any API.
+  app.get('/api/guest-files/:grant/{*filePath}', async (req, res) => {
+    try {
+      const guestId = frameGrants.use(req.params.grant);
+      if (!guestId) {
+        return res.status(403).end();
+      }
+      const guest = await loadGuest(guestId);
       if (!guest) {
         return res.status(404).end();
       }
-      const rawPath = req.params.filePath;
-      let relativePath;
-      try {
-        relativePath = decodeURIComponent(Array.isArray(rawPath) ? rawPath.join('/') : (rawPath || ''));
-      } catch {
-        return res.status(404).end();
-      }
-      const served = await resolveGuestServedFile(guest.packageRoot, relativePath, {
-        hasRuntime: hasGuestFrame(guest),
+      return await sendGuestFile(res, guest, req.params.filePath, {
+        connectSource: connectSourceFor(req, `/api/guest-files/${req.params.grant}/`),
       });
-      if (!served) {
+    } catch (error) {
+      console.error('Failed to serve guest asset:', error);
+      res.status(500).end();
+    }
+  });
+
+  // The query-token path frames used before grants. A newer server keeps it
+  // for older clients connecting as a remote host; relay frames read through
+  // it with the runtime's own credential.
+  app.get('/api/guests/:id/{*filePath}', async (req, res) => {
+    try {
+      const guest = await loadGuest(req.params.id);
+      if (!guest) {
         return res.status(404).end();
       }
-      const { filePath, contentType } = served;
-      let raw;
-      try {
-        raw = await fs.readFile(filePath);
-      } catch {
-        return res.status(404).end();
-      }
-      const token = parseGuestUrlToken(req.query.oc_url_token);
-      const body = contentType.startsWith('text/html')
-        ? injectGuestDocumentStyles(injectGuestAssetTokens(raw.toString('utf8'), token))
-        : raw;
-      res.setHeader('Content-Type', contentType);
-      res.setHeader('X-Content-Type-Options', 'nosniff');
-      res.setHeader('Cache-Control', 'no-store');
-      // Guest files are third-party code served from the OpenChamber origin.
-      // The rail embeds them in a sandboxed iframe; `sandbox` makes the
-      // document sandboxed even when opened directly, so a guest page can
-      // never run with the user's session on the app origin. The rest keeps
-      // it off the network (`guestFramePolicy`): its connections may reach
-      // only its own package path, named by the host the browser used, since
-      // a sandboxed document has no origin of its own to say `'self'` with.
-      const hostHeader = guestHostSchema.safeParse(req.headers.host);
-      const host = hostHeader.success ? hostHeader.data : null;
-      const connectSource = host ? `${host}/api/guests/${id}/` : null;
-      // Origins the user approved for this exact list (`effectiveGrants`) open too.
-      const origins = guest.capabilityGrants?.includes('origins') && Array.isArray(guest.origins) ? guest.origins : [];
-      res.setHeader('Content-Security-Policy', `sandbox allow-scripts; ${guestFramePolicy(connectSource, origins)}`);
-      // The sandboxed frame's origin is `null`, and fonts (always) and fetch
-      // are CORS requests: without this its own package fonts and files are
-      // refused. `null`, not `*`: only opaque-origin documents may read them.
-      // The app UI's own origin, already allowed by the server's CORS layer,
-      // keeps its answer: the rail draws a package icon as a CSS mask, which is
-      // a CORS fetch from openchamber-ui:// or the dev origin.
-      if (!res.getHeader('Access-Control-Allow-Origin')) {
-        res.setHeader('Access-Control-Allow-Origin', 'null');
-      }
-      res.send(body);
+      return await sendGuestFile(res, guest, req.params.filePath, {
+        token: parseGuestUrlToken(req.query.oc_url_token),
+        connectSource: connectSourceFor(req, `/api/guests/${guest.id}/`),
+      });
     } catch (error) {
       console.error('Failed to serve guest asset:', error);
       res.status(500).json({ error: 'Failed to serve guest asset' });

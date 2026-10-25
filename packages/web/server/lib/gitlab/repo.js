@@ -8,6 +8,8 @@ function normalizeProjectPath(value) {
   return segments.join('/');
 }
 
+const matchScpRemote = (value) => value.includes('://') ? null : value.match(/^(?:[^@\s]+@)?([^:/\s]+):(?!\/)(.+)$/);
+
 export function parseGitLabRemoteUrl(raw, instance) {
   if (typeof raw !== 'string' || !raw.trim()) return null;
   const origin = normalizeGitLabInstance(instance);
@@ -16,7 +18,7 @@ export function parseGitLabRemoteUrl(raw, instance) {
   const expectedHostname = originUrl.hostname.toLowerCase();
   const value = raw.trim();
 
-  const scpMatch = value.includes('://') ? null : value.match(/^(?:[^@\s]+@)?([^:/\s]+):(?!\/)(.+)$/);
+  const scpMatch = matchScpRemote(value);
   if (scpMatch) {
     if (scpMatch[1].toLowerCase() !== expectedHostname) return null;
     const projectPath = normalizeProjectPath(scpMatch[2]);
@@ -39,6 +41,25 @@ export function parseGitLabRemoteUrl(raw, instance) {
   if (url.search || url.hash) return null;
   const projectPath = normalizeProjectPath(url.pathname);
   return projectPath ? { projectPath, url: `${origin}/${projectPath}` } : null;
+}
+
+/**
+ * Project path of an SSH clone URL on any host: GitLab sets its SSH host apart from the web address (`gitlab_ssh_host`).
+ * @param {string} raw
+ */
+export function parseGitLabSshProjectPath(raw) {
+  const value = raw.trim();
+  if (!value) return null;
+  const scpMatch = matchScpRemote(value);
+  if (scpMatch) return normalizeProjectPath(scpMatch[2]);
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (!['ssh:', 'git+ssh:'].includes(url.protocol) || !url.hostname || url.search || url.hash) return null;
+  return normalizeProjectPath(url.pathname);
 }
 
 function trackingRemoteName(tracking) {

@@ -61,7 +61,7 @@ export const WorkStatusUsageSection: React.FC = () => {
   // so this is safe to run on every connection change.
   React.useEffect(() => {
     if (!isInitialized) return;
-    void runBackgroundNetworkTask(() => ensureQuotasLoadedForRuntime());
+    void runBackgroundNetworkTask(() => ensureQuotasLoadedForRuntime(), 'active-session');
   }, [ensureQuotasLoadedForRuntime, isInitialized]);
 
   React.useEffect(() => {
@@ -121,11 +121,18 @@ export const WorkStatusUsageSection: React.FC = () => {
       {groups.map((group) => (
         <React.Fragment key={group.providerId}>
           <WorkStatusRow
-            leading={<ProviderLogo providerId={group.providerId} className="size-4 shrink-0" />}
-            label={<span className="font-semibold text-foreground">{group.providerName}</span>}
-            value={group.status && group.rows.length === 0 ? (
-              <WorkStatusValue tone="muted">{group.status}</WorkStatusValue>
-            ) : undefined}
+            leading={<ProviderLogo providerId={group.providerId} className="size-3.5 shrink-0" />}
+            // A row value never shrinks, so a long status such as an error with
+            // its fix sits in the label instead, at the end of the row. The status
+            // keeps its width and the name gives way, down to a stub; past that
+            // the status truncates, with the full text on hover.
+            label={group.status && group.rows.length === 0 ? (
+              <span className="flex min-w-0 items-center gap-2">
+                <span className="min-w-0 truncate font-semibold text-foreground">{group.providerName}</span>
+                <span dir="auto" className="ms-auto max-w-[calc(100%-2rem)] shrink-0 truncate">{group.status}</span>
+              </span>
+            ) : <span className="font-semibold text-foreground">{group.providerName}</span>}
+            tooltip={group.status && group.rows.length === 0 ? group.status : undefined}
           />
           {group.rows.map((row) => {
             const displayPercent = displayMode === 'remaining'
@@ -146,7 +153,7 @@ export const WorkStatusUsageSection: React.FC = () => {
                       {row.subtitle ? `${row.subtitle} · ${row.label}` : row.label}
                     </span>
                     {resetLabel ? (
-                      <span className="shrink-0 text-[11px] text-muted-foreground">{resetLabel}</span>
+                      <span className="shrink-0 text-[0.6875rem] text-muted-foreground">{resetLabel}</span>
                     ) : null}
                   </span>
                 )}

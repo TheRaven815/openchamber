@@ -1,7 +1,7 @@
-// The idle stop of a space (DESIGN.md, decision 11): the server inside a space stops itself after
+// The idle stop of a space (decision 11): the server inside a space stops itself after
 // the hours of the user's setting with no session working, and the container stops with it,
 // because the server is what the container runs. The timer lives inside, so it works while
-// OpenChamber is closed ("Dispatcher, sessions, events", last line). Files stay in the volumes.
+// OpenChamber is closed (journey step 3). Files stay in the volumes.
 //
 // The host writes the setting into a file in the space's HOME at every start and whenever the user
 // changes it; the server inside reads that file at every check. The agent can change the file, or
@@ -11,9 +11,9 @@
 // This module runs on both sides: the host parses the setting with the schema, and the server
 // inside a space runs the timer, only when the space's environment names the file.
 
-import fs from 'node:fs';
-
 import { z } from 'zod';
+
+import { readSpaceSettingFile } from './space-setting-file.js';
 
 const IDLE_STOP_MIN_HOURS = 1;
 const IDLE_STOP_MAX_HOURS = 168;
@@ -32,15 +32,12 @@ export const readIdleStopSetting = (value) => {
 
 const HOUR_MS = 60 * 60 * 1000;
 const CHECK_INTERVAL_MS = 60 * 1000;
-// The real file is about 30 bytes. The agent owns it and can make it anything, a FIFO among them,
-// which a plain read would wait on forever, with the server's event loop stuck behind it.
-const MAX_SETTING_BYTES = 1024;
 const WORKING = new Set(['busy', 'retry']);
 
 /**
  * `settingsPath` is the file the host writes, `readSessionStates()` the server's own live status
- * by session, `{ [id]: { status, lastUpdateAt } }`, `readPendingRequests()` the permission asks
- * and forms still waiting for an answer by session, and `stopSpace()` ends the server. A session
+ * by session, `{ [id]: { status, lastUpdateAt } }`, `readPendingRequests()` the permission asks,
+ * forms and agent pages still waiting for an answer by session, and `stopSpace()` ends the server. A session
  * that is working counts as activity now, and every status change counts at the time it came, so
  * a turn that began and ended between two checks is not missed. A session that waits for the
  * user's answer stays busy in OpenCode's status the whole time; it counts as idle (the
@@ -51,21 +48,13 @@ export function createIdleStop({ settingsPath, readSessionStates, readPendingReq
   let lastActive = now();
   let stopping = false;
 
-  const readSetting = async () => {
-    try {
-      const stat = await fs.promises.lstat(settingsPath);
-      if (!stat.isFile() || stat.size > MAX_SETTING_BYTES) return null;
-      const parsed = idleStopSchema.safeParse(JSON.parse(await fs.promises.readFile(settingsPath, 'utf8')));
-      return parsed.success ? parsed.data : null;
-    } catch {
-      return null;
-    }
-  };
-
   const noteActivity = () => {
     const current = now();
     const pending = readPendingRequests();
-    const waiting = (sessionId) => (pending[sessionId]?.permissions?.length ?? 0) + (pending[sessionId]?.forms?.length ?? 0) > 0;
+    // A page an agent shows that waits for the user's answer is a form here too.
+    const waiting = (sessionId) => (pending[sessionId]?.permissions?.length ?? 0)
+      + (pending[sessionId]?.forms?.length ?? 0)
+      + (pending[sessionId]?.pages?.length ?? 0) > 0;
     for (const [sessionId, state] of Object.entries(readSessionStates())) {
       if (WORKING.has(state.status) && !waiting(sessionId)) lastActive = current;
       else if (state.lastUpdateAt > lastActive) lastActive = Math.min(state.lastUpdateAt, current);
@@ -76,7 +65,7 @@ export function createIdleStop({ settingsPath, readSessionStates, readPendingReq
   const check = async () => {
     if (stopping) return false;
     noteActivity();
-    const setting = await readSetting();
+    const setting = await readSpaceSettingFile(settingsPath, idleStopSchema);
     if (!setting?.enabled || now() - lastActive < setting.hours * HOUR_MS) return false;
     stopping = true;
     logger.log?.(`[spaces] no session worked for ${setting.hours} hours; the space stops itself`);

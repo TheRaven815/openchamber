@@ -44,8 +44,8 @@ describe('guest action execution', () => {
   });
 
   test('catalog round-trip retains the execution mode', () => {
-    expect(parseGuestCatalogJson(JSON.stringify({ guests: [entry.guest] }))?.[0]?.actions).toEqual([entry.action]);
-    expect(parseGuestCatalogJson(JSON.stringify({ guests: [{ ...entry.guest, actions: [{ ...entry.action, mode: 'invalid' }] }] }))).toBeNull();
+    expect(parseGuestCatalogJson(JSON.stringify({ guests: [entry.guest] }))?.guests[0]?.actions).toEqual([entry.action]);
+    expect(parseGuestCatalogJson(JSON.stringify({ guests: [{ ...entry.guest, actions: [{ ...entry.action, mode: 'invalid' }] }] }))?.unreadable).toHaveLength(1);
   });
 
   test('background actions deliver the captured item once and preserve visible surfaces', async () => {
@@ -63,6 +63,25 @@ describe('guest action execution', () => {
     expect(request.isActive()).toBe(false);
     expect(useGuestActionHostStore.getState().requests).toEqual([]);
     expect(errors.mock.calls.length).toBe(0);
+  });
+
+  test('background actions complete with v4 IDs without crypto.randomUUID', async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis.crypto, 'randomUUID');
+    Object.defineProperty(globalThis.crypto, 'randomUUID', { configurable: true, value: undefined });
+    try {
+      const pending = runGuestAction(entry, item, t);
+      const request = currentRequest();
+      expect(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(request.id)).toBe(true);
+      expect(request.takeMessage()).toMatchObject({ type: 'action', payload: item });
+      expect(request.takeMessage()).toBeNull();
+      request.complete({ ok: true });
+      await pending;
+      expect(useGuestActionHostStore.getState().requests).toEqual([]);
+      expect(errors.mock.calls.length).toBe(0);
+    } finally {
+      if (descriptor) Object.defineProperty(globalThis.crypto, 'randomUUID', descriptor);
+      else Reflect.deleteProperty(globalThis.crypto, 'randomUUID');
+    }
   });
 
   test('overlapping clicks keep separate items and completion lifetimes', async () => {
@@ -110,8 +129,8 @@ describe('guest action execution', () => {
       { ...entry.guest, actions: [{ ...entry.action, roles: ['user'] as const }] },
     ]) {
       const parsed = parseGuestCatalogJson(JSON.stringify({ guests: [guest] }));
-      if (!parsed) throw new Error('Invalid fixture');
-      useGuestsStore.getState().replaceCatalog(parsed, getRuntimeKey());
+      if (!parsed || parsed.unreadable.length > 0) throw new Error('Invalid fixture');
+      useGuestsStore.getState().replaceCatalog(parsed.guests, getRuntimeKey());
       await runGuestAction(entry, item, t);
       expect(useGuestActionHostStore.getState().requests).toEqual([]);
     }

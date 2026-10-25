@@ -4,16 +4,19 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Checkbox } from '@/components/ui/checkbox';
 import { toast } from '@/components/ui';
 import { Icon } from "@/components/icon/Icon";
+import { Spinner } from "@/components/ui/spinner";
 import type { IconName } from "@/components/icon/icons";
 import { useUIStore } from '@/stores/useUIStore';
 import { formatTimeForPreference } from '@/lib/timeFormat';
 import type { TimeFormatPreference } from '@/stores/useUIStore';
 import { useProjectsStore } from '@/stores/useProjectsStore';
+import { useProjectsInSidebarOrder } from '@/components/session/sidebar/list/useProjectsInSidebarOrder';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
-import { refreshGlobalSessions } from '@/stores/useGlobalSessionsStore';
+import { refreshGlobalSessions, useGlobalSessionsStore } from '@/stores/useGlobalSessionsStore';
 import { subscribeOpenchamberEvents } from '@/lib/openchamberEvents';
-import { PROJECT_COLOR_MAP, PROJECT_ICON_MAP, ProjectIconImage } from '@/lib/projectMeta';
+import { openSessionFromRoute } from '@/lib/router/openSessionFromRoute';
+import { PROJECT_ICON_MAP, resolveProjectColor, ProjectIconImage } from '@/lib/projectMeta';
 import { useThemeSystem } from '@/contexts/useThemeSystem';
 import { cn, formatDirectoryName } from '@/lib/utils';
 import { useI18n } from '@/lib/i18n';
@@ -23,6 +26,7 @@ import {
   deleteScheduledTaskLoopFile,
   fetchScheduledTasks,
   runScheduledTaskNow,
+  ScheduledTaskBusyError,
   setLoopScheduledTaskEnabled,
   upsertScheduledTask,
   type ScheduledTask,
@@ -30,9 +34,15 @@ import {
 } from '@/lib/scheduledTasksApi';
 import { ScheduledTaskEditorDialog } from './ScheduledTaskEditorDialog';
 import { canonicalizeTimezone } from '@/lib/timezones';
+import { getModelDisplayName } from '@/lib/modelDisplay';
+import { agentLabel } from '@/lib/agentLabel';
+import { useAgentColors } from '@/hooks/useAgentColors';
+import { ProviderLogo } from '@/components/ui/ProviderLogo';
+import { useConfigStore } from '@/stores/useConfigStore';
 import { useFilesViewTabsStore } from '@/stores/useFilesViewTabsStore';
 import { CHAT_DRAFT_PROJECT_ID } from '@/lib/chatDirectories';
 import { isVSCodeRuntime } from '@/lib/desktop';
+import { createTaskRequestGate, mayCommitTaskList, mayEndTaskLoad } from './scheduledTasksRequests';
 
 const scheduleTimes = (task: ScheduledTask): string[] => {
   const raw = Array.isArray(task.schedule.times)
@@ -40,6 +50,41 @@ const scheduleTimes = (task: ScheduledTask): string[] => {
     : (task.schedule.time ? [task.schedule.time] : []);
   const valid = raw.filter((value) => typeof value === 'string' && /^([01]\d|2[0-3]):([0-5]\d)$/.test(value));
   return Array.from(new Set(valid)).sort((a, b) => a.localeCompare(b));
+};
+
+/**
+ * What a task runs with, drawn the way the composer shows it: the provider's
+ * logo before the model name, then the variant, then the agent with the
+ * composer's agent icon in that agent's colour. Tasks that follow the session
+ * defaults say so instead.
+ */
+const TaskModelLine: React.FC<{ task: ScheduledTask }> = ({ task }) => {
+  const { t } = useI18n();
+  const getAgentColor = useAgentColors();
+  const agents = useConfigStore((state) => state.agents);
+  const { providerID, modelID, variant, agent, useDefaults } = task.execution;
+  if (useDefaults || !providerID || !modelID) {
+    return <span className="truncate">{t('sessions.scheduledTasks.dialog.usesDefaults')}</span>;
+  }
+  const agentName = agent?.trim();
+  const knownAgent = agentName ? agents.find((entry) => entry.name === agentName) : undefined;
+  return (
+    <>
+      <ProviderLogo providerId={providerID} alt={providerID} className="h-3 w-3 shrink-0" />
+      <span className="min-w-0 truncate">
+        {[getModelDisplayName(null, modelID), variant?.trim()].filter(Boolean).join(' · ')}
+      </span>
+      {agentName ? (
+        <>
+          <span aria-hidden="true">·</span>
+          <Icon name="ai-agent" className="h-3 w-3 shrink-0" style={{ color: getAgentColor(agentName).color }} />
+          <span className="shrink-0 truncate" style={{ color: getAgentColor(agentName).color }}>
+            {agentLabel(knownAgent ?? { name: agentName, displayName: '' })}
+          </span>
+        </>
+      ) : null}
+    </>
+  );
 };
 
 const formatSchedule = (task: ScheduledTask, t: ReturnType<typeof useI18n>['t']): string => {
@@ -145,18 +190,37 @@ const formatRelativeTime = (value: number | undefined, t: ReturnType<typeof useI
 
 type StatusTone = 'success' | 'error' | 'warning' | 'muted';
 
-const STATUS_META: Record<
-  ScheduledTaskStatus,
-  {
-    tone: StatusTone;
-    Icon: IconName;
-    spin?: boolean;
-  }
-> = {
+type TaskStatusMeta = { tone: StatusTone; Icon: IconName; spin?: boolean };
+const STATUS_META = {
   success: { tone: 'success', Icon: 'checkbox-circle' },
   error: { tone: 'error', Icon: 'error-warning' },
   running: { tone: 'warning', Icon: 'loader-4', spin: true },
   idle: { tone: 'muted', Icon: 'pulse' },
+  queued: { tone: 'warning', Icon: 'pulse' },
+  sent: { tone: 'success', Icon: 'checkbox-circle' },
+  skipped: { tone: 'muted', Icon: 'pulse' },
+  failed: { tone: 'error', Icon: 'error-warning' },
+  cancelled: { tone: 'muted', Icon: 'pulse' },
+} satisfies Record<ScheduledTaskStatus, TaskStatusMeta>;
+
+const TaskTargetLine: React.FC<{ sessionId: string }> = ({ sessionId }) => {
+  const { t } = useI18n();
+  const session = useGlobalSessionsStore((state) => state.entityById.get(sessionId));
+  return <p className="truncate typography-meta text-muted-foreground">{t('sessions.scheduledTasks.editor.targetSession')}: {session?.title || sessionId}</p>;
+};
+
+// Next to "Paused" on a repository loop that waits for the user: the icon
+// says why, the sentence is its title. A loop the user paused has none.
+const LoopApprovalMark: React.FC<{ reason: NonNullable<ScheduledTask['loopApproval']> }> = ({ reason }) => {
+  const { t } = useI18n();
+  const label = reason === 'outdated'
+    ? t('sessions.scheduledTasks.dialog.loopFile.changedSinceEnabled')
+    : t('sessions.scheduledTasks.dialog.loopFile.enableOnThisComputer');
+  return (
+    <span role="img" aria-label={label} title={label} className="inline-flex text-muted-foreground/70">
+      <Icon name={reason === 'outdated' ? 'file-edit' : 'git-branch'} className="h-3.5 w-3.5" />
+    </span>
+  );
 };
 
 const toneStyle = (tone: StatusTone): React.CSSProperties => {
@@ -185,12 +249,24 @@ export function ScheduledTasksView({ layout, onLeave }: {
 }) {
   const { t } = useI18n();
   const timeFormatPreference = useUIStore((state) => state.timeFormatPreference);
-  const projects = useProjectsStore((state) => state.projects);
+  const storedProjects = useProjectsStore((state) => state.projects);
+  const projects = useProjectsInSidebarOrder(storedProjects);
   const activeProject = useProjectsStore((state) => state.getActiveProject());
   const homeDirectory = useDirectoryStore((state) => state.homeDirectory);
   const { currentTheme } = useThemeSystem();
 
   const [selectedProjectID, setSelectedProjectID] = React.useState<string>('');
+  // Ownership of the task flow lives in refs, decided in one place:
+  // - `selectedProjectRef` mirrors the selection the moment it changes, so an
+  //   async continuation can compare against it without waiting for a render;
+  // - `listOwnerRef` is the project whose tasks the visible list holds — task
+  //   actions name it instead of re-deriving the project from the selection;
+  // - `taskRequestGate` numbers fetches per project, so a slow older response
+  //   cannot overwrite a newer one (`scheduledTasksRequests.ts`).
+  const selectedProjectRef = React.useRef<string>('');
+  const listOwnerRef = React.useRef<string>('');
+  const [taskRequestGate] = React.useState(createTaskRequestGate);
+  const editorOwnerRef = React.useRef<string>('');
   const [tasks, setTasks] = React.useState<ScheduledTask[]>([]);
   // Start in loading state so the first frame after open shows the spinner,
   // not an empty/select-project flash before the fetch effect runs.
@@ -210,7 +286,7 @@ export function ScheduledTasksView({ layout, onLeave }: {
   const renderProjectLabel = React.useCallback((project: ProjectEntry) => {
     const displayLabel = project.label?.trim() || formatDirectoryName(project.path, homeDirectory || undefined);
     const projectIconName = project.icon ? PROJECT_ICON_MAP[project.icon] : null;
-    const iconColor = project.color ? PROJECT_COLOR_MAP[project.color] : undefined;
+    const iconColor = resolveProjectColor(project.color) ?? undefined;
     const fallbackIcon = projectIconName ? (
       <Icon name={projectIconName} className="h-3.5 w-3.5 shrink-0" style={iconColor ? { color: iconColor } : undefined} />
     ) : (
@@ -240,16 +316,42 @@ export function ScheduledTasksView({ layout, onLeave }: {
     );
   }, [homeDirectory, currentTheme.metadata.variant, currentTheme.colors.surface.foreground]);
 
-  const reloadTasks = React.useCallback(async (projectID: string, options?: { silent?: boolean }) => {
-    if (!projectID) {
-      setTasks([]);
+  // Every selection change routes through here once, so the mirror ref and
+  // the state can never disagree about which scope is on screen.
+  const selectProjectScope = React.useCallback((nextProjectID: string) => {
+    selectedProjectRef.current = nextProjectID;
+    setSelectedProjectID(nextProjectID);
+  }, []);
+
+  // The only writer of the task list. It refuses a list that does not belong
+  // to the scope on screen: a project change is the selection's to answer,
+  // and a slow fetch for an earlier project has no say over this view.
+  const commitTaskList = React.useCallback((projectID: string, nextTasks: ScheduledTask[]) => {
+    if (!mayCommitTaskList(projectID, selectedProjectRef.current)) {
       return;
     }
+    listOwnerRef.current = projectID;
+    setTasks(nextTasks);
+  }, []);
+
+  const reloadTasks = React.useCallback(async (projectID: string, options?: { silent?: boolean }) => {
+    // A newer request for the same project supersedes an older one; a
+    // request for another project is answered by the selection, since
+    // commitTaskList refuses anything that is not on screen.
+    if (!projectID) {
+      commitTaskList('', []);
+      setLoading(false);
+      return;
+    }
+    const request = taskRequestGate.begin(projectID);
     if (!options?.silent) {
       setLoading(true);
     }
     try {
       const nextTasks = await fetchScheduledTasks(projectID);
+      if (!taskRequestGate.isLatest(projectID, request)) {
+        return; // A newer fetch for this project owns the list; drop this one.
+      }
       nextTasks.sort((a, b) => {
         if (a.enabled !== b.enabled) {
           return a.enabled ? -1 : 1;
@@ -260,29 +362,36 @@ export function ScheduledTasksView({ layout, onLeave }: {
         }
         return (a.state?.nextRunAt || Number.MAX_SAFE_INTEGER) - (b.state?.nextRunAt || Number.MAX_SAFE_INTEGER);
       });
-      setTasks(nextTasks);
+      commitTaskList(projectID, nextTasks);
     } catch (error) {
+      if (!taskRequestGate.isLatest(projectID, request)) {
+        return;
+      }
       toast.error(error instanceof Error ? error.message : t('sessions.scheduledTasks.dialog.toast.loadFailed'));
       if (!options?.silent) {
-        setTasks([]);
+        commitTaskList(projectID, []);
       }
     } finally {
-      if (!options?.silent) {
+      // The latest load for the scope on screen decides the spinner, silent
+      // or not. A response for another scope is refused by commitTaskList
+      // and must not clear the new selection's pending load either.
+      if (mayEndTaskLoad(taskRequestGate, projectID, request, selectedProjectRef.current)) {
         setLoading(false);
       }
     }
-  }, [t]);
+  }, [commitTaskList, taskRequestGate, t]);
 
+  // Keyed on the stored list: a "Recent" reorder must not reset the chosen scope.
   React.useEffect(() => {
-    const preferredProjectID = activeProject?.id || projects[0]?.id || (chatsAvailable ? CHAT_DRAFT_PROJECT_ID : '');
-    setSelectedProjectID(preferredProjectID);
+    const preferredProjectID = activeProject?.id || storedProjects[0]?.id || (chatsAvailable ? CHAT_DRAFT_PROJECT_ID : '');
+    selectProjectScope(preferredProjectID);
     if (preferredProjectID) {
       void reloadTasks(preferredProjectID);
     } else {
-      setTasks([]);
+      commitTaskList('', []);
       setLoading(false);
     }
-  }, [activeProject, projects, chatsAvailable, reloadTasks]);
+  }, [activeProject, storedProjects, chatsAvailable, reloadTasks, selectProjectScope, commitTaskList]);
 
   React.useEffect(() => {
     let timeoutID: ReturnType<typeof setTimeout> | null = null;
@@ -309,37 +418,53 @@ export function ScheduledTasksView({ layout, onLeave }: {
   }, [selectedProjectID, reloadTasks]);
 
   const handleSaveTask = React.useCallback(async (taskDraft: Partial<ScheduledTask>) => {
-    if (!selectedProjectID) {
+    // An existing task belongs to the scope whose list displayed it; a draft
+    // without an id is created in the selected scope. Acting on the owner
+    // keeps a scope switch made while the editor was open from misfiling a
+    // task into the other project.
+    const projectID = (taskDraft.id ? editorOwnerRef.current : '') || selectedProjectID;
+    if (!projectID) {
       throw new Error(t('sessions.scheduledTasks.dialog.error.chooseProjectFirst'));
     }
-    await upsertScheduledTask(selectedProjectID, taskDraft);
-    await reloadTasks(selectedProjectID);
+    await upsertScheduledTask(projectID, taskDraft);
+    // Refresh what is on screen: normally the scope that was just saved; if
+    // the user switched while the editor was open, the newer scope's list is
+    // what the view belongs to and it must stay consistent.
+    if (selectedProjectID) {
+      await reloadTasks(selectedProjectID);
+    }
     toast.success(t('sessions.scheduledTasks.dialog.toast.saved'));
   }, [selectedProjectID, reloadTasks, t]);
 
   const handleToggleEnabled = React.useCallback(async (task: ScheduledTask, enabled: boolean) => {
-    if (!selectedProjectID) {
+    // The row's own project decides where the mutation lands: a task shown
+    // under a scope belongs to that scope, even if the user has already
+    // switched and the selection now names another project.
+    const projectID = listOwnerRef.current;
+    if (!projectID) {
       return;
     }
     setMutatingTaskID(task.id);
-    setTasks((prev) => prev.map((item) => (item.id === task.id ? { ...item, enabled } : item)));
+    // The reload brings the reason back if the server keeps the loop paused.
+    setTasks((prev) => prev.map((item) => (item.id === task.id ? { ...item, enabled, loopApproval: undefined } : item)));
     try {
       if (task.loopFile) {
-        await setLoopScheduledTaskEnabled(selectedProjectID, task.id, enabled);
+        await setLoopScheduledTaskEnabled(projectID, task.id, enabled);
       } else {
-        await upsertScheduledTask(selectedProjectID, { ...task, enabled });
+        await upsertScheduledTask(projectID, { ...task, enabled });
       }
-      await reloadTasks(selectedProjectID, { silent: true });
+      await reloadTasks(projectID, { silent: true });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : t('sessions.scheduledTasks.dialog.toast.updateFailed'));
-      await reloadTasks(selectedProjectID, { silent: true });
+      await reloadTasks(projectID, { silent: true });
     } finally {
       setMutatingTaskID(null);
     }
-  }, [selectedProjectID, reloadTasks, t]);
+  }, [reloadTasks, t]);
 
   const handleDeleteTask = React.useCallback(async (task: ScheduledTask) => {
-    if (!selectedProjectID) {
+    const projectID = listOwnerRef.current;
+    if (!projectID) {
       return;
     }
     const confirmed = window.confirm(task.loopFile
@@ -352,42 +477,65 @@ export function ScheduledTasksView({ layout, onLeave }: {
     setMutatingTaskID(task.id);
     try {
       if (task.loopFile) {
-        await deleteScheduledTaskLoopFile(selectedProjectID, task.id);
+        await deleteScheduledTaskLoopFile(projectID, task.id);
       } else {
-        await deleteScheduledTask(selectedProjectID, task.id);
+        await deleteScheduledTask(projectID, task.id);
       }
-      await reloadTasks(selectedProjectID, { silent: true });
+      await reloadTasks(projectID, { silent: true });
       toast.success(t('sessions.scheduledTasks.dialog.toast.deleted'));
     } catch (error) {
       toast.error(error instanceof Error ? error.message : t('sessions.scheduledTasks.dialog.toast.deleteFailed'));
     } finally {
       setMutatingTaskID(null);
     }
-  }, [selectedProjectID, reloadTasks, t]);
+  }, [reloadTasks, t]);
 
   const handleEditTask = React.useCallback((task: ScheduledTask) => {
     if (!task.loopFile) {
       setEditorTask(task);
+      // The editor saves into the task's own project, captured now, later
+      // switches of the selected scope must not redirect the save.
+      editorOwnerRef.current = listOwnerRef.current;
       setEditorOpen(true);
       return;
     }
-    if (!selectedProject?.path) {
+    const ownerProject = projects.find((project) => project.id === listOwnerRef.current);
+    if (!ownerProject?.path) {
       return;
     }
-    useFilesViewTabsStore.getState().setSelectedPath(selectedProject.path, task.loopFile, { allowOutsideRoot: true });
-    useUIStore.getState().openContextFile(selectedProject.path, task.loopFile);
+    useFilesViewTabsStore.getState().setSelectedPath(ownerProject.path, task.loopFile, { allowOutsideRoot: true });
+    useUIStore.getState().openContextFile(ownerProject.path, task.loopFile);
     onLeave('file');
-  }, [selectedProject?.path, onLeave]);
+  }, [projects, onLeave]);
+
+  // The session of the task's latest run; a run records it as soon as it
+  // creates the session, so a running or failed run has one too. The session
+  // owns its directory: one in a linked worktree must not open on the
+  // project root, so the session's own record decides, not the selection.
+  const openLastRunSession = React.useCallback((task: ScheduledTask) => {
+    const sessionId = task.state?.lastSessionId;
+    if (!sessionId) return;
+    void openSessionFromRoute(sessionId);
+    // A run can create its session after the global list last loaded; that
+    // list cannot name the folder until it is fetched again.
+    if (!useGlobalSessionsStore.getState().entityById.has(sessionId)) {
+      void refreshGlobalSessions().then(() => openSessionFromRoute(sessionId));
+    }
+    onLeave('session');
+  }, [onLeave]);
 
   const handleRunNow = React.useCallback(async (task: ScheduledTask) => {
-    if (!selectedProjectID) {
+    // Like every mutation here, the run belongs to the task's own project,
+    // not to whatever the selection has become since the list was rendered.
+    const projectID = listOwnerRef.current;
+    if (!projectID) {
       return;
     }
     setMutatingTaskID(task.id);
     try {
-      const { sessionId, directory, persistError } = await runScheduledTaskNow(selectedProjectID, task.id);
+      const { sessionId, directory, persistError } = await runScheduledTaskNow(projectID, task.id);
       await Promise.all([
-        reloadTasks(selectedProjectID, { silent: true }),
+        reloadTasks(projectID, { silent: true }),
         refreshGlobalSessions(),
       ]);
       if (persistError) {
@@ -397,16 +545,28 @@ export function ScheduledTasksView({ layout, onLeave }: {
       }
       if (sessionId) {
         // Jump straight into the started session.
-        const project = projects.find((entry) => entry.id === selectedProjectID);
+        const project = projects.find((entry) => entry.id === projectID);
         useSessionUIStore.getState().setCurrentSession(sessionId, directory ?? project?.path ?? null);
         onLeave('session');
       }
     } catch (error) {
+      if (error instanceof ScheduledTaskBusyError) {
+        const startedAt = task.state?.lastRunAt;
+        const message = error.busy === 'queued'
+          ? t('sessions.scheduledTasks.dialog.toast.alreadyQueued')
+          : startedAt
+            ? t('sessions.scheduledTasks.dialog.toast.alreadyRunningSince', { time: formatClockTime(startedAt, timeFormatPreference) })
+            : t('sessions.scheduledTasks.dialog.toast.alreadyRunning');
+        toast.info(message, error.busy === 'running' && task.state?.lastSessionId
+          ? { action: { label: t('sessions.scheduledTasks.dialog.actions.openSession'), onClick: () => openLastRunSession(task) } }
+          : undefined);
+        return;
+      }
       toast.error(error instanceof Error ? error.message : t('sessions.scheduledTasks.dialog.toast.runFailed'));
     } finally {
       setMutatingTaskID(null);
     }
-  }, [selectedProjectID, projects, reloadTasks, onLeave, t]);
+  }, [projects, reloadTasks, onLeave, t, timeFormatPreference, openLastRunSession]);
 
   const chatsLabel = (
     <span className="inline-flex min-w-0 items-center gap-1.5">
@@ -423,15 +583,16 @@ export function ScheduledTasksView({ layout, onLeave }: {
         value={selectedProjectID || '__none'}
         onValueChange={(value) => {
           const nextProjectID = value === '__none' ? '' : value;
-          setSelectedProjectID(nextProjectID);
+          selectProjectScope(nextProjectID);
           if (nextProjectID) {
             void reloadTasks(nextProjectID);
           } else {
-            setTasks([]);
+            commitTaskList('', []);
+            setLoading(false);
           }
         }}
       >
-        <SelectTrigger size="lg" className="w-full">
+        <SelectTrigger className="w-full">
           {selectedProjectID === CHAT_DRAFT_PROJECT_ID ? (
             <SelectValue>{chatsLabel}</SelectValue>
           ) : selectedProject ? (
@@ -455,15 +616,17 @@ export function ScheduledTasksView({ layout, onLeave }: {
 
   const openNewTaskEditor = () => {
     setEditorTask(null);
+    editorOwnerRef.current = '';
     setEditorOpen(true);
   };
 
   const selectProject = (nextProjectID: string) => {
-    setSelectedProjectID(nextProjectID);
+    selectProjectScope(nextProjectID);
     if (nextProjectID) {
       void reloadTasks(nextProjectID);
     } else {
-      setTasks([]);
+      commitTaskList('', []);
+      setLoading(false);
     }
   };
 
@@ -473,7 +636,7 @@ export function ScheduledTasksView({ layout, onLeave }: {
       type="button"
       onClick={() => selectProject(scopeID)}
       className={cn(
-        'flex w-full min-w-0 items-center rounded-md px-2 py-1.5 text-left typography-ui-label focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+        'flex w-full min-w-0 items-center rounded-md px-2 py-1.5 text-start typography-ui-label focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
         selectedProjectID === scopeID
           ? 'bg-interactive-selection text-foreground'
           : 'text-muted-foreground hover:bg-interactive-hover/50 hover:text-foreground',
@@ -497,9 +660,14 @@ export function ScheduledTasksView({ layout, onLeave }: {
         <div className="space-y-2.5">
           {tasks.map((task) => {
             const isBusy = mutatingTaskID === task.id;
-            const status = (task.state?.lastStatus || 'idle') as ScheduledTaskStatus;
-            const meta = STATUS_META[status];
-            const statusLabel = status === 'success'
+            const status = task.state?.lastStatus || 'idle';
+            const meta: TaskStatusMeta = STATUS_META[status];
+            const statusLabel = status === 'queued' ? t('sessions.scheduledTasks.dialog.status.queued')
+              : status === 'sent' ? t('sessions.scheduledTasks.dialog.status.sent')
+              : status === 'skipped' ? t('sessions.scheduledTasks.dialog.status.skipped')
+              : status === 'failed' ? t('sessions.scheduledTasks.dialog.status.error')
+              : status === 'cancelled' ? t('sessions.scheduledTasks.dialog.status.cancelled')
+              : status === 'success'
               ? t('sessions.scheduledTasks.dialog.status.success')
               : status === 'error'
                 ? t('sessions.scheduledTasks.dialog.status.error')
@@ -523,6 +691,10 @@ export function ScheduledTasksView({ layout, onLeave }: {
                   <div className="typography-micro truncate text-muted-foreground">
                     {formatSchedule(task, t)}
                   </div>
+                  <div className="typography-micro flex min-w-0 items-center gap-1 text-muted-foreground/70" title={task.execution.useDefaults ? undefined : `${task.execution.providerID ?? ''}/${task.execution.modelID ?? ''}`}>
+                    <TaskModelLine task={task} />
+                  </div>
+                  {task.targetSessionId ? <TaskTargetLine sessionId={task.targetSessionId} /> : null}
                   {task.loopFile ? (
                     <div
                       className="typography-micro truncate text-muted-foreground/70"
@@ -565,7 +737,7 @@ export function ScheduledTasksView({ layout, onLeave }: {
                             className="inline-flex items-center gap-1"
                             style={{ color: `var(--status-${meta.tone})` }}
                           >
-                            <Icon name={meta.Icon} className="h-3.5 w-3.5" />
+                            {meta.spin ? <Spinner className="h-3.5 w-3.5" /> : <Icon name={meta.Icon} className="h-3.5 w-3.5" />}
                             {statusLabel}
                           </span>
                         ) : null}
@@ -589,25 +761,38 @@ export function ScheduledTasksView({ layout, onLeave }: {
                 ) : null}
 
                 <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
-                  <label
-                    className={cn(
-                      'inline-flex cursor-pointer items-center gap-2 typography-micro font-medium',
-                      task.enabled ? 'text-foreground' : 'text-muted-foreground',
-                      isBusy && 'cursor-not-allowed opacity-50',
-                    )}
-                  >
-                    <Checkbox
-                      checked={task.enabled}
-                      onChange={(enabled) => void handleToggleEnabled(task, enabled)}
-                      ariaLabel={task.enabled
-                        ? t('sessions.scheduledTasks.dialog.taskToggle.pauseAria', { taskName: task.name })
-                        : t('sessions.scheduledTasks.dialog.taskToggle.enableAria', { taskName: task.name })}
-                      disabled={isBusy}
-                    />
-                    {task.enabled ? t('sessions.scheduledTasks.dialog.taskToggle.enabled') : t('sessions.scheduledTasks.dialog.taskToggle.paused')}
-                  </label>
+                  <div className="inline-flex items-center gap-1">
+                    <label
+                      className={cn(
+                        'inline-flex cursor-pointer items-center gap-2 typography-micro font-medium',
+                        task.enabled ? 'text-foreground' : 'text-muted-foreground',
+                        isBusy && 'cursor-not-allowed opacity-50',
+                      )}
+                    >
+                      <Checkbox
+                        checked={task.enabled}
+                        onChange={(enabled) => void handleToggleEnabled(task, enabled)}
+                        ariaLabel={task.enabled
+                          ? t('sessions.scheduledTasks.dialog.taskToggle.pauseAria', { taskName: task.name })
+                          : t('sessions.scheduledTasks.dialog.taskToggle.enableAria', { taskName: task.name })}
+                        disabled={isBusy}
+                      />
+                      {task.enabled ? t('sessions.scheduledTasks.dialog.taskToggle.enabled') : t('sessions.scheduledTasks.dialog.taskToggle.paused')}
+                    </label>
+                    {task.loopApproval ? <LoopApprovalMark reason={task.loopApproval} /> : null}
+                  </div>
 
                   <div className="flex flex-wrap items-center gap-1.5">
+                    {task.state?.lastSessionId ? (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => openLastRunSession(task)}
+                        aria-label={t('sessions.scheduledTasks.dialog.actions.openSessionAria', { taskName: task.name })}
+                      >
+                        <Icon name="chat-1" className="h-4 w-4" /> {t('sessions.scheduledTasks.dialog.actions.openSession')}
+                      </Button>
+                    ) : null}
                     <Button
                       variant="outline"
                       size="sm"
@@ -646,7 +831,7 @@ export function ScheduledTasksView({ layout, onLeave }: {
 
   const newTaskButton = (className?: string) => (
     <Button className={className} size={layout === 'page' ? 'sm' : 'default'} onClick={openNewTaskEditor} disabled={!selectedProjectID}>
-      <Icon name="add" className="mr-1 h-4 w-4" /> {t('sessions.scheduledTasks.dialog.actions.newTask')}
+      <Icon name="add" className="me-1 h-4 w-4" /> {t('sessions.scheduledTasks.dialog.actions.newTask')}
     </Button>
   );
 
@@ -673,7 +858,7 @@ export function ScheduledTasksView({ layout, onLeave }: {
         // so the page itself only carries the close affordance.
         <div className="absolute inset-0 z-10 flex flex-col bg-background">
           <div className="flex min-h-0 flex-1">
-            <div className="flex w-60 flex-shrink-0 flex-col border-r border-border/50">
+            <div className="flex w-60 flex-shrink-0 flex-col border-e border-border/50">
               <div className="flex-1 space-y-0.5 overflow-y-auto p-2">
                 {!hasScopes ? (
                   <div className="px-2 py-2 typography-meta text-muted-foreground">
@@ -703,6 +888,9 @@ export function ScheduledTasksView({ layout, onLeave }: {
       <ScheduledTaskEditorDialog
         open={editorOpen}
         task={editorTask}
+        // The editor works in the task's own scope: an existing task keeps
+        // the project it was captured with even if the selection has moved.
+        projectId={editorOwnerRef.current || selectedProjectID}
         onOpenChange={setEditorOpen}
         onSave={handleSaveTask}
       />

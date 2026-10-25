@@ -9,7 +9,7 @@ let root: Root;
 const descriptors = new Map<string, PropertyDescriptor | undefined>();
 beforeEach(() => {
   browser = new Window({ url: 'http://localhost' });
-  for (const [key, value] of Object.entries({ window: browser, document: browser.document, navigator: browser.navigator, HTMLElement: browser.HTMLElement, IS_REACT_ACT_ENVIRONMENT: true })) {
+  for (const [key, value] of Object.entries({ window: browser, document: browser.document, navigator: browser.navigator, HTMLElement: browser.HTMLElement, Element: browser.Element, IS_REACT_ACT_ENVIRONMENT: true })) {
     descriptors.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
     Object.defineProperty(globalThis, key, { value, configurable: true });
   }
@@ -28,10 +28,12 @@ afterEach(async () => {
 
 const title = 'درخواست پاسخ فارسی با React';
 
-const renderRow = (compact: boolean) => root.render(<SessionTimelineRowBody
+const project = { id: 'project-a', icon: null, color: null, iconImage: null, iconBackground: null };
+
+const renderRow = (compact: boolean, withProject = false) => root.render(<SessionTimelineRowBody
   compact={compact}
-  project={null}
-  projectLabel={null}
+  project={withProject ? project : null}
+  projectLabel={withProject ? 'openchamber' : null}
   title={title}
   titleClassName=""
   branchLabel={null}
@@ -47,10 +49,11 @@ const renderRow = (compact: boolean) => root.render(<SessionTimelineRowBody
 
 // A truncated title in an LTR box clips an RTL title's beginning, because its
 // first word sits at the right edge. dir=auto lets the title own its direction.
-for (const compact of [true, false]) {
-  test(`the title resolves its own direction (compact: ${compact})`, async () => {
-    await act(async () => renderRow(compact));
-    const element = Array.from(document.querySelectorAll('div')).find((node) => node.textContent === title);
+for (const [compact, withProject] of [[true, false], [false, false], [false, true]] as const) {
+  test(`the title resolves its own direction (compact: ${compact}, project: ${withProject})`, async () => {
+    await act(async () => renderRow(compact, withProject));
+    // The innermost box holding the title is the one that truncates it.
+    const element = Array.from(document.querySelectorAll('div')).reverse().find((node) => node.textContent === title);
     expect(element?.getAttribute('dir')).toBe('auto');
   });
 }

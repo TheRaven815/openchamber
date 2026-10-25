@@ -37,18 +37,29 @@ import { z } from 'zod';
  *   routes and stays allowed.
  * - Jev classification is off, unless the administrator pinned their own
  *   endpoint (`routing/runtime.js`).
- * - External tunnels are refused: their provider sees plain text (`tunnels`).
+ * - External tunnels are refused: Cloudflare and ngrok see plain text, and
+ *   Tailscale opens this machine to other devices (`tunnels`).
  * - The private relay runs only on a pinned self-hosted endpoint
  *   (`relay/service.js`).
  * - Speech and transcription go only to servers on this machine (`tts`,
  *   `dictation`).
  * - Push notifications carry no message text or session name (`notifications`).
  * - Update checks still run but never report usage (`package-manager.js`).
+ * - Environment variables from Settings and `opencode service set env` do
+ *   not reach the managed OpenCode: one could carry a provider key
+ *   (`environment/runtime.js`). Git, the terminal and exec still get them.
  * - The draw.io diagram editor, diagrams.net's own page in a frame, is not
  *   loaded; a .drawio file opens as its XML (`packages/ui` FilesView). The
  *   crossing happens in the browser, so the UI is where it is held back.
  * - Web fonts that load from a public CDN fall back to the system fonts
  *   (`packages/ui` useFontPreferences); the stored choice is kept.
+ * - The integrations catalog, a bundled list of outside services to install,
+ *   is hidden (`packages/ui` SidebarHeader); administrator-curated sources for
+ *   it do not exist yet. MCP, plugin and skill entry in Settings is unchanged.
+ * - The Settings card that installs the Claude Code plugin, a model provider,
+ *   is hidden (`packages/ui` IntegrationsPage). The plugin itself is not
+ *   refused: OpenCode's `provider.use` policy covers `claude-code` like any
+ *   other provider.
  * - The server listens only on this machine unless network access is allowed
  *   (`allowNetworkAccess` / `OPENCHAMBER_ALLOW_NETWORK_ACCESS`): it refuses
  *   to start on a network address and drops connections from other machines
@@ -65,6 +76,11 @@ import { z } from 'zod';
  * falls back to the bundled CLI or PATH, ignores the user's binary setting,
  * and OpenChamber neither installs nor upgrades it (`opencode/env-runtime.js`,
  * `packages/vscode/src/opencode.ts`).
+ *
+ * The file can also hide the skills catalogs OpenChamber ships with
+ * (`hideBuiltinSkillCatalogs`), with or without enterprise mode, so the only
+ * catalogs on offer are the ones the organization added
+ * (`skills-catalog/curated-sources.js`, `packages/vscode/src/skillsCatalog.ts`).
  *
  * The VS Code extension host, which runs no OpenChamber server, reads the
  * same policy through this module for the parts it has (provider connection,
@@ -105,6 +121,7 @@ const policyFileSchema = z.object({
   allowLocalExtensions: z.boolean().optional(),
   jev: z.object({ url: optionalText, model: optionalText, apiKey: optionalText }).optional(),
   opencodeBinary: optionalText,
+  hideBuiltinSkillCatalogs: z.boolean().optional(),
 }).refine((policy) => !policy.jev || policy.jev.url || (!policy.jev.model && !policy.jev.apiKey), {
   message: '"jev" needs a "url"',
   path: ['jev'],
@@ -125,7 +142,7 @@ const parsePolicyFile = (text) => {
     const field = issue.path.length > 0 ? `"${issue.path.join('.')}": ` : '';
     throw new Error(`${field}${issue.message}`);
   }
-  const { enterpriseMode, organization, relayUrl, allowNetworkAccess, allowedExtensions, allowLocalExtensions, jev, opencodeBinary } = parsed.data;
+  const { enterpriseMode, organization, relayUrl, allowNetworkAccess, allowedExtensions, allowLocalExtensions, jev, opencodeBinary, hideBuiltinSkillCatalogs } = parsed.data;
   return {
     enterpriseMode: enterpriseMode === true,
     organization: organization ?? null,
@@ -135,6 +152,7 @@ const parsePolicyFile = (text) => {
     allowLocalExtensions,
     jev: jev?.url ? { url: jev.url, model: jev.model ?? null, apiKey: jev.apiKey ?? null } : undefined,
     opencodeBinary: opencodeBinary ?? null,
+    hideBuiltinSkillCatalogs: hideBuiltinSkillCatalogs === true,
   };
 };
 
@@ -205,6 +223,8 @@ export const readEnterprisePolicy = (options = {}) => {
       allowedExtensions: [],
       allowLocalExtensions: false,
       opencodeBinary: null,
+      // Fails closed like the rest: a broken policy offers no catalog it might have hidden.
+      hideBuiltinSkillCatalogs: true,
     };
   }
 
@@ -239,6 +259,8 @@ export const readEnterprisePolicy = (options = {}) => {
     // File only, in or out of enterprise mode: OPENCODE_BINARY already lets a
     // user pick a binary, and a pin they could override would not be one.
     opencodeBinary: fromFile?.opencodeBinary ?? null,
+    // File only, in or out of enterprise mode, for the same reason.
+    hideBuiltinSkillCatalogs: fromFile?.hideBuiltinSkillCatalogs === true,
   };
 };
 
@@ -303,7 +325,7 @@ const isMcpSignIn = (integrationId, rest) => (
 /**
  * Whether a request to OpenCode would add a way to reach a model provider:
  * every POST under `/api/integration/:id/connect` (key, oauth start and
- * complete, command), storing a key with `POST /api/credential`, and adding a
+ * complete, command, external since 2.0.25), storing a key with `POST /api/credential`, and adding a
  * well-known integration. Signing in to a
  * remote MCP server goes through the same routes and stays allowed. Reads,
  * cancelling an attempt and removing or switching an existing account stay

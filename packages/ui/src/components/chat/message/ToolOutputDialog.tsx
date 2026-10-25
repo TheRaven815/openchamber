@@ -11,6 +11,7 @@ import { toolDisplayStyles } from '@/lib/typography';
 import { getLanguageFromExtension } from '@/lib/toolHelpers';
 import { useOptionalThemeSystem } from '@/contexts/useThemeSystem';
 import { ensurePierreThemeRegistered } from '@/lib/shiki/appThemeRegistry';
+import { DIFFS_HIGHLIGHTER, toDiffsLanguage } from '@/lib/shiki/diffsHighlighter';
 import { getDefaultTheme } from '@/lib/theme/themes';
 import {
     renderGrepOutput,
@@ -22,6 +23,7 @@ import {
 } from './toolRenderers';
 import type { ToolPopupContent, DiffViewMode } from './types';
 import { DiffViewToggle } from './DiffViewToggle';
+import { useDefaultDiffViewMode } from './useDefaultDiffViewMode';
 import { VirtualizedCodeBlock, type CodeLine } from './parts/VirtualizedCodeBlock';
 import { JsonTreeView } from '@/components/ui/JsonTreeView';
 import { Icon } from "@/components/icon/Icon";
@@ -30,6 +32,7 @@ import { useGuestToolPresentation } from '@/lib/guests/tool-presentation';
 import { useI18n, type I18nKey, type I18nParams } from '@/lib/i18n';
 import { runtimeFetch } from '@/lib/runtime-fetch';
 import { MermaidLoadFailure, getMermaidDataUrlSourcePromise, isCurrentMermaidLoadRequest, isMermaidLoadFailure, nextMermaidLoadRequestId } from './toolOutputDialogMermaid';
+import { PIERRE_DIFF_TINT_CSS } from '@/lib/shiki/pierreDiffTint';
 
 interface ToolOutputDialogProps {
     popup: ToolPopupContent;
@@ -54,6 +57,7 @@ type PierreThemeConfig = {
 };
 
 const TOOL_DIFF_UNSAFE_CSS = `
+  ${PIERRE_DIFF_TINT_CSS}
   [data-diff-header],
   [data-diff] {
     [data-separator] {
@@ -155,7 +159,7 @@ const getSvgAspectRatio = (svg: SVGElement): number | null => {
         // Ignore getBBox failures and fall back to SVG attrs/viewBox.
     }
 
-    const viewBox = svg.getAttribute('viewBox');
+    const viewBox = svg.getAttribute('data-oc-mermaid-original-viewbox') ?? svg.getAttribute('viewBox');
     if (viewBox) {
         const parts = viewBox.trim().split(/\s+/).map(Number);
         if (parts.length === 4) {
@@ -256,7 +260,7 @@ const ImagePreviewDialog: React.FC<{
     onOpenChange: (open: boolean) => void;
     isMobile: boolean;
 }> = ({ popup, onOpenChange, isMobile }) => {
-    const { t } = useI18n();
+    const { t, direction } = useI18n();
     const gallery = React.useMemo(() => {
         const baseImage = popup.image;
         if (!baseImage) return [] as Array<{ url: string; mimeType?: string; filename?: string; size?: number }>;
@@ -277,7 +281,7 @@ const ImagePreviewDialog: React.FC<{
     }, [popup.image]);
 
     const [currentIndex, setCurrentIndex] = React.useState(0);
-    const [imageNaturalSize, setImageNaturalSize] = React.useState<{ width: number; height: number } | null>(null);
+    const [imageNaturalSize, setImageNaturalSize] = React.useState<{ url: string; width: number; height: number } | null>(null);
     const { isRendered, isVisible, isTransitioning } = usePreviewOverlayState(popup.open);
     const viewport = usePreviewViewport(popup.open);
 
@@ -323,13 +327,16 @@ const ImagePreviewDialog: React.FC<{
                 return;
             }
 
-            if (event.key === 'ArrowLeft' && hasMultipleImages) {
+            // "Previous" sits at the start of the row: on the right in RTL.
+            const previousKey = direction === 'rtl' ? 'ArrowRight' : 'ArrowLeft';
+            const nextKey = direction === 'rtl' ? 'ArrowLeft' : 'ArrowRight';
+            if (event.key === previousKey && hasMultipleImages) {
                 event.preventDefault();
                 showPrevious();
                 return;
             }
 
-            if (event.key === 'ArrowRight' && hasMultipleImages) {
+            if (event.key === nextKey && hasMultipleImages) {
                 event.preventDefault();
                 showNext();
             }
@@ -339,32 +346,36 @@ const ImagePreviewDialog: React.FC<{
         return () => {
             window.removeEventListener('keydown', onKeyDown);
         };
-    }, [hasMultipleImages, onOpenChange, popup.open, showNext, showPrevious]);
+    }, [direction, hasMultipleImages, onOpenChange, popup.open, showNext, showPrevious]);
 
-    React.useEffect(() => {
-        setImageNaturalSize(null);
-    }, [currentImage?.url]);
+    // The measured size belongs to one URL. Resetting it in an effect on URL
+    // change raced the load event of an already-cached image, which left the
+    // viewer stuck at its maximum box with wide dead margins around the image.
+    const currentImageUrl = currentImage?.url;
+    const currentNaturalSize = imageNaturalSize && imageNaturalSize.url === currentImageUrl
+        ? imageNaturalSize
+        : null;
 
     const imageDisplaySize = React.useMemo(() => {
         const maxWidth = Math.max(160, viewport.width * (isMobile ? 0.86 : 0.75));
         const maxHeight = Math.max(160, viewport.height * (isMobile ? 0.72 : 0.75));
 
-        if (!imageNaturalSize) {
+        if (!currentNaturalSize) {
             return {
                 width: Math.round(maxWidth),
                 height: Math.round(maxHeight),
             };
         }
 
-        const widthScale = maxWidth / imageNaturalSize.width;
-        const heightScale = maxHeight / imageNaturalSize.height;
+        const widthScale = maxWidth / currentNaturalSize.width;
+        const heightScale = maxHeight / currentNaturalSize.height;
         const scale = Math.min(widthScale, heightScale);
 
         return {
-            width: Math.max(1, Math.round(imageNaturalSize.width * scale)),
-            height: Math.max(1, Math.round(imageNaturalSize.height * scale)),
+            width: Math.max(1, Math.round(currentNaturalSize.width * scale)),
+            height: Math.max(1, Math.round(currentNaturalSize.height * scale)),
         };
-    }, [imageNaturalSize, isMobile, viewport.height, viewport.width]);
+    }, [currentNaturalSize, isMobile, viewport.height, viewport.width]);
 
     if (!isRendered || !currentImage || typeof document === 'undefined') {
         return null;
@@ -390,7 +401,7 @@ const ImagePreviewDialog: React.FC<{
                         type="button"
                         onMouseDown={(event) => event.stopPropagation()}
                         onClick={showPrevious}
-                        className="absolute left-3 top-1/2 -translate-y-1/2 z-10 h-10 w-10 flex items-center justify-center rounded-full bg-surface-elevated/90 text-surface-elevated-foreground hover:bg-surface-elevated focus:outline-none focus:ring-2 focus:ring-ring"
+                        className="absolute inset-s-3 top-1/2 -translate-y-1/2 z-10 h-10 w-10 flex items-center justify-center rounded-full bg-surface-elevated/90 text-surface-elevated-foreground hover:bg-surface-elevated focus:outline-none focus:ring-2 focus:ring-ring"
                         aria-label={t('chat.toolOutputDialog.image.previousAria')}
                     >
                         <Icon name="arrow-left-s" className="h-6 w-6" />
@@ -399,7 +410,7 @@ const ImagePreviewDialog: React.FC<{
                         type="button"
                         onMouseDown={(event) => event.stopPropagation()}
                         onClick={showNext}
-                        className="absolute right-3 top-1/2 -translate-y-1/2 z-10 h-10 w-10 flex items-center justify-center rounded-full bg-surface-elevated/90 text-surface-elevated-foreground hover:bg-surface-elevated focus:outline-none focus:ring-2 focus:ring-ring"
+                        className="absolute inset-e-3 top-1/2 -translate-y-1/2 z-10 h-10 w-10 flex items-center justify-center rounded-full bg-surface-elevated/90 text-surface-elevated-foreground hover:bg-surface-elevated focus:outline-none focus:ring-2 focus:ring-ring"
                         aria-label={t('chat.toolOutputDialog.image.nextAria')}
                     >
                         <Icon name="arrow-right-s" className="h-6 w-6" />
@@ -445,12 +456,13 @@ const ImagePreviewDialog: React.FC<{
                             const element = event.currentTarget;
                             const width = element.naturalWidth;
                             const height = element.naturalHeight;
+                            const url = element.getAttribute('src') ?? '';
                             if (width > 0 && height > 0) {
                                 setImageNaturalSize((previous) => {
-                                    if (previous && previous.width === width && previous.height === height) {
+                                    if (previous && previous.url === url && previous.width === width && previous.height === height) {
                                         return previous;
                                     }
-                                    return { width, height };
+                                    return { url, width, height };
                                 });
                             }
                         }}
@@ -488,6 +500,7 @@ const DialogUnifiedDiff: React.FC<{
                     overflow: 'wrap',
                     theme: pierreThemeConfig.theme,
                     themeType: pierreThemeConfig.themeType,
+                    preferredHighlighter: DIFFS_HIGHLIGHTER,
                     unsafeCSS: TOOL_DIFF_UNSAFE_CSS,
                 }}
                 className="block w-full"
@@ -559,13 +572,14 @@ const DialogReadContent: React.FC<{
                 file={{
                     name: filePath,
                     contents: fileContents,
-                    lang: detectedLanguage || undefined,
+                    lang: toDiffsLanguage(detectedLanguage),
                 }}
                 options={{
                     disableFileHeader: true,
                     overflow: 'wrap',
                     theme: pierreThemeConfig.theme,
                     themeType: pierreThemeConfig.themeType,
+                    preferredHighlighter: DIFFS_HIGHLIGHTER,
                 }}
                 className="block w-full"
             />
@@ -749,16 +763,19 @@ const MermaidPreviewDialog: React.FC<{
             return;
         }
 
+        let measuredSvg: SVGElement | null = null;
         const measureAspectRatio = () => {
             const svg = mermaidPreviewRef.current?.querySelector('svg');
             if (!svg) {
                 return false;
             }
+            if (svg === measuredSvg) return true;
 
             const aspectRatio = getSvgAspectRatio(svg as SVGElement);
             if (!aspectRatio || !Number.isFinite(aspectRatio) || aspectRatio <= 0) {
                 return false;
             }
+            measuredSvg = svg;
 
             setDiagramAspectRatio((previous) => {
                 if (previous && Math.abs(previous - aspectRatio) < 0.001) {
@@ -798,7 +815,8 @@ const MermaidPreviewDialog: React.FC<{
         });
 
         if (mermaidPreviewRef.current) {
-            observer.observe(mermaidPreviewRef.current, { childList: true, subtree: true, attributes: true });
+            // A new SVG needs sizing; pointer-driven viewBox changes do not.
+            observer.observe(mermaidPreviewRef.current, { childList: true, subtree: true });
         }
 
         return () => {
@@ -880,10 +898,9 @@ const MermaidPreviewDialog: React.FC<{
 
                             {status === 'error' && (
                                 <div
-                                    className="rounded-xl border p-3 space-y-3"
+                                    className="rounded-xl p-3 space-y-3"
                                     style={{
                                         backgroundColor: 'var(--status-error-background)',
-                                        borderColor: 'var(--status-error-border)',
                                     }}
                                 >
                                     <p className="typography-markdown" style={{ color: 'var(--status-error)' }}>
@@ -929,15 +946,16 @@ const MermaidPreviewDialog: React.FC<{
 
 const ToolOutputDialog: React.FC<ToolOutputDialogProps> = ({ popup, onOpenChange, isMobile }) => {
     const { t } = useI18n();
-    const [diffViewMode, setDiffViewMode] = React.useState<DiffViewMode>('unified');
+    const defaultDiffViewMode = useDefaultDiffViewMode();
+    const [diffViewMode, setDiffViewMode] = React.useState<DiffViewMode>(defaultDiffViewMode);
     const pierreThemeConfig = usePierreThemeConfig();
     const popupToolName = typeof popup.metadata?.tool === 'string' ? popup.metadata.tool : null;
     const popupToolPresentation = useGuestToolPresentation(popupToolName);
 
     React.useEffect(() => {
         if (!popup.open) return;
-        setDiffViewMode('unified');
-    }, [popup.open, popup.title]);
+        setDiffViewMode(defaultDiffViewMode);
+    }, [defaultDiffViewMode, popup.open, popup.title]);
 
     if (popup.image) {
         return <ImagePreviewDialog popup={popup} onOpenChange={onOpenChange} isMobile={isMobile} />;
@@ -954,7 +972,7 @@ const ToolOutputDialog: React.FC<ToolOutputDialogProps> = ({ popup, onOpenChange
                     'overflow-hidden flex flex-col min-h-0 pt-3 pb-4 px-4 gap-1',
                     '[&>button]:top-1.5',
                     isMobile ? 'w-[95vw] max-w-[95vw]' : 'max-w-5xl',
-                    isMobile ? '[&>button]:right-1' : '[&>button]:top-2.5 [&>button]:right-4'
+                    isMobile ? '[&>button]:inset-e-1' : '[&>button]:top-2.5 [&>button]:inset-e-4'
                 )}
                 style={{ maxHeight: '90vh' }}
             >
@@ -968,13 +986,13 @@ const ToolOutputDialog: React.FC<ToolOutputDialogProps> = ({ popup, onOpenChange
                             <DiffViewToggle
                                 mode={diffViewMode}
                                 onModeChange={setDiffViewMode}
-                                className="mr-8 flex-shrink-0"
+                                className="me-8 flex-shrink-0"
                             />
                         )}
                     </div>
                 </div>
-                <div className="flex-1 min-h-0 rounded-xl border border-border/30 bg-muted/10 overflow-hidden">
-                    <div className="tool-output-surface h-full max-h-[75vh] overflow-y-auto px-3 pr-4">
+                <div className="flex-1 min-h-0 rounded-xl oc-tile overflow-hidden">
+                    <div className="tool-output-surface h-full max-h-[75vh] overflow-y-auto px-3 pe-4">
                         {popup.metadata?.input && typeof popup.metadata.input === 'object' &&
                             Object.keys(popup.metadata.input).length > 0 &&
                             popup.metadata?.tool !== 'patch' ? (() => {
@@ -998,7 +1016,7 @@ const ToolOutputDialog: React.FC<ToolOutputDialogProps> = ({ popup, onOpenChange
                                                 : 'Input:'}
                                     </div>
                                     {isShellTool(metaTool) && getInputValue('command') ? (
-                                        <div className="tool-input-surface bg-transparent rounded-xl border border-border/20 mx-3">
+                                        <div className="tool-input-surface oc-tile rounded-xl mx-3">
                                             <WorkerHighlightedCode
                                                 language="bash"
                                                 code={getInputValue('command')!}
@@ -1009,7 +1027,7 @@ const ToolOutputDialog: React.FC<ToolOutputDialogProps> = ({ popup, onOpenChange
                                         </div>
                                     ) : isSubagentTool(metaTool) && getInputValue('prompt') ? (
                                         <div
-                                            className="tool-input-surface bg-transparent rounded-xl border border-border/20 font-mono whitespace-pre-wrap text-foreground/90 mx-3"
+                                            className="tool-input-surface oc-tile rounded-xl font-mono whitespace-pre-wrap text-foreground/90 mx-3"
                                             style={toolDisplayStyles.getPopupStyles()}
                                         >
                                             {getInputValue('description') ? `Task: ${getInputValue('description')}\n` : ''}
@@ -1017,25 +1035,26 @@ const ToolOutputDialog: React.FC<ToolOutputDialogProps> = ({ popup, onOpenChange
                                             {`Instructions:\n${getInputValue('prompt')}`}
                                         </div>
                                     ) : isWriteTool(metaTool) && getInputValue('content') ? (
-                                        <div className="tool-input-surface bg-transparent rounded-xl border border-border/20 mx-3">
+                                        <div className="tool-input-surface oc-tile rounded-xl mx-3">
                                             <PierreFile
                                                 file={{
                                                     name: writeTarget || 'new-file',
                                                     contents: getInputValue('content')!,
-                                                    lang: getLanguageFromExtension(writeTarget) || undefined,
+                                                    lang: toDiffsLanguage(getLanguageFromExtension(writeTarget)),
                                                 }}
                                                 options={{
                                                     disableFileHeader: true,
                                                     overflow: 'wrap',
                                                     theme: pierreThemeConfig.theme,
                                                     themeType: pierreThemeConfig.themeType,
+                                                    preferredHighlighter: DIFFS_HIGHLIGHTER,
                                                 }}
                                                 className="block w-full"
                                             />
                                         </div>
                                     ) : (
                                         <div
-                                            className="tool-input-surface bg-transparent rounded-xl border border-border/20 font-mono whitespace-pre-wrap text-foreground/90 mx-3"
+                                            className="tool-input-surface oc-tile rounded-xl font-mono whitespace-pre-wrap text-foreground/90 mx-3"
                                             style={toolDisplayStyles.getPopupStyles()}
                                         >
                                             {formatInputForDisplay(input, meta.tool as string)}
@@ -1059,7 +1078,7 @@ const ToolOutputDialog: React.FC<ToolOutputDialogProps> = ({ popup, onOpenChange
                                 if (tool === 'grep') {
                                     return (
                                         renderGrepOutput(popup.content, isMobile) || (
-                                            <pre className="typography-code bg-muted/30 p-2 rounded-xl border border-border/20 font-mono whitespace-pre-wrap">
+                                            <pre className="typography-code oc-tile-inset p-2 rounded-xl font-mono whitespace-pre-wrap">
                                                 {popup.content}
                                             </pre>
                                         )
@@ -1069,7 +1088,7 @@ const ToolOutputDialog: React.FC<ToolOutputDialogProps> = ({ popup, onOpenChange
                                 if (tool === 'glob') {
                                     return (
                                         renderGlobOutput(popup.content, isMobile) || (
-                                            <pre className="typography-code bg-muted/30 p-2 rounded-xl border border-border/20 font-mono whitespace-pre-wrap">
+                                            <pre className="typography-code oc-tile-inset p-2 rounded-xl font-mono whitespace-pre-wrap">
                                                 {popup.content}
                                             </pre>
                                         )
@@ -1138,4 +1157,6 @@ const ToolOutputDialog: React.FC<ToolOutputDialogProps> = ({ popup, onOpenChange
     );
 };
 
-export default ToolOutputDialog;
+// Mounted by every chat message, which re-renders on each streamed chunk
+// while the popup state and handlers stay the same.
+export default React.memo(ToolOutputDialog);

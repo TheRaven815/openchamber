@@ -5,10 +5,13 @@ import { describe, expect, test } from 'bun:test';
 import type { GhosttyCell, GhosttyRow } from './core';
 import {
   DEFAULT_TERMINAL_FONT_FAMILY,
+  TerminalPasteArbiter,
   advanceTerminalSelectionClickSequence,
   isTerminalCopyShortcut,
   isTerminalLinkPointerGesture,
   isTerminalPasteShortcut,
+  isTerminalMacAppShortcut,
+  isTerminalZoomShortcut,
   resolveTerminalMouseData,
   shouldBlinkTerminalCursor,
   terminalContentOriginY,
@@ -108,6 +111,70 @@ describe('shortcuts and gestures', () => {
     expect(isTerminalPasteShortcut({ key: 'v', ctrlKey: true, metaKey: false, shiftKey: false }, 'Win32')).toBe(false);
     expect(isTerminalPasteShortcut({ key: 'v', ctrlKey: true, metaKey: false, shiftKey: true }, 'Win32')).toBe(true);
     expect(isTerminalPasteShortcut({ key: 'Insert', ctrlKey: false, metaKey: false, shiftKey: true }, 'Win32')).toBe(true);
+  });
+
+  test('macOS Super chords belong to the app; Option and Ctrl stay with the terminal', () => {
+    const mac = (mods: Partial<Pick<KeyboardEvent, 'altKey' | 'ctrlKey' | 'metaKey' | 'shiftKey'>>) => ({
+      altKey: false, ctrlKey: false, metaKey: false, shiftKey: false, ...mods,
+    });
+    // Every registered menu chord stands down: the accelerators (Cmd+B, Cmd+J,
+    // Cmd+Q, Cmd+Shift+G, Cmd+Alt+L, the edit roles, ...) claim them upstream.
+    expect(isTerminalMacAppShortcut(mac({ metaKey: true }), 'MacIntel')).toBe(true);
+    expect(isTerminalMacAppShortcut(mac({ metaKey: true, shiftKey: true }), 'MacIntel')).toBe(true);
+    expect(isTerminalMacAppShortcut(mac({ metaKey: true, altKey: true }), 'MacIntel')).toBe(true);
+    // Terminal-owned chords keep encoding: Option is the terminal's Meta key,
+    // Ctrl chords are legacy C0 input, and Cmd+Ctrl has no accelerator.
+    expect(isTerminalMacAppShortcut(mac({ altKey: true }), 'MacIntel')).toBe(false);
+    expect(isTerminalMacAppShortcut(mac({ ctrlKey: true }), 'MacIntel')).toBe(false);
+    expect(isTerminalMacAppShortcut(mac({ metaKey: true, ctrlKey: true }), 'MacIntel')).toBe(false);
+    expect(isTerminalMacAppShortcut(mac({}), 'MacIntel')).toBe(false);
+    // Other platforms keep encoding Super (their menu chords are Ctrl-based
+    // and resolved separately).
+    expect(isTerminalMacAppShortcut(mac({ metaKey: true }), 'Win32')).toBe(false);
+    expect(isTerminalMacAppShortcut(mac({ metaKey: true }), 'Linux x86_64')).toBe(false);
+  });
+
+  test('Ctrl zoom chords pass through to the app on Windows and Linux', () => {
+    const chord = (code: string, key: string, mods: Partial<Pick<KeyboardEvent, 'altKey' | 'ctrlKey' | 'metaKey' | 'shiftKey'>> = {}) => ({
+      code, key, altKey: false, ctrlKey: false, metaKey: false, shiftKey: false, ...mods,
+    });
+    // macOS Cmd chords, zoom included, are isTerminalMacAppShortcut's.
+    expect(isTerminalZoomShortcut(chord('Equal', '=', { metaKey: true }), 'MacIntel')).toBe(false);
+    // Ctrl + =/-/0 on Windows/Linux reaches it too.
+    expect(isTerminalZoomShortcut(chord('Equal', '=', { ctrlKey: true }), 'Win32')).toBe(true);
+    expect(isTerminalZoomShortcut(chord('Minus', '-', { ctrlKey: true }), 'Linux x86_64')).toBe(true);
+    // Cross-platform noise stays terminal input: Ctrl chords on macOS have no
+    // accelerator, and Shift combos (Cmd+Plus) are not registered.
+    expect(isTerminalZoomShortcut(chord('Equal', '=', { ctrlKey: true }), 'MacIntel')).toBe(false);
+    expect(isTerminalZoomShortcut(chord('Equal', '=', { metaKey: true }), 'Win32')).toBe(false);
+    expect(isTerminalZoomShortcut(chord('Equal', '=', { metaKey: true, shiftKey: true }), 'MacIntel')).toBe(false);
+    // AltGraph (ctrl+alt) and unmodified keys must keep encoding for the pty.
+    expect(isTerminalZoomShortcut(chord('Equal', '=', { ctrlKey: true, altKey: true }), 'Linux x86_64')).toBe(false);
+    expect(isTerminalZoomShortcut(chord('Equal', '='), 'MacIntel')).toBe(false);
+    expect(isTerminalZoomShortcut(chord('KeyV', 'v', { ctrlKey: true }), 'Win32')).toBe(false);
+  });
+
+  test('a paste shortcut delivers once whichever path arrives first', () => {
+    const nativeFirst = new TerminalPasteArbiter();
+    const lateRead = nativeFirst.beginRead();
+    expect(nativeFirst.settleNativePaste(10)).toBe(true);
+    expect(nativeFirst.settleRead(lateRead, true, 20)).toBe(false);
+
+    // WebKit: the read resolves before the keystroke's native paste event.
+    const readFirst = new TerminalPasteArbiter();
+    expect(readFirst.settleRead(readFirst.beginRead(), true, 10)).toBe(true);
+    expect(readFirst.settleNativePaste(60)).toBe(false);
+    expect(readFirst.settleNativePaste(70)).toBe(true);
+  });
+
+  test('a native paste with no event owed delivers after the echo window or a menu read', () => {
+    const noNativeEvent = new TerminalPasteArbiter();
+    expect(noNativeEvent.settleRead(noNativeEvent.beginRead(), true, 0)).toBe(true);
+    expect(noNativeEvent.settleNativePaste(5000)).toBe(true);
+
+    const menu = new TerminalPasteArbiter();
+    expect(menu.settleRead(menu.beginRead(), false, 0)).toBe(true);
+    expect(menu.settleNativePaste(10)).toBe(true);
   });
 
   test('link activation uses Command on macOS and Control elsewhere', () => {

@@ -18,7 +18,8 @@ interface CodeLineContentProps {
 }
 
 const CodeLineContent: React.FC<CodeLineContentProps> = ({ content, html, status }) => {
-  if (status === 'ready' && html !== undefined) {
+  // Ready lines, and unchanged lines carried while an update tokenizes.
+  if (html !== undefined) {
     return <span className="whitespace-pre-wrap break-all" dangerouslySetInnerHTML={{ __html: html }} />;
   }
   if (status === 'loading') {
@@ -26,6 +27,10 @@ const CodeLineContent: React.FC<CodeLineContentProps> = ({ content, html, status
   }
   return <span className="whitespace-pre-wrap break-all">{content}</span>;
 };
+
+const highlightedLineAt = (result: WorkerHighlightedLinesResult, index: number): string | undefined => (
+    result.status === 'loading' ? result.carriedLines[index] : result.lines?.[index]
+);
 
 interface DiffPreviewProps {
     diff: string;
@@ -56,7 +61,7 @@ export const DiffPreview: React.FC<DiffPreviewProps> = ({ diff, filePath }) => {
 
                     <div>
                         {hunk.lines.map((line, lineIdx) => {
-                            const html = highlighted.lines?.[lineCursor];
+                            const html = highlightedLineAt(highlighted, lineCursor);
                             lineCursor += 1;
                             return (
                                 <div
@@ -75,7 +80,7 @@ export const DiffPreview: React.FC<DiffPreviewProps> = ({ diff, filePath }) => {
                                                 : {}
                                     }
                                 >
-                                    <span className="w-10 flex-shrink-0 text-right pr-3 select-none border-r mr-3 -my-0.5 py-0.5" style={{ color: 'var(--tools-edit-line-number)', borderColor: 'var(--tools-border)' }}>
+                                    <span className="w-10 flex-shrink-0 text-end pe-3 select-none border-e me-3 -my-0.5 py-0.5" style={{ color: 'var(--tools-edit-line-number)', borderColor: 'var(--tools-border)' }}>
                                         {line.lineNumber || ''}
                                     </span>
                                     <div className="flex-1 min-w-0">
@@ -114,13 +119,13 @@ export const WritePreview: React.FC<WritePreviewProps> = ({ content, filePath })
             <div className="space-y-0">
                 {lines.map((line, lineIdx) => (
                     <div key={lineIdx} className="typography-code font-mono px-2 py-0.5 flex -mx-1">
-                        <span className="w-10 flex-shrink-0 text-right pr-3 select-none border-r mr-3 -my-0.5 py-0.5" style={{ color: 'var(--tools-edit-line-number)', borderColor: 'var(--tools-border)' }}>
+                        <span className="w-10 flex-shrink-0 text-end pe-3 select-none border-e me-3 -my-0.5 py-0.5" style={{ color: 'var(--tools-edit-line-number)', borderColor: 'var(--tools-border)' }}>
                             {lineIdx + 1}
                         </span>
                         <div className="flex-1 min-w-0">
                             <CodeLineContent
                                 content={line || ' '}
-                                html={highlighted.lines?.[lineIdx]}
+                                html={highlightedLineAt(highlighted, lineIdx)}
                                 status={highlighted.status}
                             />
                         </div>

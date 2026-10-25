@@ -16,6 +16,9 @@ import {
   type ParseError,
 } from 'jsonc-parser';
 import { resolveNpmRegistryRequest } from '../../web/server/lib/opencode/npm-registry-config.js';
+import { writeFileAtomic } from '../../web/server/lib/opencode/atomic-write.js';
+import { toLoadablePluginSpec } from '../../web/server/lib/opencode/loadable-plugin-spec.js';
+import { isGitSpec } from '../../web/server/lib/opencode/plugin-spec.js';
 import {
   toAgentEntity,
   fromAgentEntity,
@@ -35,6 +38,7 @@ import {
   writeSectionEntry,
   deleteSectionEntry,
   readMcpEntry,
+  readMcpEntries,
   readLayeredMcpEntries,
   writeMcpEntry,
   deleteMcpEntry,
@@ -45,6 +49,7 @@ import {
   formatModelSelection,
   writeWebSearchSelection,
   writeWarmingEnabled,
+  writeSkillDisabled,
   findWebSearchProjectOverride,
   type AgentEntity,
   type CommandEntity,
@@ -102,7 +107,7 @@ export type Snippet = {
 };
 
 export type PluginScope = 'user' | 'project';
-type PluginParsedKind = 'npm' | 'path';
+type PluginParsedKind = 'npm' | 'path' | 'git';
 
 export type PluginEntry = {
   id: string;
@@ -128,7 +133,8 @@ export type PluginRegistryResult =
   | { kind: 'npm-network'; spec: string; error: string }
   | { kind: 'path-ok'; spec: string; absolutePath: string }
   | { kind: 'path-missing'; spec: string; absolutePath: string }
-  | { kind: 'path-unreadable'; spec: string; absolutePath: string };
+  | { kind: 'path-unreadable'; spec: string; absolutePath: string }
+  | { kind: 'git-ok'; spec: string };
 
 export type ConfigSources = {
   /** `legacy` marks a file OpenCode still decodes through its v1 path. */
@@ -735,10 +741,11 @@ const readConfigLayers = (workingDirectory?: string) => {
 
   return {
     userConfig: userLayer.config,
+    userOverrideConfig: userOverrideLayer.config,
     projectConfig: projectLayer.config,
     customConfig: customLayer.config,
     mergedConfig,
-    paths: { userPath, projectPath, customPath },
+    paths: { userPath, userOverridePath, projectPath, customPath },
     layerErrors,
   };
 };
@@ -761,6 +768,51 @@ const getAncestors = (startDir?: string, stopDir?: string): string[] => {
   }
 
   return result;
+};
+
+const realPathOrResolved = (filePath: string): string => {
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    return path.resolve(filePath);
+  }
+};
+
+const isFile = (filePath: string): boolean => {
+  try {
+    return fs.statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Every config file OpenCode 2 finds by walking up from the project folder to
+ * the filesystem root, lowest priority first, as `ConfigDiscovery.discover`
+ * and `Config.load` order them: each folder's `opencode.json` then
+ * `opencode.jsonc`, outermost folder first, followed by each folder's
+ * `.opencode/opencode.json(c)` in the same order. The global config files are
+ * left out, and there is no walk when the project folder is the global config
+ * folder itself. The web runtime reads them the same way.
+ */
+const getFolderConfigPaths = (workingDirectory?: string): string[] => {
+  if (!workingDirectory) return [];
+  const globalDirectory = realPathOrResolved(OPENCODE_CONFIG_DIR);
+  if (realPathOrResolved(workingDirectory) === globalDirectory) return [];
+  const globalFiles = ['opencode.json', 'opencode.jsonc']
+    .map((name) => realPathOrResolved(path.join(OPENCODE_CONFIG_DIR, name)));
+  const isGlobal = (filePath: string) => globalFiles.includes(realPathOrResolved(filePath));
+  const folders = getAncestors(workingDirectory).reverse();
+  const configFilesIn = (folder: string) => ['opencode.json', 'opencode.jsonc']
+    .map((name) => path.join(folder, name))
+    .filter((filePath) => isFile(filePath) && !isGlobal(filePath));
+  return [
+    ...folders.flatMap(configFilesIn),
+    ...folders
+      .map((folder) => path.join(folder, '.opencode'))
+      .filter((folder) => realPathOrResolved(folder) !== globalDirectory)
+      .flatMap(configFilesIn),
+  ];
 };
 
 const findWorktreeRoot = (startDir?: string): string | null => {
@@ -1035,7 +1087,7 @@ const writeConfig = (config: Record<string, unknown>, filePath: string = CONFIG_
   // A JSON round-trip normalizes the config at the write boundary: it drops
   // `undefined` values exactly like the serialized write would.
   const desired: JsonValue = JSON.parse(JSON.stringify(config));
-  fs.writeFileSync(filePath, buildConfigFileContent(desired, existingRaw, existingParse), 'utf8');
+  writeFileAtomic(filePath, buildConfigFileContent(desired, existingRaw, existingParse));
 };
 
 const codedError = (message: string, code: string): Error & { code: string } => {
@@ -1057,6 +1109,14 @@ const validatePluginSpec = (spec: unknown): string => {
     throw codedError('Plugin spec cannot contain null bytes', 'INVALID_SPEC');
   }
   return spec.trim();
+};
+
+const requireLoadablePluginSpec = (spec: string): string => {
+  const loadable = toLoadablePluginSpec(spec);
+  if (loadable === null) {
+    throw codedError(`OpenCode cannot load plugin "${spec}"`, 'UNLOADABLE_SPEC');
+  }
+  return loadable;
 };
 
 const PLUGIN_FILE_NAME_PATTERN = /^[a-z0-9][a-z0-9-_.]*\.(js|ts|mjs|cjs)$/;
@@ -1130,6 +1190,13 @@ const serializePluginEntry = (entry: { spec?: unknown; options?: unknown }): str
 
 const isPluginPathSpec = (spec: string): boolean =>
   spec.startsWith('/') || spec.startsWith('./') || spec.startsWith('../') || spec.startsWith('~') || path.win32.isAbsolute(spec);
+
+/** How a spec loads, by the server's rule (`plugin-spec.js`): a path, a Git package, or npm. */
+const pluginParsedKind = (spec: string): PluginParsedKind => {
+  if (isPluginPathSpec(spec)) return 'path';
+  if (isGitSpec(spec)) return 'git';
+  return 'npm';
+};
 
 const parsePluginPathSpec = (spec: string, workingDirectory?: string | null): { absolutePath: string } => {
   if (spec === '~') return { absolutePath: path.resolve(os.homedir()) };
@@ -1286,7 +1353,7 @@ export const listPluginEntries = (workingDirectory?: string): PluginEntry[] => {
         spec: item.entry.package,
         scope: source.scope,
         kind: 'config',
-        parsedKind: isPluginPathSpec(item.entry.package) ? 'path' : 'npm',
+        parsedKind: pluginParsedKind(item.entry.package),
       };
       if (item.entry.options) entry.options = item.entry.options;
       entries.push(entry);
@@ -1299,7 +1366,7 @@ export const getPluginEntry = (id: string, workingDirectory?: string): PluginEnt
   listPluginEntries(workingDirectory).find((entry) => entry.id === id) || null;
 
 export const createPluginEntry = (entry: { spec?: unknown; options?: unknown; scope?: unknown }, workingDirectory?: string): void => {
-  const spec = validatePluginSpec(entry.spec);
+  const spec = requireLoadablePluginSpec(validatePluginSpec(entry.spec));
   const scope = validatePluginScope(entry.scope || 'user');
   const sources = getPluginConfigSources(workingDirectory);
   if (sources.some((source) => source.scope === scope && hasPluginSpec(readPluginArray(source.config), spec))) {
@@ -1318,7 +1385,10 @@ export const updatePluginEntry = (id: string, updates: { spec?: unknown; options
   const target = getPluginTarget(id, workingDirectory);
   if (!target) throw codedError('Plugin entry not found', 'NOT_FOUND');
   const existing = parsePluginRaw(target.plugin[target.index]);
-  const nextSpec = updates.spec === undefined ? existing.spec : validatePluginSpec(updates.spec);
+  let nextSpec = updates.spec === undefined ? existing.spec : validatePluginSpec(updates.spec);
+  // An entry already in the config keeps its spec as written; only a changed
+  // spec has to be one OpenCode loads.
+  if (nextSpec !== existing.spec) nextSpec = requireLoadablePluginSpec(nextSpec);
   const nextOptions = updates.options === undefined ? existing.options : updates.options;
   target.plugin[target.index] = serializePluginEntry({ spec: nextSpec, options: nextOptions });
   writeConfig(writePluginArray(target.config, target.plugin), target.path);
@@ -1474,7 +1544,7 @@ export const queryPluginRegistry = async (
   const npmJobs = new Map<string, string[]>();
   const malformedSpecs = new Set<string>();
   for (const spec of uniqueSpecs) {
-    if (isPluginPathSpec(spec)) continue;
+    if (pluginParsedKind(spec) !== 'npm') continue;
     const parsed = parsePluginNpmSpec(spec);
     if ('malformed' in parsed) {
       malformedSpecs.add(spec);
@@ -1492,6 +1562,12 @@ export const queryPluginRegistry = async (
   for (const spec of uniqueSpecs) {
     if (malformedSpecs.has(spec)) {
       results.push({ kind: 'npm-malformed', spec, error: 'Spec syntax is malformed' });
+      continue;
+    }
+
+    // A Git package never reaches the npm registry; OpenCode resolves it itself.
+    if (pluginParsedKind(spec) === 'git') {
+      results.push({ kind: 'git-ok', spec });
       continue;
     }
 
@@ -1559,10 +1635,67 @@ export type McpConfigEntry = McpEntity & {
   legacy?: boolean;
 };
 
-const resolveMcpScopeFromPath = (layers: ReturnType<typeof readConfigLayers>, sourcePath?: string | null): AgentScope | null => {
-  if (!sourcePath) return null;
-  return sourcePath === layers.paths.projectPath ? AGENT_SCOPE.PROJECT : AGENT_SCOPE.USER;
+type McpSource = {
+  path: string;
+  config: Record<string, unknown>;
+  error: { code: string; message: string } | null;
+  required: boolean;
 };
+
+/**
+ * Every config file OpenCode 2 reads MCP servers from, lowest priority first:
+ * the global files, `OPENCODE_CONFIG`, then the files found walking up from the
+ * project folder. A later file's server replaces an earlier one of the same
+ * name, as in OpenCode's MCP config plugin. A broken global or
+ * `OPENCODE_CONFIG` file fails the lookup that reaches it; a broken folder
+ * file is skipped, as the project file always was.
+ */
+const readMcpSources = (layers: ReturnType<typeof readConfigLayers>, workingDirectory?: string): McpSource[] => {
+  const { userPath, userOverridePath, customPath } = layers.paths;
+  const required = (filePath: string, config: Record<string, unknown>): McpSource => ({
+    path: filePath,
+    config,
+    error: getLayerError(layers, filePath),
+    required: true,
+  });
+  return [
+    required(userPath, layers.userConfig),
+    ...(userOverridePath ? [required(userOverridePath, layers.userOverrideConfig)] : []),
+    ...(customPath ? [required(customPath, layers.customConfig)] : []),
+    ...getFolderConfigPaths(workingDirectory).map((filePath) => ({ path: filePath, ...readConfigLayer(filePath), required: false })),
+  ];
+};
+
+/** The file whose definition of `name` OpenCode uses, or null. */
+const findMcpSource = (sources: McpSource[], name: string) => {
+  for (const source of [...sources].reverse()) {
+    if (source.error) {
+      if (source.required) throw codedError(source.error.message, source.error.code);
+      continue;
+    }
+    const entry = readMcpEntries(source.config).get(name);
+    if (entry) {
+      return { ...source, section: entry.value, sectionKey: entry.key, legacy: entry.legacy };
+    }
+  }
+  return null;
+};
+
+const toMcpConfigEntry = (
+  name: string,
+  source: NonNullable<ReturnType<typeof findMcpSource>>,
+  workingDirectory?: string,
+): McpConfigEntry => ({
+  name,
+  ...toMcpEntity(source.section),
+  // Only the project folder's own files are "this project"; a parent
+  // folder's file reaches every project below it, like the global file.
+  scope: !source.required && getProjectConfigCandidates(workingDirectory).includes(source.path)
+    ? AGENT_SCOPE.PROJECT
+    : AGENT_SCOPE.USER,
+  sectionKey: source.sectionKey,
+  legacy: source.legacy,
+});
 
 const ensureProjectMcpConfigPath = (workingDirectory: string): string => {
   const projectConfigDir = path.join(workingDirectory, '.opencode');
@@ -1581,38 +1714,25 @@ const validateMcpName = (name: string): void => {
   }
 };
 
-/** Same precedence as `getJsonEntrySource`: custom > project > user. */
-const readMcpEntriesAcrossLayers = (layers: ReturnType<typeof readConfigLayers>) =>
-  readLayeredMcpEntries([layers.userConfig, layers.projectConfig, layers.customConfig]);
-
 export const listMcpConfigs = (workingDirectory?: string): McpConfigEntry[] => {
   const layers = readConfigLayers(workingDirectory);
-  return Array.from(readMcpEntriesAcrossLayers(layers).entries()).map(([name, entry]) => {
-    const source = getJsonEntrySource(layers, 'mcp', name);
-    return {
-      name,
-      ...toMcpEntity(entry.value),
-      scope: resolveMcpScopeFromPath(layers, source.path),
-      sectionKey: source.sectionKey,
-      legacy: Boolean(source.legacy),
-    };
+  const sources = readMcpSources(layers, workingDirectory);
+  const names = Array.from(readLayeredMcpEntries(sources.map((source) => source.config)).keys());
+  if (names.length === 0) throwIfLayerError(layers, layers.paths.userOverridePath);
+  return names.flatMap((name) => {
+    const source = findMcpSource(sources, name);
+    return source ? [toMcpConfigEntry(name, source, workingDirectory)] : [];
   });
 };
 
 export const getMcpConfig = (name: string, workingDirectory?: string): McpConfigEntry | null => {
   const layers = readConfigLayers(workingDirectory);
-  const entry = readMcpEntriesAcrossLayers(layers).get(name);
-  if (!entry) {
+  const source = findMcpSource(readMcpSources(layers, workingDirectory), name);
+  if (!source) {
+    throwIfLayerError(layers, layers.paths.userOverridePath);
     return null;
   }
-  const source = getJsonEntrySource(layers, 'mcp', name);
-  return {
-    name,
-    ...toMcpEntity(entry.value),
-    scope: resolveMcpScopeFromPath(layers, source.path),
-    sectionKey: source.sectionKey,
-    legacy: Boolean(source.legacy),
-  };
+  return toMcpConfigEntry(name, source, workingDirectory);
 };
 
 export const createMcpConfig = (
@@ -1624,8 +1744,7 @@ export const createMcpConfig = (
   validateMcpName(name);
 
   const layers = readConfigLayers(workingDirectory);
-  const source = getJsonEntrySource(layers, 'mcp', name);
-  if (source.exists) {
+  if (findMcpSource(readMcpSources(layers, workingDirectory), name)) {
     throw new Error(`MCP server "${name}" already exists`);
   }
 
@@ -1653,39 +1772,34 @@ export const createMcpConfig = (
 };
 
 /**
- * A server still stored under the v1 `mcp.<name>` key is rewritten into
- * `mcp.servers` in the same file.
+ * Edits the server in the file OpenCode reads it from, which may be a parent
+ * folder's config. A server still stored under the v1 `mcp.<name>` key is
+ * rewritten into `mcp.servers` in the same file.
  */
 export const updateMcpConfig = (name: string, updates: Record<string, unknown>, workingDirectory?: string) => {
-  const layers = readConfigLayers(workingDirectory);
-  const source = getJsonEntrySource(layers, 'mcp', name);
-  if (!source.exists) {
+  const source = findMcpSource(readMcpSources(readConfigLayers(workingDirectory), workingDirectory), name);
+  if (!source) {
     throw new Error(`MCP server "${name}" not found`);
   }
-  const targetPath = source.path || CONFIG_FILE;
-  const config = (source.config || readConfigFile(targetPath)) as Record<string, unknown>;
 
   const existing = toMcpEntity(source.section);
   const { name: _ignoredName, scope: _ignoredScope, ...updateData } = updates;
   void _ignoredName;
   void _ignoredScope;
-  writeMcpEntry(config, name, toMcpEntity({ ...existing, ...updateData }));
-  writeConfig(config, targetPath);
-  return { path: targetPath };
+  writeMcpEntry(source.config, name, toMcpEntity({ ...existing, ...updateData }));
+  writeConfig(source.config, source.path);
+  return { path: source.path };
 };
 
+/** Deletes the server from the file OpenCode reads it from. */
 export const deleteMcpConfig = (name: string, workingDirectory?: string) => {
-  const layers = readConfigLayers(workingDirectory);
-  const source = getJsonEntrySource(layers, 'mcp', name);
-  const targetPath = source.path || CONFIG_FILE;
-  const config = (source.config || readConfigFile(targetPath)) as Record<string, unknown>;
-
-  if (!deleteMcpEntry(config, name)) {
+  const source = findMcpSource(readMcpSources(readConfigLayers(workingDirectory), workingDirectory), name);
+  if (!source || !deleteMcpEntry(source.config, name)) {
     throw new Error(`MCP server "${name}" not found`);
   }
 
-  writeConfig(config, targetPath);
-  return { path: targetPath };
+  writeConfig(source.config, source.path);
+  return { path: source.path };
 };
 
 const getLayerError = (
@@ -1745,6 +1859,12 @@ const getJsonEntrySource = (
     if (project) return project;
   }
 
+  if (paths.userOverridePath) {
+    throwIfLayerError(layers, paths.userOverridePath);
+    const userOverride = found(layers.userOverrideConfig, paths.userOverridePath);
+    if (userOverride) return userOverride;
+  }
+
   throwIfLayerError(layers, paths.userPath);
   const user = found(userConfig, paths.userPath);
   if (user) return user;
@@ -1788,6 +1908,49 @@ export const setWarmingEnabled = (enabled: boolean): { changed: boolean } => {
   const target = getJsonWriteTarget(layers, AGENT_SCOPE.USER);
   const changed = writeWarmingEnabled(target.config, enabled);
   if (changed) writeConfig(target.config, target.path);
+  return { changed };
+};
+
+/** A config file to clear a skill's deny from, or null when it cannot be parsed: it is skipped, never rewritten. */
+const readConfigFileForSkillSwitch = (filePath: string) => {
+  try {
+    return readConfigFile(filePath);
+  } catch (error) {
+    console.warn(`[skills] could not read ${filePath} to switch a skill on:`, error instanceof Error ? error.message : String(error));
+    return null;
+  }
+};
+
+/**
+ * Mirror of the web server's `setSkillEnabled`
+ * (`packages/web/server/lib/opencode/skill-switch.js`): off writes an exact
+ * deny where the skill lives, on removes the exact deny from every config file
+ * OpenCode reads for the directory. Returns the files it changed.
+ */
+export const setSkillEnabled = (input: {
+  id: string;
+  enabled: boolean;
+  scope: 'user' | 'project';
+  directory?: string;
+}) => {
+  const layers = readConfigLayers(input.directory);
+
+  if (!input.enabled) {
+    const target = getJsonWriteTarget(layers, input.scope === 'project' ? AGENT_SCOPE.PROJECT : AGENT_SCOPE.USER);
+    const changed = writeSkillDisabled(target.config, input.id, true);
+    if (changed) writeConfig(target.config, target.path);
+    return { changed: changed ? [target.path] : [] };
+  }
+
+  const { userPath, userOverridePath, customPath } = layers.paths;
+  const files = [...new Set([customPath, userPath, userOverridePath, ...getFolderConfigPaths(input.directory)])]
+    .filter((filePath): filePath is string => Boolean(filePath));
+  const changed = files.filter((filePath) => {
+    const config = readConfigFileForSkillSwitch(filePath);
+    if (!config || !writeSkillDisabled(config, input.id, false)) return false;
+    writeConfig(config, filePath);
+    return true;
+  });
   return { changed };
 };
 
@@ -1874,7 +2037,7 @@ const writeMdFile = (filePath: string, frontmatter: Record<string, unknown>, bod
   );
   const yamlStr = yaml.stringify(cleanedFrontmatter);
   const content = `${`---\n${yamlStr}---\n\n${body ?? ''}`.trimEnd()}\n`;
-  fs.writeFileSync(filePath, content, 'utf8');
+  writeFileAtomic(filePath, content);
 };
 
 const readMdAgent = (mdPath: string) => {
@@ -1951,6 +2114,62 @@ export const getAgentConfig = (agentName: string, workingDirectory?: string): {
   }
 
   return { source: 'none', scope: null, path: null, legacy: false, config: {} };
+};
+
+/** Agent ids under one agents directory, nested ones as `group/name`. */
+const collectAgentIds = (dir: string, prefix: string, ids: Set<string>): void => {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      collectAgentIds(path.join(dir, entry.name), `${prefix}${entry.name}/`, ids);
+    } else if (entry.isFile() && entry.name.endsWith('.md')) {
+      ids.add(`${prefix}${entry.name.slice(0, -3)}`);
+    }
+  }
+};
+
+export type DisabledAgent = { name: string; scope: AgentScope | null; path: string | null; description?: string };
+
+/**
+ * Agents switched off with `disabled: true`, which OpenCode drops from its
+ * agent list. Mirrors `listDisabledAgents` in the web server's agents.js.
+ */
+export const listDisabledAgents = (workingDirectory?: string): DisabledAgent[] => {
+  const names = new Set<string>();
+  for (const dir of USER_AGENT_DIRS) collectAgentIds(dir, '', names);
+  if (workingDirectory) {
+    const worktreeRoot = findWorktreeRoot(workingDirectory) || path.resolve(workingDirectory);
+    for (const base of getAncestors(workingDirectory, worktreeRoot)) {
+      for (const dirName of PROJECT_AGENT_DIR_NAMES) {
+        collectAgentIds(path.join(base, '.opencode', dirName), '', names);
+      }
+    }
+  }
+  const { mergedConfig } = readConfigLayers(workingDirectory);
+  for (const sectionKey of ['agents', 'agent', 'mode']) {
+    const section = mergedConfig[sectionKey];
+    if (section && typeof section === 'object' && !Array.isArray(section)) {
+      for (const name of Object.keys(section)) names.add(name);
+    }
+  }
+
+  const disabled: DisabledAgent[] = [];
+  for (const name of [...names].sort((a, b) => a.localeCompare(b))) {
+    const entry = getAgentConfig(name, workingDirectory);
+    if (entry.config.disabled !== true) continue;
+    disabled.push({
+      name,
+      scope: entry.scope,
+      path: entry.path,
+      ...(typeof entry.config.description === 'string' ? { description: entry.config.description } : {}),
+    });
+  }
+  return disabled;
 };
 
 const writeAgentMd = (targetPath: string, entity: AgentEntity): void => {
@@ -2717,6 +2936,8 @@ export type SkillConfigSources = {
 };
 
 export type DiscoveredSkill = {
+  /** OpenCode's id, sent for built-in skills, whose path does not carry it. */
+  id?: string;
   name: string;
   path: string;
   scope: SkillScope;

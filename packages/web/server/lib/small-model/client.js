@@ -1,4 +1,5 @@
 import { OpenCode } from '@opencode/client';
+import { asNonEmptyString } from '../shared/guards.js';
 
 // The running OpenCode instance is the only transport this module has. It is
 // wired once from `server/index.js`, and re-read on every call because the
@@ -67,6 +68,10 @@ const unwrap = (payload) => (Array.isArray(payload?.data) ? payload.data : []);
  * and paying a round trip for them on every title or summary would be the
  * wrong trade. An empty array means "asked and got nothing", so callers fall
  * back to conservative defaults rather than refusing.
+ *
+ * An empty answer is not cached: OpenCode 2 answers with an empty catalog
+ * while it is still starting, and keeping that would hide every provider from
+ * the pickers until the cache expired.
  */
 export async function listModelInfos(client, directory) {
   const key = typeof directory === 'string' ? directory : '';
@@ -75,6 +80,7 @@ export async function listModelInfos(client, directory) {
   }
   try {
     const models = unwrap(await client.model.list());
+    if (models.length === 0) return models;
     modelCache = models;
     modelCacheKey = key;
     modelCacheAt = Date.now();
@@ -108,15 +114,20 @@ export async function getDefaultModelInfo(client) {
 }
 
 /**
- * The model the user configured for OpenCode's hidden `title` agent, or `null`
- * when there is none. OpenCode 2 merges `agents.title.model` and the v1
- * `small_model` (migrated onto that agent) across every config layer, and its
- * own session titles run on this model before any family scan.
+ * The model and thinking variant the user configured for OpenCode's hidden
+ * `title` agent, or `null` when there is none. OpenCode 2 merges
+ * `agents.title.model` and the v1 `small_model` (migrated onto that agent)
+ * across every config layer, and its own session titles run on this model
+ * before any family scan.
  */
 export async function getConfiguredSmallModelRef(client) {
   try {
     const { model } = (await client.agent.get({ agentID: 'title' })).data;
-    return model ? { providerID: model.providerID, modelID: model.id } : null;
+    if (!model) return null;
+    const ref = { providerID: model.providerID, modelID: model.id };
+    const variant = asNonEmptyString(model.variant);
+    if (variant) ref.variant = variant;
+    return ref;
   } catch {
     // No `title` agent (removed in config, or a cold location still loading
     // its agents) or OpenCode unreachable: nothing configured to honor.

@@ -41,58 +41,6 @@ export function matchesFuzzyQuery(
   return fuse.search(query).length > 0;
 }
 
-/**
- * Score-sorted fuzzy ranking. Strict (low threshold), prioritizes substring
- * matches (especially prefix matches), and returns the top N.
- *
- * Use this for command-palette-style result ranking where order matters more
- * than recall.
- */
-export function scoreByFuzzyQuery<T>(
-  items: T[],
-  query: string,
-  getText: (item: T) => string,
-  options?: { limit?: number; threshold?: number; noFuzzy?: boolean },
-): { item: T; score: number }[] {
-  if (!query) return items.map((item) => ({ item, score: 0 }));
-  const limit = options?.limit ?? items.length;
-  const threshold = options?.threshold ?? 0.3;
-  const noFuzzy = options?.noFuzzy ?? false;
-  const queryLower = query.toLowerCase();
-
-  const scored: { item: T; score: number }[] = [];
-  const fuzzyCandidates: { item: T; text: string }[] = [];
-
-  for (const item of items) {
-    const text = getText(item);
-    if (!text) continue;
-    const lower = text.toLowerCase();
-    const idx = lower.indexOf(queryLower);
-    if (idx === 0) {
-      scored.push({ item, score: -1 });
-      continue;
-    }
-    if (idx > 0) {
-      scored.push({ item, score: idx / 1000 });
-      continue;
-    }
-    if (!noFuzzy) fuzzyCandidates.push({ item, text });
-  }
-
-  if (fuzzyCandidates.length > 0) {
-    const fuse = new Fuse(
-      fuzzyCandidates.map((c) => c.text),
-      { threshold, ignoreLocation: true, distance: 100, includeScore: true, minMatchCharLength: 2 },
-    );
-    for (const result of fuse.search(query)) {
-      scored.push({ item: fuzzyCandidates[result.refIndex].item, score: result.score ?? 1 });
-    }
-  }
-
-  scored.sort((a, b) => a.score - b.score);
-  return scored.slice(0, limit);
-}
-
 const RANK_TOKEN_MISS = Number.POSITIVE_INFINITY;
 
 const tokenizeRankQuery = (query: string): string[] =>
@@ -121,6 +69,9 @@ const buildRankFields = (texts: ReadonlyArray<string | null | undefined>): RankF
  * callers should order `getTexts` by importance (name before path/description).
  */
 const scoreRankToken = (token: string, { fields, compact }: RankFields): number => {
+  // A token with no alphanumerics compacts to '', and every field contains ''.
+  // Without this guard a "..." query would score a hit on every item.
+  const compactToken = compactText(token);
   let best = RANK_TOKEN_MISS;
   for (let fieldIndex = 0; fieldIndex < fields.length; fieldIndex++) {
     const field = fields[fieldIndex];
@@ -132,8 +83,8 @@ const scoreRankToken = (token: string, { fields, compact }: RankFields): number 
     } else if (idx > 0) {
       const boundary = !/[a-z0-9]/.test(field[idx - 1]);
       score = (boundary ? 0.1 : 0.2) + idx / 1000 + fieldPenalty;
-    } else {
-      const compactIdx = compact[fieldIndex].indexOf(compactText(token));
+    } else if (compactToken.length > 0) {
+      const compactIdx = compact[fieldIndex].indexOf(compactToken);
       if (compactIdx >= 0 && token.length > 1) {
         score = 0.4 + compactIdx / 1000 + fieldPenalty;
       }

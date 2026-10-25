@@ -24,6 +24,25 @@ describe('GitLab provider mappers', () => {
       ...projectPayload,
       ssh_url_to_repo: 'git@gitlab.example.com:other/repo.git',
     }, identity)).toBeNull();
+    expect(mapGitLabProject({
+      ...projectPayload,
+      ssh_url_to_repo: 'git@gitlab-ssh.example.net:other/repo.git',
+    }, identity)).toBeNull();
+    expect(mapGitLabProject({
+      ...projectPayload,
+      ssh_url_to_repo: 'https://gitlab-ssh.example.net/group/team/repo.git',
+    }, identity)).toBeNull();
+    expect(mapGitLabProject({ ...projectPayload, ssh_url_to_repo: 42 }, identity)).toBeNull();
+  });
+
+  it('accepts an SSH clone host that differs from the web address', () => {
+    for (const sshUrl of ['git@gitlab-ssh.example.net:group/team/repo.git', 'ssh://git@gitlab-ssh.example.net:2222/group/team/repo.git']) {
+      expect(mapGitLabProject({
+        ...projectPayload,
+        http_url_to_repo: 'https://gitlab.example.com/group/team/repo.git',
+        ssh_url_to_repo: sshUrl,
+      }, identity)).toMatchObject({ id: '7', cloneUrl: 'https://gitlab.example.com/group/team/repo.git', sshUrl });
+    }
   });
 
   it('maps issues without confusing incidents or malformed entries', () => {

@@ -1,47 +1,11 @@
 import express from 'express';
-import { constants as fsConstants } from 'node:fs';
 import { mintOutsideFileGrant } from '../fs/routes.js';
 import { unwrapOpenCodeResponse } from '../opencode/response-envelope.js';
-
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
-const MAX_IMAGE_SOURCES = 12;
+import { fitRenderPageImages, renderPageImageSources } from '../openchamber-control/render-page.js';
+import { isString } from '../shared/guards.js';
+import { inspectLocalImage } from './inspect-image.js';
 
 const asString = (value) => typeof value === 'string' ? value.trim() : '';
-
-const isWithin = (target, root, path) => {
-  const relative = path.relative(root, target);
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
-};
-
-const parseFileSource = (source) => {
-  if (/^file:\/\//i.test(source)) {
-    try {
-      const url = new URL(source);
-      if (url.protocol !== 'file:' || (url.host && url.host !== 'localhost')) return '';
-      const pathname = decodeURIComponent(url.pathname);
-      return /^\/[A-Za-z]:\//.test(pathname) ? pathname.slice(1) : pathname;
-    } catch {
-      return '';
-    }
-  }
-  const pathname = source.split(/[?#]/, 1)[0] || '';
-  try {
-    return decodeURIComponent(pathname);
-  } catch {
-    return pathname;
-  }
-};
-
-const hasImageSignature = (bytes) => {
-  if (bytes.length >= 8
-    && bytes[0] === 0x89 && bytes.subarray(1, 4).toString('ascii') === 'PNG'
-    && bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) return true;
-  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return true;
-  const header = bytes.subarray(0, 12).toString('ascii');
-  return header.startsWith('GIF87a')
-    || header.startsWith('GIF89a')
-    || (header.startsWith('RIFF') && header.slice(8, 12) === 'WEBP');
-};
 
 const normalizeReferenceLabel = (value) => value.trim().replace(/\s+/g, ' ').toLowerCase();
 
@@ -134,7 +98,7 @@ const parseDefinitionDestination = (value) => {
  * one a single `text`. Both are read here, because an image link can come from
  * either side of the conversation.
  */
-const messageTextParts = (message) => {
+const messageContent = (message) => {
   if (Array.isArray(message?.content)) return message.content;
   if (typeof message?.text === 'string') return [{ type: 'text', text: message.text }];
   return [];
@@ -142,7 +106,7 @@ const messageTextParts = (message) => {
 
 const collectMarkdownLinesOutsideCode = (message) => {
   const lines = [];
-  for (const part of messageTextParts(message)) {
+  for (const part of messageContent(message)) {
     if (part?.type !== 'text' || typeof part.text !== 'string') continue;
     let fence = null;
     for (const line of part.text.split('\n')) {
@@ -203,6 +167,33 @@ const markdownImageSources = (message) => {
   return sources;
 };
 
+/**
+ * The message's openchamber_render pages, by tool call id. The page's HTML is
+ * the call's input, which OpenCode stores with the message, so it authorizes
+ * its paths the way assistant text does. The input is either the page itself
+ * or, for a call made through the action form, its `parameters`.
+ */
+const renderPages = (message) => {
+  const pages = new Map();
+  for (const part of messageContent(message)) {
+    if (part?.type !== 'tool' || part.name !== 'openchamber_render') continue;
+    const input = part.state?.input;
+    const html = input?.parameters?.html ?? input?.html;
+    // A stored tool item's `id` is its call id: the chat's `callID` is this
+    // field (projectToolPart in packages/ui/src/lib/opencode/projection.ts).
+    if (isString(html)) pages.set(part.id, html);
+  }
+  return pages;
+};
+
+const renderPageSources = (message) => {
+  const sources = new Set();
+  for (const html of renderPages(message).values()) {
+    for (const source of renderPageImageSources(html)) sources.add(source);
+  }
+  return sources;
+};
+
 const fetchMessage = async ({ sessionId, messageId, directory, buildOpenCodeUrl, getOpenCodeAuthHeaders }) => {
   const url = new URL(buildOpenCodeUrl(
     `/api/session/${encodeURIComponent(sessionId)}/message/${encodeURIComponent(messageId)}`,
@@ -225,68 +216,31 @@ const fetchMessage = async ({ sessionId, messageId, directory, buildOpenCodeUrl,
   return message && typeof message === 'object' && typeof message.id === 'string' ? message : null;
 };
 
-const inspectImage = async ({ source, directory, approvedTempRoot, fsPromises, path }) => {
-  const parsed = parseFileSource(source);
-  if (!parsed) return { status: 'error' };
-  const sourcePath = path.isAbsolute(parsed) ? parsed : path.resolve(directory, parsed);
-  const workspaceRoot = path.resolve(directory);
-  const outsideWorkspace = !isWithin(path.resolve(sourcePath), workspaceRoot, path);
-  const root = outsideWorkspace ? approvedTempRoot : workspaceRoot;
-
-  try {
-    // Resolve symlinks before comparing roots; lexical prefixes are not an authorization boundary.
-    const [canonicalRoot, canonicalPath] = await Promise.all([
-      fsPromises.realpath(root),
-      fsPromises.realpath(sourcePath),
-    ]);
-    if (!isWithin(canonicalPath, canonicalRoot, path)) return { status: 'error' };
-    const handle = await fsPromises.open(canonicalPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    try {
-      const stats = await handle.stat();
-      if (!stats.isFile() || stats.size > MAX_IMAGE_BYTES) return { status: 'error' };
-      const header = Buffer.alloc(12);
-      const { bytesRead } = await handle.read(header, 0, header.length, 0);
-      if (!hasImageSignature(header.subarray(0, bytesRead))) return { status: 'error' };
-      return {
-        status: 'ready',
-        path: outsideWorkspace ? canonicalPath : path.resolve(sourcePath),
-        outsideWorkspace,
-      };
-    } finally {
-      await handle.close();
-    }
-  } catch (error) {
-    if (error?.code === 'ENOENT') return { status: 'missing' };
-    if (error?.code === 'EACCES' || error?.code === 'EPERM' || error?.code === 'ELOOP') {
-      return { status: 'error' };
-    }
-    throw error;
-  }
-};
-
 export const registerMarkdownImageGrantRoutes = (app, dependencies) => {
   const {
     fsPromises,
     path,
-    os,
     crypto,
     validateDirectoryPath,
     buildOpenCodeUrl,
     getOpenCodeAuthHeaders,
-    approvedTempRoot = path.join(os.tmpdir(), 'opencode'),
   } = dependencies;
 
   app.post(
     '/api/openchamber/sessions/:sessionId/markdown-image-grants',
-    express.json({ limit: '32kb' }),
+    // A drawn page may name hundreds of local images (the page itself takes up
+    // to 200 000 characters), and the chat asks for all of them in one body.
+    express.json({ limit: '256kb' }),
     async (req, res) => {
       const sessionId = asString(req.params.sessionId);
       const messageId = asString(req.body?.messageId);
       const sources = Array.isArray(req.body?.sources)
         ? [...new Set(req.body.sources.map(asString).filter(Boolean))]
         : [];
-      if (!sessionId || !messageId || sources.length === 0 || sources.length > MAX_IMAGE_SOURCES) {
-        return res.status(400).json({ error: 'sessionId, messageId, and 1-12 sources are required' });
+      // The page the sources belong to, when the chat draws an openchamber_render page.
+      const callId = asString(req.body?.callId);
+      if (!sessionId || !messageId || sources.length === 0) {
+        return res.status(400).json({ error: 'sessionId, messageId, and sources are required' });
       }
       const validatedDirectory = await validateDirectoryPath(asString(req.body?.directory));
       if (!validatedDirectory.ok) {
@@ -305,22 +259,29 @@ export const registerMarkdownImageGrantRoutes = (app, dependencies) => {
         if (!message || message.id !== messageId || message.type !== 'assistant') {
           return res.status(404).json({ error: 'Assistant message not found' });
         }
-        // Assistant text is authoritative: a remote client cannot mint grants for unreferenced paths.
-        const referenced = markdownImageSources(message);
+        const inspect = (source) => inspectLocalImage({
+          source,
+          directory: validatedDirectory.directory,
+          fsPromises,
+          path,
+        }).catch(() => ({ status: 'error' }));
+        // The assistant's text and pages are authoritative: a remote client cannot mint grants for unreferenced paths.
+        // A page's images are checked together, so the page shows them in its own order up to its weight budget.
+        let check;
+        if (callId) {
+          const html = renderPages(message).get(callId);
+          if (html === undefined) return res.status(404).json({ error: 'Page not found' });
+          const { images } = await fitRenderPageImages(html, inspect);
+          const checked = new Map(images.map((image) => [image.source, image]));
+          check = (source) => checked.get(source) ?? { status: 'error' };
+        } else {
+          const referenced = new Set([...markdownImageSources(message), ...renderPageSources(message)]);
+          check = (source) => (referenced.has(source) ? inspect(source) : { status: 'error' });
+        }
         const results = [];
         for (const source of sources) {
-          if (!referenced.has(source)) {
-            results.push({ source, status: 'error' });
-            continue;
-          }
           try {
-            const inspected = await inspectImage({
-              source,
-              directory: validatedDirectory.directory,
-              approvedTempRoot,
-              fsPromises,
-              path,
-            });
+            const inspected = await check(source);
             if (inspected.status !== 'ready') {
               results.push({ source, status: inspected.status });
               continue;

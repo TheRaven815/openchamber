@@ -47,7 +47,7 @@ describe('explicit remote transport configuration', () => {
     credentialRevision: 3,
     providerUserId: 'github.com#42',
     status: 'valid',
-    accessToken: 'canary-private-token',
+    secret: 'canary-private-token',
   };
   const accountReference = () => createHttpsCredentialReference({
     provider: account.provider,
@@ -378,6 +378,16 @@ describe('explicit remote transport configuration', () => {
     expect([...files.values()].join('')).not.toContain('canary-private-token');
   });
 
+  it('refuses a selected credential whose provider user belongs to another instance', async () => {
+    const { service, input, store } = await setup({
+      readTransportAccount: vi.fn(async () => ({ ...resolvedAccount, providerUserId: 'ghe.example.com#42' })),
+    });
+    const { unverifiedConfirmed: _confirmation, ...authority } = input;
+    await expect(service.configureTransportBinding({ ...authority, transport: 'https', credentialAccount: account }))
+      .rejects.toThrow('Selected credential account is unavailable');
+    expect(await store.read(context.repositoryId)).toEqual({ revision: 0, binding: null });
+  });
+
   it('removes one exact committed remote grant while preserving providers, siblings, auxiliary grants, and credentials', async () => {
     const { service, input, readTransportAccount } = await setup();
     const credentialId = accountReference();
@@ -498,7 +508,7 @@ describe('explicit remote transport configuration', () => {
     resolveTransportRepository.mockResolvedValue({ ...context, remotes: [origin] });
     const selectedCredential = {
       id: selectedAccount.accountId, credentialId: selectedAccount.accountId, credentialRevision: 4,
-      providerUserId: 'https://gitlab.example:8443#42', status: 'valid', token: 'private-gitlab-token',
+      providerUserId: 'https://gitlab.example:8443#42', status: 'valid', secret: 'private-gitlab-token',
     };
     readTransportAccount.mockResolvedValue(selectedCredential);
     const { unverifiedConfirmed: _confirmation, ...authority } = input;
@@ -911,6 +921,30 @@ describe('source-control binding service', () => {
       transportMode: 'managed', credentialId: 'credential_one',
       transportRevision: 'transport_one',
     });
+  });
+
+  it('names the providers whose ready association uses the remote as its primary remote', async () => {
+    const association = (provider, primaryRemote, readiness = 'ready') => ({
+      provider, instance: 'https://review.example.com', accountId: `${provider}-account`, primaryRemote, readiness,
+      endpoint: repository.remotes[0].fetch,
+    });
+    const binding = {
+      repositoryId: 'repo_one', revision: 3, state: 'bound', configRevision: 'config_one', auxiliary: [],
+      providers: [association('gitea', 'origin'), association('gitlab', 'origin', 'account-unavailable'), association('github', 'upstream')],
+      remotes: [{
+        name: 'origin', fetch: repository.remotes[0].fetch, push: repository.remotes[0].push,
+        mode: 'managed', credentialId: 'credential_one', readiness: 'ready',
+      }],
+    };
+    const service = createBindingService({
+      store: { read: vi.fn(async () => ({ revision: 3, binding })), compareAndSwap: vi.fn() },
+      resolveRepository: async () => repository,
+      resolveTransportRepository: async () => transportRepository,
+    });
+    await expect(service.validateGitTransportContext({
+      directory: '/repository', repositoryId: 'repo_one', bindingRevision: 3,
+      configRevision: 'config_one', remote: 'origin', endpointKind: 'push',
+    })).resolves.toMatchObject({ primaryOf: ['gitea'] });
   });
 
   it('requires an exact auxiliary path grant and returns only its endpoint credential', async () => {
@@ -1453,5 +1487,31 @@ describe('source-control binding service', () => {
       accountId: 'account-one',
     })).resolves.toEqual([{ revision: 2 }]);
     expect(reconcileAccount).toHaveBeenCalledWith({ provider, instance: normalizedInstance, accountId: 'account-one' });
+  });
+});
+
+describe('binding readiness summary', () => {
+  const remote = (name, url) => {
+    const endpoint = { displayUrl: redactRemoteUrl(url), fingerprint: fingerprintRemoteUrl(url) };
+    return { name, fetch: endpoint, push: endpoint };
+  };
+  const origin = remote('origin', 'git@github.com:team/repo.git');
+  const binding = {
+    repositoryId: 'repo_one', revision: 3, state: 'bound', configRevision: 'config_one', providers: [], auxiliary: [],
+    remotes: [{ ...origin, mode: 'system', readiness: 'ready' }],
+  };
+  const repository = (remotes) => ({ repositoryId: 'repo_one', configRevision: 'config_two', bare: false, remotes });
+
+  it('stays bound when a remote is only added beside the bound ones', () => {
+    const read = resolveBindingReadiness(binding, repository([origin, remote('fork', 'git@github.com:someone/repo.git')]));
+    expect(read.state).toBe('bound');
+    expect(read.remotes[0].readiness).toBe('ready');
+  });
+
+  it('needs attention when a bound remote is repointed or removed', () => {
+    const repointed = resolveBindingReadiness(binding, repository([remote('origin', 'https://github.com/team/repo.git')]));
+    expect(repointed.state).toBe('needs-attention');
+    expect(repointed.remotes[0].readiness).toBe('config-changed');
+    expect(resolveBindingReadiness(binding, repository([])).state).toBe('needs-attention');
   });
 });

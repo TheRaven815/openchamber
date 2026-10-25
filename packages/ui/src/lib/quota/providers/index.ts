@@ -1,6 +1,6 @@
 import type { QuotaProviderId } from '@/types';
 
-export interface QuotaProviderMeta {
+interface QuotaProviderMeta {
   id: QuotaProviderId;
   name: string;
 }
@@ -12,6 +12,7 @@ export const QUOTA_PROVIDERS: QuotaProviderMeta[] = [
   { id: 'cursor', name: 'Cursor' },
   { id: 'github-copilot', name: 'GitHub Copilot' },
   { id: 'google', name: 'Google' },
+  { id: 'antigravity', name: 'Antigravity' },
   { id: 'kimi-for-coding', name: 'Kimi for Coding' },
   { id: 'nano-gpt', name: 'NanoGPT' },
   { id: 'openrouter', name: 'OpenRouter' },

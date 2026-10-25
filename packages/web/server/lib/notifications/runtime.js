@@ -1,7 +1,16 @@
 import { unwrapOpenCodeResponse } from '../opencode/response-envelope.js';
 import { createSessionActivityProbe } from '../opencode/session-activity.js';
 import { isEnterpriseMode } from '../enterprise-mode.js';
+import { truncateNotificationText } from './message.js';
+import {
+  defaultNotificationTemplates,
+  notificationTexts,
+  renderNotificationText,
+  withTemplateDefaults,
+} from './template-locales.js';
 
+/** The session id OpenCode gives an MCP elicitation form, which no session owns. */
+const LOCATION_SCOPED_FORM_SESSION_ID = 'global';
 
 export const createNotificationTriggerRuntime = (deps) => {
   const {
@@ -22,15 +31,31 @@ export const createNotificationTriggerRuntime = (deps) => {
     // OpenChamber's own session metadata (the goal lives there, not on the
     // OpenCode record). Optional: without it no goal can suppress a push.
     readSessionMetadata = null,
+    // `(spaceId) => fetch` for a session of an isolated space, whose record and messages only
+    // the OpenCode inside that space has; null while the feature is off.
+    spaceFetchFor = () => null,
   } = deps;
   let getIsSessionAutoAccepting = deps.getIsSessionAutoAccepting;
-  const activityProbe = createSessionActivityProbe({ buildOpenCodeUrl, getOpenCodeAuthHeaders, timeoutMs: 2000 });
+  // Where a session is read: the host's OpenCode for its own sessions, the OpenCode inside the
+  // space for a session of a space. The host's OpenCode does not know a space's session, so it
+  // is never asked about one; a space that cannot be asked answers nothing.
+  const hostSource = { buildOpenCodeUrl, getOpenCodeAuthHeaders, fetchImpl: (...args) => fetch(...args) };
+  const unreachableSpaceFetch = async () => { throw new Error('isolated spaces are off'); };
+  const sourceFor = (spaceId) => (spaceId
+    ? {
+        buildOpenCodeUrl: (fetchPath) => `http://space${fetchPath}`,
+        getOpenCodeAuthHeaders: () => ({}),
+        fetchImpl: spaceFetchFor(spaceId) ?? unreachableSpaceFetch,
+      }
+    : hostSource);
+  const hostActivityProbe = createSessionActivityProbe({ ...hostSource, timeoutMs: 2000 });
 
   // A parent goes idle while a background subagent still works; OpenCode then
   // hands the result back and the parent runs again. That first idle is a
   // pause, so it announces nothing. When the check cannot be made, the idle is
   // announced as before: a missed "ready" is worse than an early one.
-  const isPausedForSubagents = async (sessionId) => {
+  const isPausedForSubagents = async (sessionId, spaceId) => {
+    const activityProbe = spaceId ? createSessionActivityProbe({ ...sourceFor(spaceId), timeoutMs: 2000 }) : hostActivityProbe;
     const statuses = await activityProbe.fetchActiveSessionStatuses();
     if (!statuses) return false;
     return (await activityProbe.hasWorkingChildren(sessionId, statuses)) === true;
@@ -49,10 +74,9 @@ export const createNotificationTriggerRuntime = (deps) => {
   // (ready + question + permission are different tags), so counting sessionIds
   // both over- and under-counts the lock-screen stack; counting tags mirrors it.
   //
-  // We deliberately do NOT derive this from the live attention snapshot
-  // (needsAttention/isViewed): that machinery is for in-app indicators on
-  // connected clients — a backgrounded client stays "viewing", and needsAttention
-  // is set by a separate session.status event that races the push trigger. The
+  // We deliberately do NOT derive this from the in-app unread marks (OpenCode's
+  // `time.viewed`): a backgrounded client can still be on the session, and the
+  // mark changes on a separate event that races the push trigger. The
   // set is cleared when a UI client reports visible (`clearPendingPushBadge`),
   // the same moment the device zeroes its icon badge on becomeActive.
   const pendingPushTags = new Set();
@@ -67,7 +91,8 @@ export const createNotificationTriggerRuntime = (deps) => {
   };
 
   // Generic notification for native push (per the mobile design): a fixed, scenario-based
-  // title + the session name as the body. No model/project/message content crosses the relay.
+  // title + the session name as the body. No model/project/message content crosses the relay
+  // in the clear; a phone with a push key gets what happened sealed (`sealed` below).
   const APNS_TITLE_BY_TYPE = {
     ready: 'Agent response is ready',
     error: 'Agent hit an error',
@@ -82,18 +107,38 @@ export const createNotificationTriggerRuntime = (deps) => {
 
   const toApnsGenericPayload = (payload) => {
     const data = payload?.data && typeof payload.data === 'object' ? payload.data : {};
-    const sessionName = typeof data.sessionName === 'string' && data.sessionName.trim().length > 0
-      ? data.sessionName.trim()
-      : 'Session';
+    const knownSessionName = typeof data.sessionName === 'string' ? data.sessionName.trim() : '';
+    const sessionName = knownSessionName || 'Session';
+    const phoneBody = payload?.phoneBody ?? '';
     return {
       title: genericTitleOf(payload),
       // A session name is derived from the conversation.
       body: isEnterpriseMode() ? '' : sessionName,
+      // A phone with a push key opens this on the device; the relay and the
+      // push service see only the title above. Enterprise mode keeps the
+      // generic text even sealed: the push service is outside its boundary.
+      sealed: phoneBody && !isEnterpriseMode()
+        ? { title: knownSessionName || genericTitleOf(payload), body: phoneBody }
+        : undefined,
       badge: trackPushAndCountBadge(typeof payload?.tag === 'string' ? payload.tag : undefined),
       tag: payload?.tag,
       // sessionId is forwarded so a tapped push can deep-link; it is an opaque id, not content.
       data: typeof data.sessionId === 'string' ? { sessionId: data.sessionId } : undefined,
     };
+  };
+
+  // The body a phone shows: what happened, after a word that says which kind
+  // of event it is. A finished turn needs no word, its reply says it.
+  const phoneBodyOf = (prefix, text) => {
+    const detail = truncateNotificationText((text ?? '').trim());
+    if (!detail) return '';
+    return prefix ? `${prefix}: ${detail}` : detail;
+  };
+
+  const PERMISSION_PREFIX_BY_ACTION = {
+    bash: 'Wants to run',
+    edit: 'Wants to edit',
+    read: 'Wants to read',
   };
 
   // Fan a notification out to every delivery channel: browser web-push (full templated
@@ -109,7 +154,7 @@ export const createNotificationTriggerRuntime = (deps) => {
     return { ...payload, title: genericTitleOf(payload), body: '', data: rest };
   };
 
-  const fanoutPush = (payload, options) => {
+  const fanoutPush = ({ phoneBody, ...payload }, options) => {
     // Presence-aware routing: if any interactive (non-mobile) client — desktop/web/vscode — is
     // currently visible, it already shows the in-app notification, so skip the native push to the
     // phone. Gated on the desktop's visibility (reliable), never the phone's own. When we skip we
@@ -121,7 +166,7 @@ export const createNotificationTriggerRuntime = (deps) => {
       }),
       interactiveVisible
         ? Promise.resolve()
-        : Promise.resolve(sendApnsToAllUiSessions?.(toApnsGenericPayload(payload), options)).catch((error) => {
+        : Promise.resolve(sendApnsToAllUiSessions?.(toApnsGenericPayload({ ...payload, phoneBody }), options)).catch((error) => {
             console.warn('[APNs] fanout failed:', error?.message ?? error);
           }),
     ]);
@@ -169,10 +214,10 @@ export const createNotificationTriggerRuntime = (deps) => {
     return `/?session=${encodeURIComponent(sessionId)}`;
   };
 
-  const getSessionParentCacheKey = (sessionId, directory) => `${directory || ''}\0${sessionId}`;
+  const getSessionParentCacheKey = (sessionId, directory, spaceId) => `${spaceId || ''}\0${directory || ''}\0${sessionId}`;
 
-  const getCachedSessionParentId = (sessionId, directory) => {
-    const cacheKey = getSessionParentCacheKey(sessionId, directory);
+  const getCachedSessionParentId = (sessionId, directory, spaceId) => {
+    const cacheKey = getSessionParentCacheKey(sessionId, directory, spaceId);
     const entry = sessionParentIdCache.get(cacheKey);
     if (!entry) return undefined;
     if (Date.now() - entry.at > SESSION_PARENT_CACHE_TTL_MS) {
@@ -182,8 +227,8 @@ export const createNotificationTriggerRuntime = (deps) => {
     return entry.parentID;
   };
 
-  const setCachedSessionParentId = (sessionId, directory, parentID) => {
-    sessionParentIdCache.set(getSessionParentCacheKey(sessionId, directory), { parentID: parentID ?? null, at: Date.now() });
+  const setCachedSessionParentId = (sessionId, directory, spaceId, parentID) => {
+    sessionParentIdCache.set(getSessionParentCacheKey(sessionId, directory, spaceId), { parentID: parentID ?? null, at: Date.now() });
   };
 
   const getParentIdFromPayload = (payload) => {
@@ -242,48 +287,51 @@ export const createNotificationTriggerRuntime = (deps) => {
     return merged;
   };
 
-  const maybeCacheSessionParentFromPayload = (payload) => {
+  const maybeCacheSessionParentFromPayload = (payload, spaceId) => {
     const sessionId = extractSessionIdFromPayload(payload);
     if (typeof sessionId !== 'string' || sessionId.length === 0) return;
     const directory = extractDirectoryFromPayload(payload);
     const parentID = getParentIdFromPayload(payload);
     if (parentID === undefined) return;
-    setCachedSessionParentId(sessionId, directory, parentID);
+    setCachedSessionParentId(sessionId, directory, spaceId, parentID);
   };
 
-  const fetchSessionParentId = async (sessionId, directory) => {
-    if (!sessionId) return undefined;
-
-    const cached = getCachedSessionParentId(sessionId, directory);
-    if (cached !== undefined) return cached;
-
+  /** The session's own record, or null when it could not be read. */
+  const fetchSessionRecord = async (sessionId, directory, spaceId) => {
     try {
-      const base = buildOpenCodeUrl(`/api/session/${encodeURIComponent(sessionId)}`, '');
-      const url = directory ? `${base}?directory=${encodeURIComponent(directory)}` : base;
-      const response = await fetch(url, {
+      const source = sourceFor(spaceId);
+      const base = source.buildOpenCodeUrl(`/api/session/${encodeURIComponent(sessionId)}`, '');
+      // The space's own OpenCode finds its session by id; a directory names the host's instance.
+      const url = directory && !spaceId ? `${base}?directory=${encodeURIComponent(directory)}` : base;
+      const response = await source.fetchImpl(url, {
         method: 'GET',
         headers: {
           Accept: 'application/json',
-          ...getOpenCodeAuthHeaders(),
+          ...source.getOpenCodeAuthHeaders(),
         },
         signal: AbortSignal.timeout(2000),
       });
-      if (!response.ok) {
-        return undefined;
-      }
+      if (!response.ok) return null;
       const session = unwrapOpenCodeResponse(await response.json().catch(() => null));
-      if (!session || typeof session !== 'object') {
-        return undefined;
-      }
-
-      const parentID = typeof session.parentID === 'string' && session.parentID.length > 0
-        ? session.parentID
-        : null;
-      setCachedSessionParentId(sessionId, directory, parentID);
-      return parentID;
+      return session && typeof session === 'object' ? session : null;
     } catch {
-      return undefined;
+      return null;
     }
+  };
+
+  const fetchSessionParentId = async (sessionId, directory, spaceId = null) => {
+    if (!sessionId) return undefined;
+
+    const cached = getCachedSessionParentId(sessionId, directory, spaceId);
+    if (cached !== undefined) return cached;
+
+    const session = await fetchSessionRecord(sessionId, directory, spaceId);
+    if (!session) return undefined;
+    const parentID = typeof session.parentID === 'string' && session.parentID.length > 0
+      ? session.parentID
+      : null;
+    setCachedSessionParentId(sessionId, directory, spaceId, parentID);
+    return parentID;
   };
 
   // Mirrors client-side autoRespondsPermission: a session auto-accepts if it
@@ -300,6 +348,24 @@ export const createNotificationTriggerRuntime = (deps) => {
       current = parent;
     }
     return false;
+  };
+
+  // v2 replaced questions with forms: the form's title is the ask, and the
+  // first field carries the detail a question used to put in its body.
+  const readFormAsk = (payload) => {
+    const form = payload.properties?.form;
+    const header = typeof form?.title === 'string' ? form.title.trim() : '';
+    const firstField = Array.isArray(form?.fields) ? form.fields[0] : null;
+    const fieldTitle = typeof firstField?.title === 'string' ? firstField.title.trim() : '';
+    const fieldDescription = typeof firstField?.description === 'string' ? firstField.description.trim() : '';
+    return { header, questionText: fieldDescription || fieldTitle };
+  };
+
+  // A waiting page's title says what it asks; the notification title stays
+  // the generic "Input needed".
+  const readPageAsk = (payload) => {
+    const title = payload.properties?.page?.title;
+    return { header: '', questionText: typeof title === 'string' ? title.trim() : '' };
   };
 
   const extractSessionIdFromPayload = (payload) => {
@@ -362,10 +428,13 @@ export const createNotificationTriggerRuntime = (deps) => {
   // A session with an ACTIVE goal suppresses per-turn ready notifications;
   // the session-goal runtime sends its own notification when the goal
   // settles. Fetch failures fall through to normal notification behavior.
-  const hasActiveSessionGoal = async (sessionId) => {
-    if (!sessionId || typeof readSessionMetadata !== 'function') return false;
+  // A space's session keeps its metadata in its record inside the space.
+  const hasActiveSessionGoal = async (sessionId, spaceId) => {
+    if (!sessionId || (!spaceId && typeof readSessionMetadata !== 'function')) return false;
     try {
-      const metadata = await readSessionMetadata(sessionId);
+      const metadata = spaceId
+        ? (await fetchSessionRecord(sessionId, undefined, spaceId))?.metadata
+        : await readSessionMetadata(sessionId);
       const goal = metadata?.openchamber?.goal;
       return Boolean(goal && typeof goal === 'object' && goal.status === 'active');
     } catch {
@@ -373,12 +442,14 @@ export const createNotificationTriggerRuntime = (deps) => {
     }
   };
 
-  const maybeSendPushForTrigger = async (payload) => {
+  /** `spaceId` marks an event of an isolated space: its session is read inside that space. */
+  const maybeSendPushForTrigger = async (payload, { spaceId = null } = {}) => {
     if (!payload || typeof payload !== 'object') {
       return;
     }
 
-    maybeCacheSessionParentFromPayload(payload);
+    maybeCacheSessionParentFromPayload(payload, spaceId);
+    const source = sourceFor(spaceId);
 
     const sessionId = extractSessionIdFromPayload(payload);
     const notificationDirectory = extractDirectoryFromPayload(payload);
@@ -389,7 +460,7 @@ export const createNotificationTriggerRuntime = (deps) => {
     }
 
     if ((payload.type === 'session.idle' || payload.type === 'session.error') && sessionId) {
-      if (payload.type === 'session.idle' && await isPausedForSubagents(sessionId)) {
+      if (payload.type === 'session.idle' && await isPausedForSubagents(sessionId, spaceId)) {
         return;
       }
       const error = payload.properties?.error;
@@ -411,7 +482,7 @@ export const createNotificationTriggerRuntime = (deps) => {
             ...(errorText ? { parts: [{ type: 'text', text: errorText }] } : {}),
           },
         },
-      });
+      }, { spaceId });
       return;
     }
 
@@ -429,7 +500,7 @@ export const createNotificationTriggerRuntime = (deps) => {
           const parentIDFromPayload = getParentIdFromPayload(payload);
           const parentID = parentIDFromPayload
             ? parentIDFromPayload
-            : await fetchSessionParentId(sessionId, notificationDirectory);
+            : await fetchSessionParentId(sessionId, notificationDirectory, spaceId);
 
           if (parentID !== null) {
             return;
@@ -443,7 +514,7 @@ export const createNotificationTriggerRuntime = (deps) => {
         // While a goal drives the session, per-turn "ready" notifications are
         // noise produced by the goal loop itself — the goal's own settle
         // notification (complete/blocked/budget) is the final word instead.
-        if (await hasActiveSessionGoal(sessionId)) {
+        if (await hasActiveSessionGoal(sessionId, spaceId)) {
           return;
         }
 
@@ -458,30 +529,40 @@ export const createNotificationTriggerRuntime = (deps) => {
         }
         lastReadyNotificationAt.set(sessionId, now);
 
-        let title = `${formatMode(info?.mode)} agent is ready`;
-        let body = `${formatModelId(info?.modelID)} completed the task`;
+        const texts = notificationTexts(settings.locale);
+        let title = renderNotificationText(texts.readyTitle, {
+          agent_name: formatMode(info?.mode),
+        });
+        let body = renderNotificationText(texts.readyMessage, {
+          model_name: formatModelId(info?.modelID),
+        });
         let sessionName = '';
+        let reply = '';
 
         try {
           const templates = settings.notificationTemplates || {};
-          const isSubtask = await fetchSessionParentId(sessionId, notificationDirectory);
-          const completionTemplate = isSubtask && settings.notifyOnSubtasks !== false
-            ? (templates.subtask || templates.completion || { title: '{agent_name} is ready', message: '{model_name} completed the task' })
-            : (templates.completion || { title: '{agent_name} is ready', message: '{model_name} completed the task' });
+          const defaults = defaultNotificationTemplates(settings.locale);
+          const isSubtask = await fetchSessionParentId(sessionId, notificationDirectory, spaceId);
+          const usesSubtaskTemplate = Boolean(isSubtask) && settings.notifyOnSubtasks !== false;
+          const completionTemplate = withTemplateDefaults(
+            usesSubtaskTemplate ? (templates.subtask ?? templates.completion) : templates.completion,
+            usesSubtaskTemplate ? defaults.subtask : defaults.completion,
+          );
 
-          const variables = await buildTemplateVariables(payload, sessionId);
+          const variables = await buildTemplateVariables(payload, sessionId, source);
           sessionName = typeof variables.session_name === 'string' ? variables.session_name : sessionName;
 
           const messageId = info?.id;
           let lastMessage = extractLastMessageText(payload);
           if (!lastMessage) {
-            lastMessage = await fetchLastAssistantMessageText(sessionId, messageId);
+            lastMessage = await fetchLastAssistantMessageText(sessionId, messageId, undefined, source);
           }
 
           variables.last_message = await prepareNotificationLastMessage({
             message: lastMessage,
             settings,
           });
+          reply = variables.last_message;
 
           const resolvedTitle = resolveNotificationTemplate(completionTemplate.title, variables);
           const resolvedBody = resolveNotificationTemplate(completionTemplate.message, variables);
@@ -509,6 +590,7 @@ export const createNotificationTriggerRuntime = (deps) => {
           {
             title,
             body,
+            phoneBody: phoneBodyOf('', reply),
             tag: `ready-${sessionId}`,
             data: {
               url: buildSessionDeepLinkUrl(sessionId),
@@ -534,25 +616,31 @@ export const createNotificationTriggerRuntime = (deps) => {
           return;
         }
 
-        let title = 'Tool error';
-        let body = 'An error occurred';
+        const texts = notificationTexts(settings.locale);
+        let title = texts.errorTitle;
+        let body = texts.errorBody;
         let sessionName = '';
+        let errorText = '';
 
         try {
-          const variables = await buildTemplateVariables(payload, sessionId);
+          const variables = await buildTemplateVariables(payload, sessionId, source);
           sessionName = typeof variables.session_name === 'string' ? variables.session_name : sessionName;
           const errorMessageId = info?.id;
           let lastMessage = extractLastMessageText(payload);
           if (!lastMessage) {
-            lastMessage = await fetchLastAssistantMessageText(sessionId, errorMessageId);
+            lastMessage = await fetchLastAssistantMessageText(sessionId, errorMessageId, undefined, source);
           }
 
           variables.last_message = await prepareNotificationLastMessage({
             message: lastMessage,
             settings,
           });
+          errorText = variables.last_message;
 
-          const errorTemplate = (settings.notificationTemplates || {}).error || { title: 'Tool error', message: '{last_message}' };
+          const errorTemplate = withTemplateDefaults(
+            (settings.notificationTemplates || {}).error,
+            defaultNotificationTemplates(settings.locale).error,
+          );
           const resolvedTitle = resolveNotificationTemplate(errorTemplate.title, variables);
           const resolvedBody = resolveNotificationTemplate(errorTemplate.message, variables);
           if (resolvedTitle) title = resolvedTitle;
@@ -579,6 +667,7 @@ export const createNotificationTriggerRuntime = (deps) => {
           {
             title,
             body,
+            phoneBody: phoneBodyOf('Error', errorText),
             tag: `error-${sessionId}`,
             data: {
               url: buildSessionDeepLinkUrl(sessionId),
@@ -594,7 +683,13 @@ export const createNotificationTriggerRuntime = (deps) => {
       return;
     }
 
-    if (payload.type === 'form.created' && sessionId) {
+    // A form, and a page an agent shows that waits for the user's answer
+    // (render.page with awaitAnswer, announced by this server), both mean the
+    // agent waits for the user, so they notify the same way.
+    const ask = payload.type === 'form.created' ? readFormAsk(payload)
+      : payload.type === 'openchamber:page-waiting' ? readPageAsk(payload)
+        : null;
+    if (ask && sessionId) {
       const existingTimer = pushQuestionDebounceTimers.get(sessionId);
       if (existingTimer) {
         clearTimeout(existingTimer);
@@ -612,30 +707,31 @@ export const createNotificationTriggerRuntime = (deps) => {
           return;
         }
 
-        // v2 replaced questions with forms: the form's title is the ask, and
-        // the first field carries the detail a question used to put in its body.
-        const form = payload.properties?.form;
-        const header = typeof form?.title === 'string' ? form.title.trim() : '';
-        const firstField = Array.isArray(form?.fields) ? form.fields[0] : null;
-        const fieldTitle = typeof firstField?.title === 'string' ? firstField.title.trim() : '';
-        const fieldDescription = typeof firstField?.description === 'string' ? firstField.description.trim() : '';
-        const questionText = fieldDescription || fieldTitle;
+        const { header, questionText } = ask;
+        // An MCP elicitation belongs to the whole directory: OpenCode files it
+        // under the `global` sentinel, which no session record carries, so the
+        // notification opens the app instead of a session that cannot load.
+        const formSessionId = sessionId === LOCATION_SCOPED_FORM_SESSION_ID ? undefined : sessionId;
 
+        const texts = notificationTexts(settings.locale);
         let title = /plan\s*mode/i.test(header)
-          ? 'Switch to plan mode'
+          ? texts.planModeTitle
           : /build\s*agent/i.test(header)
-            ? 'Switch to build mode'
-            : header || 'Input needed';
-        let body = questionText || 'Agent is waiting for your response';
+            ? texts.buildModeTitle
+            : header || texts.questionTitle;
+        let body = questionText || texts.questionBody;
         let sessionName = '';
 
         try {
-          const variables = await buildTemplateVariables(payload, sessionId);
+          const variables = await buildTemplateVariables(payload, formSessionId, source);
           sessionName = typeof variables.session_name === 'string' ? variables.session_name : sessionName;
           variables.last_message = questionText || header || '';
 
           const templates = settings.notificationTemplates || {};
-          const questionTemplate = templates.question || { title: 'Input needed', message: '{last_message}' };
+          const questionTemplate = withTemplateDefaults(
+            templates.question,
+            defaultNotificationTemplates(settings.locale).question,
+          );
 
           const resolvedTitle = resolveNotificationTemplate(questionTemplate.title, variables);
           const resolvedBody = resolveNotificationTemplate(questionTemplate.message, variables);
@@ -651,7 +747,7 @@ export const createNotificationTriggerRuntime = (deps) => {
             title,
             body,
             tag: `question-${sessionId}`,
-            sessionId,
+            sessionId: formSessionId,
             directory: notificationDirectory,
             requireHidden: settings.notificationMode !== 'always',
           };
@@ -663,10 +759,11 @@ export const createNotificationTriggerRuntime = (deps) => {
           {
             title,
             body,
+            phoneBody: phoneBodyOf('Question', questionText || header),
             tag: `question-${sessionId}`,
             data: {
-              url: buildSessionDeepLinkUrl(sessionId),
-              sessionId,
+              url: buildSessionDeepLinkUrl(formSessionId),
+              sessionId: formSessionId,
               sessionName,
               type: 'question',
             },
@@ -708,6 +805,9 @@ export const createNotificationTriggerRuntime = (deps) => {
       const permissionMessage = typeof payload.properties?.message === 'string' ? payload.properties.message.trim() : '';
       const permission = permissionMessage
         || (permissionAction && permissionResource ? `${permissionAction}: ${permissionResource}` : permissionAction);
+      const permissionPhoneBody = PERMISSION_PREFIX_BY_ACTION[permissionAction] && permissionResource
+        ? phoneBodyOf(PERMISSION_PREFIX_BY_ACTION[permissionAction], permissionResource)
+        : phoneBodyOf('Wants permission', permission);
       const requestKey = typeof requestId === 'string' ? `${sessionId}:${requestId}` : null;
       if (requestKey && notifiedPermissionRequests.has(requestKey)) {
         return;
@@ -715,9 +815,11 @@ export const createNotificationTriggerRuntime = (deps) => {
 
       // The session (or an ancestor) answers permissions by itself. Skip the
       // notification when this request was answered automatically; one the
-      // safety net held for the user still notifies.
-      if (await (getIsSessionAutoAccepting?.(sessionId, notificationDirectory, requestId)
-        ?? isSessionAutoAccepting(sessionId, notificationDirectory))) {
+      // safety net held for the user still notifies. The host's permission
+      // policy knows nothing of a space's session, so it is not asked about one.
+      const isAutoAnswered = async () => !spaceId && await (getIsSessionAutoAccepting?.(sessionId, notificationDirectory, requestId)
+        ?? isSessionAutoAccepting(sessionId, notificationDirectory));
+      if (await isAutoAnswered()) {
         if (requestKey) notifiedPermissionRequests.add(requestKey);
         return;
       }
@@ -730,8 +832,7 @@ export const createNotificationTriggerRuntime = (deps) => {
       const timer = setTimeout(async () => {
         pushPermissionDebounceTimers.delete(sessionId);
 
-        if (await (getIsSessionAutoAccepting?.(sessionId, notificationDirectory, requestId)
-          ?? isSessionAutoAccepting(sessionId, notificationDirectory))) {
+        if (await isAutoAnswered()) {
           if (requestKey) notifiedPermissionRequests.add(requestKey);
           return;
         }
@@ -748,21 +849,29 @@ export const createNotificationTriggerRuntime = (deps) => {
 
         const sessionTitle = payload.properties?.sessionTitle;
         const permissionText = typeof permission === 'string' && permission.length > 0 ? permission : '';
-        const fallbackMessage = typeof sessionTitle === 'string' && sessionTitle.trim().length > 0
-          ? sessionTitle.trim()
-          : permissionText || 'Agent is waiting for your approval';
+        const texts = notificationTexts(settings.locale);
+        // What the agent wants to do decides the answer, so it comes before the session name.
+        const fallbackMessage = permissionText
+          || (typeof sessionTitle === 'string' && sessionTitle.trim().length > 0 ? sessionTitle.trim() : '')
+          || texts.permissionBody;
 
-        let title = 'Permission required';
+        let title = texts.permissionTitle;
         let body = fallbackMessage;
         let sessionName = '';
 
         try {
-          const variables = await buildTemplateVariables(payload, sessionId);
+          const variables = await buildTemplateVariables(payload, sessionId, source);
           sessionName = typeof variables.session_name === 'string' ? variables.session_name : sessionName;
           variables.last_message = fallbackMessage;
 
           const templates = settings.notificationTemplates || {};
-          const questionTemplate = templates.question || { title: 'Permission required', message: '{last_message}' };
+          // Permissions reuse the question template (as they always have), but
+          // an empty field falls back to the permission wording, not to "input".
+          const questionDefaults = defaultNotificationTemplates(settings.locale).question;
+          const questionTemplate = withTemplateDefaults(
+            templates.question,
+            { ...questionDefaults, title: texts.permissionTitle },
+          );
 
           const resolvedTitle = resolveNotificationTemplate(questionTemplate.title, variables);
           const resolvedBody = resolveNotificationTemplate(questionTemplate.message, variables);
@@ -794,6 +903,7 @@ export const createNotificationTriggerRuntime = (deps) => {
           {
             title,
             body,
+            phoneBody: permissionPhoneBody,
             tag: `permission-${sessionId}`,
             data: {
               url: buildSessionDeepLinkUrl(sessionId),
@@ -835,6 +945,7 @@ export const createNotificationTriggerRuntime = (deps) => {
       {
         title,
         body,
+        phoneBody: phoneBodyOf(title, body) || title,
         tag: `goal-${sessionId}`,
         data: {
           url: buildSessionDeepLinkUrl(sessionId),

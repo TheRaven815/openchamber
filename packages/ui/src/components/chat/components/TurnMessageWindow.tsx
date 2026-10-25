@@ -1,61 +1,22 @@
 import React from 'react';
 
+import { useUIStore } from '@/stores/useUIStore';
 import type { ChatMessageEntry } from '../lib/turns/types';
+import { ActivityRowSkipContext, activityRowParts } from '../lib/turns/activityRows';
 import {
-    TURN_MESSAGE_REVEAL_CHUNK,
+    TURN_ROW_REVEAL_CHUNK,
     TurnMessageWindowContext,
     FULL_MESSAGE_WINDOW,
     initialMessageWindow,
+    resolveMountedMessages,
     shouldHoldRevealAnchor,
     type TurnMessageWindowRange,
 } from '../lib/turns/turnMessageWindow';
+import { CHAT_SCROLLER_SELECTOR, holdAnchor } from '../lib/scroll/holdAnchor';
 
-// Stands in for a not yet mounted message until it mounts and measures.
-const ESTIMATED_MESSAGE_HEIGHT_PX = 64;
-const CHAT_SCROLLER_SELECTOR = '[data-scrollbar="chat"]';
-
-// Not wheel: a trackpad sends wheel events for as long as a scroll and its
-// momentum last, so a wheel-ended hold lasted one frame and the list's later
-// correction threw the reader by the whole batch. The hold is two frames.
-const READER_INPUT_EVENTS = ['touchstart', 'pointerdown', 'keydown'] as const;
-
+// Stands in for a not yet mounted row until it mounts and measures.
+const ESTIMATED_ROW_HEIGHT_PX = 40;
 const subscribeNowhere = () => () => {};
-
-/**
- * Keeps the message the reader is looking at where it was across a batch
- * mount. The list measures the grown row after this commit and, anchored to
- * a visible row it can have cached from before the reader scrolled into this
- * turn, may move the viewport by the same amount a second time. Observed
- * after the list's own measurement, the resize check puts the message back
- * before that frame paints; the frame checks cover a later correction. Touch,
- * pointer or key input ends the hold at once.
- */
-const holdAnchor = (scroller: Element, element: Element, top: number): (() => void) => {
-    const align = () => {
-        if (!element.isConnected) return;
-        const delta = element.getBoundingClientRect().top - top;
-        if (Math.abs(delta) > 0.5) scroller.scrollTop += delta;
-    };
-    const resizeObserver = new ResizeObserver(align);
-    let frame: number | null = null;
-    const stop = () => {
-        resizeObserver.disconnect();
-        if (frame !== null) cancelAnimationFrame(frame);
-        frame = null;
-        for (const type of READER_INPUT_EVENTS) scroller.removeEventListener(type, stop);
-    };
-    align();
-    resizeObserver.observe(element.closest('[data-turn-id]') ?? element);
-    for (const type of READER_INPUT_EVENTS) scroller.addEventListener(type, stop, { passive: true });
-    frame = requestAnimationFrame(() => {
-        align();
-        frame = requestAnimationFrame(() => {
-            align();
-            stop();
-        });
-    });
-    return stop;
-};
 
 /**
  * Mounts the next batch once a spacer comes within a viewport of the
@@ -78,7 +39,7 @@ const useSpacerReveal = (
             const view = scroller.getBoundingClientRect();
             const rect = spacer.getBoundingClientRect();
             const onScreen = rect.bottom > view.top && rect.top < view.bottom;
-            reveal(onScreen ? 0 : Math.max(0, hidden - TURN_MESSAGE_REVEAL_CHUNK));
+            reveal(onScreen ? 0 : Math.max(0, hidden - TURN_ROW_REVEAL_CHUNK));
         }, { root: scroller, rootMargin: '100% 0px' });
         observer.observe(spacer);
         return () => observer.disconnect();
@@ -92,21 +53,33 @@ interface TurnMessageWindowProps {
 }
 
 /**
- * A turn's assistant messages, with the steps of a long turn outside its
+ * A turn's assistant messages, with the rows of a long turn outside its
  * window held behind spacers until they come near the viewport (see
  * turnMessageWindow). Mounting a batch above the reader keeps the message
  * they were looking at still.
  */
 export function TurnMessageWindow({ turnId, messages, renderMessage }: TurnMessageWindowProps) {
     const store = React.useContext(TurnMessageWindowContext);
-    const [initialRange] = React.useState(() => store?.range(turnId) ?? initialMessageWindow(messages.length));
+    const outerRowSkip = React.useContext(ActivityRowSkipContext);
+    const showReasoningTraces = useUIStore((state) => state.showReasoningTraces);
+    // Rows a folded live activity already skips (its trim cuts into its first
+    // shown message) are not rows of this window.
+    const rowsPerMessage = React.useMemo(
+        () => messages.map((message) => {
+            const rows = activityRowParts(message.parts, showReasoningTraces).length;
+            return outerRowSkip?.messageId === message.info.id ? Math.max(0, rows - outerRowSkip.rows) : rows;
+        }),
+        [messages, outerRowSkip, showReasoningTraces],
+    );
+    const [initialRange] = React.useState(() => store?.range(turnId)
+        ?? initialMessageWindow(rowsPerMessage.reduce((total, rows) => total + rows, 0)));
     const storedRange = React.useSyncExternalStore(
         store?.subscribe ?? subscribeNowhere,
         () => store?.range(turnId),
     );
     const range: TurnMessageWindowRange = store ? storedRange ?? initialRange : FULL_MESSAGE_WINDOW;
-    const hiddenHead = Math.min(range.hiddenHead, messages.length);
-    const hiddenTail = Math.min(range.hiddenTail, messages.length - hiddenHead);
+    const mounted = resolveMountedMessages(rowsPerMessage, range);
+    const { hiddenHeadRows, hiddenTailRows } = mounted;
 
     const headSpacerRef = React.useRef<HTMLDivElement | null>(null);
     const tailSpacerRef = React.useRef<HTMLDivElement | null>(null);
@@ -149,31 +122,49 @@ export function TurnMessageWindow({ turnId, messages, renderMessage }: TurnMessa
         const scroller = anchor.element.closest(CHAT_SCROLLER_SELECTOR);
         if (!scroller) return;
         return holdAnchor(scroller, anchor.element, anchor.top);
-    }, [hiddenHead]);
+    }, [hiddenHeadRows]);
 
-    useSpacerReveal(headSpacerRef, hiddenHead, revealHead);
-    useSpacerReveal(tailSpacerRef, hiddenTail, revealTail);
+    useSpacerReveal(headSpacerRef, hiddenHeadRows, revealHead);
+    useSpacerReveal(tailSpacerRef, hiddenTailRows, revealTail);
 
-    const visibleMessages = hiddenHead > 0 || hiddenTail > 0
-        ? messages.slice(hiddenHead, messages.length - hiddenTail)
+    const visibleMessages = mounted.headMessages > 0 || mounted.tailMessages > 0
+        ? messages.slice(mounted.headMessages, messages.length - mounted.tailMessages)
         : messages;
+    // The message the head cuts into skips its first rows, after any the outer
+    // trim skips there. Every message sits in a provider, so the one that
+    // stops being cut into keeps its tree.
+    const cutMessageId = mounted.headSkipRows > 0 ? visibleMessages[0]?.info.id : undefined;
+    const outerSkipOfCut = outerRowSkip && outerRowSkip.messageId === cutMessageId ? outerRowSkip.rows : 0;
+    const headRowSkip = React.useMemo(
+        () => (cutMessageId ? { messageId: cutMessageId, rows: outerSkipOfCut + mounted.headSkipRows } : null),
+        [cutMessageId, mounted.headSkipRows, outerSkipOfCut],
+    );
     return (
         <>
-            {hiddenHead > 0 ? (
+            {hiddenHeadRows > 0 ? (
                 <div
                     ref={headSpacerRef}
                     aria-hidden="true"
                     data-turn-message-spacer="head"
-                    style={{ height: hiddenHead * ESTIMATED_MESSAGE_HEIGHT_PX }}
+                    // Navigation reads it: that message's top is not its start.
+                    data-turn-message-cut={headRowSkip?.messageId}
+                    style={{ height: hiddenHeadRows * ESTIMATED_ROW_HEIGHT_PX }}
                 />
             ) : null}
-            {visibleMessages.map((message) => renderMessage(message))}
-            {hiddenTail > 0 ? (
+            {visibleMessages.map((message) => (
+                <ActivityRowSkipContext.Provider
+                    key={message.info.id}
+                    value={headRowSkip && message.info.id === headRowSkip.messageId ? headRowSkip : outerRowSkip}
+                >
+                    {renderMessage(message)}
+                </ActivityRowSkipContext.Provider>
+            ))}
+            {hiddenTailRows > 0 ? (
                 <div
                     ref={tailSpacerRef}
                     aria-hidden="true"
                     data-turn-message-spacer="tail"
-                    style={{ height: hiddenTail * ESTIMATED_MESSAGE_HEIGHT_PX }}
+                    style={{ height: hiddenTailRows * ESTIMATED_ROW_HEIGHT_PX }}
                 />
             ) : null}
         </>

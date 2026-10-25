@@ -6,7 +6,9 @@ import {
   DEFAULT_PLANS_DIR,
   EMPTY_SHARED_PROJECT_CONFIG,
   SHARED_CONFIG_RELATIVE_PATH,
+  SHARED_SETUP_KEYS,
   applySharedProjectSetupPatch,
+  defineOwnEntry,
   isSharedProjectConfigEmpty,
   mergeProjectSetup,
   parseSharedProjectConfig,
@@ -38,7 +40,7 @@ const clampLength = (value, maxLength) => {
 };
 
 const normalizeStatus = (value) => {
-  if (value === 'running' || value === 'success' || value === 'error' || value === 'idle') {
+  if (value === 'running' || value === 'success' || value === 'error' || value === 'idle' || value === 'queued' || value === 'sent' || value === 'skipped' || value === 'failed' || value === 'cancelled') {
     return value;
   }
   return 'idle';
@@ -218,7 +220,7 @@ const normalizeSchedule = (value, existingSchedule) => {
   return { kind, cron, timezone };
 };
 
-const normalizeExecution = (value) => {
+const normalizeExecution = (value, targetSessionId) => {
   if (!value || typeof value !== 'object') {
     throw new Error('execution is required');
   }
@@ -230,6 +232,9 @@ const normalizeExecution = (value) => {
   const agent = asNonEmptyString(value.agent);
   const goalEnabled = value.goalEnabled === true;
   const permissionAutoAccept = value.permissionAutoAccept === true;
+  // Model, thinking level and agent come from the session defaults at run
+  // time; the stored ones are kept only for when this is turned off.
+  const useDefaults = value.useDefaults === true;
   const goalTokenBudget = typeof value.goalTokenBudget === 'number'
     && Number.isFinite(value.goalTokenBudget)
     && value.goalTokenBudget > 0
@@ -239,17 +244,18 @@ const normalizeExecution = (value) => {
   if (!prompt) {
     throw new Error('execution.prompt is required');
   }
-  if (!providerID) {
+  if (!useDefaults && !targetSessionId && !providerID) {
     throw new Error('execution.providerID is required');
   }
-  if (!modelID) {
+  if (!useDefaults && !targetSessionId && !modelID) {
     throw new Error('execution.modelID is required');
   }
+  if (targetSessionId && Boolean(providerID) !== Boolean(modelID)) throw new Error('execution providerID and modelID are required together');
 
   return {
     prompt,
-    providerID,
-    modelID,
+    ...(providerID && modelID ? { providerID, modelID } : {}),
+    ...(useDefaults ? { useDefaults: true } : {}),
     ...(variant ? { variant } : {}),
     ...(agent ? { agent } : {}),
     ...(goalEnabled ? { goalEnabled: true } : {}),
@@ -333,7 +339,10 @@ const normalizeTaskForStorage = (value, options) => {
     : (existingTask?.enabled ?? true);
 
   const schedule = normalizeSchedule(value.schedule, existingTask?.schedule);
-  const execution = normalizeExecution(value.execution);
+  const targetSessionId = asNonEmptyString(value.targetSessionId);
+  if (value.targetSessionId != null && value.targetSessionId !== '' && !targetSessionId) throw new Error('targetSessionId is invalid');
+  if (targetSessionId && !/^[A-Za-z0-9_-]{4,128}$/.test(targetSessionId)) throw new Error('targetSessionId is invalid');
+  const execution = normalizeExecution(value.execution, targetSessionId);
 
   // Loop provenance: absolute path of the `.agents/loops/*.md` file driving
   // this task, when any. Preserved on every write so the scheduler can detect
@@ -348,7 +357,7 @@ const normalizeTaskForStorage = (value, options) => {
     updatedAt: refreshUpdatedAt ? nowMs : baseState.updatedAt ?? nowMs,
   };
 
-  return {
+  const storedTask = {
     id,
     name,
     enabled,
@@ -357,6 +366,8 @@ const normalizeTaskForStorage = (value, options) => {
     state,
     ...(loopFile ? { loopFile } : {}),
   };
+  if (targetSessionId) storedTask.targetSessionId = targetSessionId;
+  return storedTask;
 };
 
 // `loopApprovals`: loop file path -> fingerprint of the version the user
@@ -865,12 +876,16 @@ export const createProjectConfigRuntime = (deps) => {
       // A project loop comes with the repository: `enabled: true` in its file
       // is the author's suggestion. It runs here only once the user enabled
       // this version of it on this machine (see setLoopApproval); a change to
-      // what it runs or when needs a new approval.
-      loops = loops.map((loop) => (
-        loop?.scope === 'project' && loop.definition?.enabled === true && approvals[loop.filePath] !== loop.fingerprint
-          ? { ...loop, definition: { ...loop.definition, enabled: false } }
-          : loop
-      ));
+      // what it runs or when needs a new approval. The returned task says
+      // which of the two held it back (`loopApproval`); it is never stored.
+      const heldBack = new Map();
+      loops = loops.map((loop) => {
+        if (loop?.scope !== 'project' || loop.definition?.enabled !== true || approvals[loop.filePath] === loop.fingerprint) {
+          return loop;
+        }
+        heldBack.set(loop.filePath, approvals[loop.filePath] ? 'outdated' : 'required');
+        return { ...loop, definition: { ...loop.definition, enabled: false } };
+      });
 
       const activeLoopFilePaths = new Set();
       const pendingLoops = new Map();
@@ -967,7 +982,9 @@ export const createProjectConfigRuntime = (deps) => {
         scheduledTasks: toStoredTasks(current, nextTasks, { replacedIDs }),
       });
 
-      return nextTasks;
+      return nextTasks.map((task) => (
+        task.loopFile && heldBack.has(task.loopFile) ? { ...task, loopApproval: heldBack.get(task.loopFile) } : task
+      ));
     });
   };
 
@@ -1001,9 +1018,9 @@ export const createProjectConfigRuntime = (deps) => {
   );
   const sharedConfigPathOf = (projectPath) => path.join(projectPath, ...SHARED_CONFIG_RELATIVE_PATH.split('/'));
 
-  const readSharedProjectConfig = async (projectID, personalRaw) => {
-    const projectPath = projectPathOf(projectID, personalRaw);
-    if (!projectPath) return { status: 'missing' };
+  // A missing file is `missing`; one that cannot be read or parsed is
+  // `invalid` with a reason, never "no shared setup".
+  const readSharedProjectFile = async (projectPath) => {
     let raw;
     try {
       raw = await fsPromises.readFile(sharedConfigPathOf(projectPath), 'utf8');
@@ -1012,6 +1029,43 @@ export const createProjectConfigRuntime = (deps) => {
       return { status: 'invalid', reason: error instanceof Error ? error.message : String(error) };
     }
     return parseSharedProjectConfig(raw);
+  };
+
+  const readSharedProjectConfig = async (projectID, personalRaw) => {
+    const projectPath = projectPathOf(projectID, personalRaw);
+    if (!projectPath) return { status: 'missing' };
+    return readSharedProjectFile(projectPath);
+  };
+
+  const assertProjectCheckout = async (projectPath) => {
+    if (!projectPath) throw new Error('project checkout not found');
+    try {
+      if (!(await fsPromises.stat(projectPath)).isDirectory()) throw new Error('project checkout not found');
+    } catch {
+      throw new Error('project checkout not found');
+    }
+  };
+
+  // Replace the shared file through a unique temporary sibling, so a failed
+  // write or rename leaves the previous bytes in place and no temporary file.
+  // An empty result removes the file, and the `.openchamber` folder when that
+  // leaves it empty.
+  const writeSharedProjectFile = async (projectPath, text) => {
+    const filePath = sharedConfigPathOf(projectPath);
+    if (text === null) {
+      await fsPromises.rm(filePath, { force: true });
+      await fsPromises.rmdir(path.dirname(filePath)).catch(() => {});
+      return;
+    }
+    await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
+    const temporaryPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    try {
+      await fsPromises.writeFile(temporaryPath, text, 'utf8');
+      await fsPromises.rename(temporaryPath, filePath);
+    } catch (error) {
+      await fsPromises.rm(temporaryPath, { force: true }).catch(() => {});
+      throw error;
+    }
   };
 
   const mergedProjectSetupOf = async (projectID, personalRaw) => (
@@ -1046,31 +1100,19 @@ export const createProjectConfigRuntime = (deps) => {
     withProjectWriteLock(projectID, async () => {
       const personalRaw = await readRawProjectConfigFromDisk(projectID);
       const projectPath = projectPathOf(projectID, personalRaw);
-      if (!projectPath) throw new Error('project checkout not found');
-      try {
-        if (!(await fsPromises.stat(projectPath)).isDirectory()) throw new Error('project checkout not found');
-      } catch {
-        throw new Error('project checkout not found');
-      }
+      await assertProjectCheckout(projectPath);
       const currentRead = await readSharedProjectConfig(projectID, personalRaw);
       const current = currentRead.status === 'ok' ? currentRead.config : EMPTY_SHARED_PROJECT_CONFIG;
+      // Keys this writer does not own survive the write, and a repair of a
+      // wrongly shaped setup key too; only an unreadable, unparsable or
+      // other-version file is replaced whole.
+      const document = currentRead.document ?? {};
       const next = applySharedProjectSetupPatch(current, patch);
 
-      const filePath = sharedConfigPathOf(projectPath);
-      if (isSharedProjectConfigEmpty(next)) {
-        await fsPromises.rm(filePath, { force: true });
-        await fsPromises.rmdir(path.dirname(filePath)).catch(() => {});
-      } else {
-        await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
-        const temporaryPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-        try {
-          await fsPromises.writeFile(temporaryPath, serializeSharedProjectConfig(next), 'utf8');
-          await fsPromises.rename(temporaryPath, filePath);
-        } catch (error) {
-          await fsPromises.rm(temporaryPath, { force: true }).catch(() => {});
-          throw error;
-        }
-      }
+      await writeSharedProjectFile(
+        projectPath,
+        isSharedProjectConfigEmpty(next, document) ? null : serializeSharedProjectConfig(next, document),
+      );
 
       const hash = sharedTrustHashOf(next);
       const personalNext = { ...personalRaw };
@@ -1080,6 +1122,44 @@ export const createProjectConfigRuntime = (deps) => {
       return mergedProjectSetupOf(projectID, personalNext);
     })
   );
+
+  /**
+   * Change one key of the shared file that the setup writer does not own
+   * (Magic Prompts use `magicPrompts`), under the same lock as the setup
+   * writer. `projectPath` is the checkout the caller resolved for
+   * `projectID`; the lock is keyed by the id, so both writers of one project
+   * serialize. `mutate(current)` receives the stored value (`undefined` when
+   * absent) and returns the next one; `undefined` removes the key and the
+   * same value skips the write. The rest of the document goes back out
+   * exactly as read, so setup, `plansDir` and unknown keys keep their values
+   * and no trust record changes. A file that is unreadable, unparsable, of
+   * another version or has a wrongly shaped setup key is refused with
+   * `code: 'shared_config_invalid'` and left byte for byte; this writer
+   * never repairs. Removing the last key removes the file.
+   */
+  const updateSharedProjectEntry = async (projectID, projectPath, key, mutate) => {
+    if (SHARED_SETUP_KEYS.includes(key)) throw new Error(`${key} belongs to the shared setup writer`);
+    return withProjectWriteLock(projectID, async () => {
+      await assertProjectCheckout(projectPath);
+      const currentRead = await readSharedProjectFile(projectPath);
+      if (currentRead.status === 'invalid') {
+        throw Object.assign(new Error(`${SHARED_CONFIG_RELATIVE_PATH} is invalid: ${currentRead.reason}`), { code: 'shared_config_invalid' });
+      }
+      const document = currentRead.status === 'ok' ? currentRead.document : { version: 1 };
+      const current = Object.prototype.hasOwnProperty.call(document, key) ? document[key] : undefined;
+      const next = mutate(current);
+      if (next === current) return current;
+
+      const nextDocument = {};
+      for (const [entryKey, value] of Object.entries(document)) {
+        if (entryKey !== key) defineOwnEntry(nextDocument, entryKey, value);
+      }
+      if (next !== undefined) defineOwnEntry(nextDocument, key, next);
+      const onlyVersion = Object.keys(nextDocument).every((entryKey) => entryKey === 'version');
+      await writeSharedProjectFile(projectPath, onlyVersion ? null : `${JSON.stringify(nextDocument, null, 2)}\n`);
+      return next;
+    });
+  };
 
   /**
    * The absolute repository plans folder of a project: `plansDir` from the
@@ -1101,6 +1181,8 @@ export const createProjectConfigRuntime = (deps) => {
     readProjectSetup,
     updateProjectSetup,
     updateSharedProjectSetup,
+    readSharedProjectFile,
+    updateSharedProjectEntry,
     resolveSharedPlansDir,
     listScheduledTasks,
     upsertScheduledTask,

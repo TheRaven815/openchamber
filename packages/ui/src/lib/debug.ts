@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
+/* oxlint-disable typescript/no-explicit-any */
 import { useSessionUIStore, getRememberedSessionDirectory } from '@/sync/session-ui-store';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
 import { useProjectsStore } from '@/stores/useProjectsStore';
@@ -20,7 +20,7 @@ import { useStreamingStore } from '@/sync/streaming';
 import { runtimeFetch } from '@/lib/runtime-fetch';
 import { getRegisteredRuntimeAPIs } from '@/contexts/runtimeAPIRegistry';
 
-export interface DebugMessageInfo {
+interface DebugMessageInfo {
   messageId: string;
   role: string;
   timestamp: number;

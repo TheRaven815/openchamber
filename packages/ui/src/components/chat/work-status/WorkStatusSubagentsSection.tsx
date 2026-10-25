@@ -11,6 +11,8 @@ import { useConfigStore } from '@/stores/useConfigStore';
 import { getProviderModelDisplayName } from '@/lib/modelDisplay';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { isVSCodeRuntime } from '@/lib/desktop';
+import { normalizePath } from '@/lib/pathNormalization';
+import { spaceIdOfDirectory } from '@/lib/spaces/space-route';
 import { WorkStatusCollapsibleSection, WorkStatusRow, WorkStatusValue } from './WorkStatusPrimitives';
 import { useReportWorkStatusPresence } from './presenceContext';
 import { formatCost } from './subagentCost';
@@ -60,12 +62,22 @@ export const WorkStatusSubagentsSection: React.FC<Props> = ({ sessionId, directo
     React.useCallback((state: State) => state.sessionStatusReady, []),
     directory ?? undefined,
   );
-  // The last turn's outcome outlives the live status: a child that went idle
-  // after an error reads as failed, not done. Joined to a string so the
-  // selector stays stable while nothing about these children changes.
-  const failedChildIds = useGlobalSessionStatusStore(React.useCallback((state) => children
-    .filter((child) => state.observedById.get(child.id)?.outcome === 'failed')
-    .map((child) => child.id)
+  const statusInvalidated = useDirectorySync(
+    React.useCallback((state: State) => state.sessionStatusInvalidated, []),
+    directory ?? undefined,
+  );
+  // Every status event reaches the global store, whichever directory owns the
+  // child, so a child seen going busy and then settling is known to be idle
+  // even when the directory snapshot does not cover it. The last turn's
+  // outcome outlives the live status: a child that went idle after an error
+  // reads as failed, not done. Joined to a string so the selector stays
+  // stable while nothing about these children changes.
+  const observedChildren = useGlobalSessionStatusStore(React.useCallback((state) => children
+    .flatMap((child) => {
+      if (state.statusById.has(child.id)) return [`${child.id}\tbusy`];
+      const observed = state.observedById.get(child.id);
+      return observed ? [`${child.id}\t${observed.outcome === 'failed' ? 'failed' : 'settled'}`] : [];
+    })
     .join('\n'), [children]));
 
   const openContextPanelTab = useUIStore((state) => state.openContextPanelTab);
@@ -103,21 +115,36 @@ export const WorkStatusSubagentsSection: React.FC<Props> = ({ sessionId, directo
 
   if (children.length === 0) return null;
 
-  const failedIds = new Set(failedChildIds.split('\n'));
+  const observedById = new Map<string, string>();
+  for (const line of observedChildren.split('\n')) {
+    const [id, observed] = line.split('\t');
+    if (id && observed) observedById.set(id, observed);
+  }
+  const panelDirectory = normalizePath(directory);
+  const panelSpaceId = spaceIdOfDirectory(panelDirectory);
   const rows = children.map((child) => {
     const blocked = (permissions[child.id]?.length ?? 0) > 0;
     const asked = (forms[child.id]?.length ?? 0) > 0;
     const status = statuses[child.id]?.type;
-    const busy = status === 'busy' || status === 'retry';
-    const failed = !busy && failedIds.has(child.id);
-    const done = !failed && (status === 'idle' || (!status && statusReady && child.directory === directory));
-    return { child, blocked, asked, busy, failed, done, finished: !blocked && !asked && (done || failed) };
+    const observed = observedById.get(child.id);
+    const busy = status === 'busy' || status === 'retry' || (!status && observed === 'busy');
+    const failed = !busy && observed === 'failed';
+    // The snapshot is the server's list of running sessions: the host's for
+    // every host directory, a space's own for that space. So it also speaks
+    // for a child that moved to another worktree, never across that boundary.
+    const snapshotCovers = statusReady === true && !statusInvalidated?.[child.id]
+      && panelDirectory !== null && spaceIdOfDirectory(normalizePath(child.directory)) === panelSpaceId;
+    const done = !failed && !busy && (status === 'idle' || (!status && (snapshotCovers || observed === 'settled')));
+    const finished = !blocked && !asked && (done || failed);
+    // Blockers first, then running rows, then rows whose status is not known
+    // yet, then finished ones: an unknown row must not push a working one down.
+    const rank = blocked || asked ? 0 : busy ? 1 : finished ? 3 : 2;
+    return { child, blocked, asked, busy, failed, done, rank };
   });
-  // Newest first by creation, never by last activity: an activity order
-  // reshuffled the rows on every step, moving them under the pointer. Finished
-  // rows sink below the unfinished ones but keep the same order among
-  // themselves, so a fully finished list reads exactly as it did at launch.
-  rows.sort((left, right) => (Number(left.finished) - Number(right.finished))
+  // Newest first by creation within each rank, never by last activity: an
+  // activity order reshuffled the rows on every step, moving them under the
+  // pointer. A fully finished list reads exactly as it did at launch.
+  rows.sort((left, right) => (left.rank - right.rank)
     || ((right.child.time?.created ?? 0) - (left.child.time?.created ?? 0)));
 
   const busyChildren = rows.filter((row) => row.busy).length;
@@ -163,12 +190,12 @@ export const WorkStatusSubagentsSection: React.FC<Props> = ({ sessionId, directo
               key={child.id}
               onClick={directory ? () => openChildSession(child.id, label) : undefined}
               ariaLabel={[t('chat.workStatus.action.openSubagent', { name: label }), statusLabel].filter(Boolean).join('. ')}
-              // The smaller status glyph sits centred in the panel's 16px icon
+              // The smaller status glyph sits centred in the panel's 14px icon
               // slot, so it lines up under the section icon and the label
               // starts where every other row's does.
               leading={(
-                <span className="flex size-4 shrink-0 items-center justify-center">
-                  <Icon name={icon} className="size-3.5" style={iconColor ? { color: iconColor } : undefined} />
+                <span className="flex size-3.5 shrink-0 items-center justify-center">
+                  <Icon name={icon} className="size-3" style={iconColor ? { color: iconColor } : undefined} />
                 </span>
               )}
               label={label}

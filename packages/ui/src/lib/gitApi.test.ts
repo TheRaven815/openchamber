@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
 import type { Spy } from "bun:test"
 import type { GitAPI, GitStatus } from "./api/types"
-import { generateCommitMessage, getGitStatus, stageGitFile, stageGitFiles, unstageGitFile, unstageGitFiles } from "./gitApi"
+import { generateCommitMessage, getGitStatus, resolveGitRepositoryPrefix, stageGitFile, stageGitFiles, unstageGitFile, unstageGitFiles } from "./gitApi"
 import { switchRuntimeEndpoint } from "./runtime-switch"
 
 const status: GitStatus = {
@@ -32,6 +32,63 @@ const withRuntimeGit = async (git: Partial<GitAPI>, callback: () => Promise<void
     }
   }
 }
+
+describe("resolveGitRepositoryPrefix", () => {
+  test("asks the runtime git API when one is registered", async () => {
+    let asked = ""
+    await withRuntimeGit({
+      resolveRepositoryPrefix: async (directory: string) => {
+        asked = directory
+        return "ai"
+      },
+    }, async () => {
+      expect(await resolveGitRepositoryPrefix("/repo/ai")).toBe("ai")
+    })
+    expect(asked).toBe("/repo/ai")
+  })
+
+  // The web runtime registers a git object that predates this operation, so a
+  // registered runtime without it has to reach the server instead of failing.
+  describe("when the registered runtime git object lacks the operation", () => {
+    let request: Spy<typeof fetch>
+    const answer = (body: string): Response =>
+      new Response(body, { status: 200, headers: { "Content-Type": "application/json" } })
+
+    afterEach(() => {
+      request.mockRestore()
+    })
+
+    test("asks the server's toplevel route", async () => {
+      request = spyOn(globalThis, "fetch").mockImplementation(async () => answer('{"root":"/repo","prefix":"ai"}'))
+      switchRuntimeEndpoint({ apiBaseUrl: "https://git.test", runtimeKey: "git-api-repository-prefix" })
+
+      await withRuntimeGit({}, async () => {
+        expect(await resolveGitRepositoryPrefix("/repo/ai")).toBe("ai")
+      })
+      expect(request.mock.calls.map(([input]) => String(input)).filter((url) => url.includes("/git/toplevel"))).toEqual([
+        `https://git.test/api/git/toplevel?directory=${encodeURIComponent("/repo/ai")}`,
+      ])
+    })
+
+    test("rejects when an older server does not report the folder, instead of answering the repository root", async () => {
+      request = spyOn(globalThis, "fetch").mockImplementation(async () => answer('{"root":"/repo"}'))
+      switchRuntimeEndpoint({ apiBaseUrl: "https://git.test", runtimeKey: "git-api-repository-prefix-old" })
+
+      await withRuntimeGit({}, async () => {
+        await expect(resolveGitRepositoryPrefix("/repo/ai")).rejects.toThrow("did not report")
+      })
+    })
+
+    test("rejects a null prefix", async () => {
+      request = spyOn(globalThis, "fetch").mockImplementation(async () => answer('{"root":"/repo","prefix":null}'))
+      switchRuntimeEndpoint({ apiBaseUrl: "https://git.test", runtimeKey: "git-api-repository-prefix-null" })
+
+      await withRuntimeGit({}, async () => {
+        await expect(resolveGitRepositoryPrefix("/repo/ai")).rejects.toThrow("did not report")
+      })
+    })
+  })
+})
 
 describe("getGitStatus", () => {
   test("forwards light-mode options to runtime git APIs", async () => {
@@ -134,7 +191,7 @@ describe("generateCommitMessage diff collection", () => {
     diffRequestCount = 0
     request = spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = String(input)
-      if (url.includes("/api/git/diff")) {
+      if (url.includes("/git/diff")) {
         diffRequestCount += 1
         activeDiffRequests += 1
         peakDiffRequests = Math.max(peakDiffRequests, activeDiffRequests)
@@ -146,13 +203,13 @@ describe("generateCommitMessage diff collection", () => {
           submodule: null,
         }))
       }
-      if (url.includes("/api/git/log")) {
+      if (url.includes("/git/log")) {
         return jsonResponse(JSON.stringify({ all: [], latest: null, total: 0 }))
       }
       if (url.includes("/api/magic-prompts")) {
         return jsonResponse(JSON.stringify({ version: 1, overrides: {} }))
       }
-      if (url.includes("/api/small-model/generate")) {
+      if (url.includes("/small-model/generate")) {
         return jsonResponse(JSON.stringify({ text: '{"subject":"chore: bound diff collection","highlights":[]}' }))
       }
       if (url.includes("/auth/url-token")) {
@@ -174,5 +231,14 @@ describe("generateCommitMessage diff collection", () => {
     expect(diffRequestCount).toBe(files.length * 2)
     // Two files in flight, each issuing a staged + unstaged pair.
     expect(peakDiffRequests).toBeLessThanOrEqual(4)
+  })
+
+  test("asks the server inside the space for a repository in an isolated space", async () => {
+    await generateCommitMessage("/spaces/a1b2c3d4e5f6/repo", files.slice(0, 1))
+
+    const generateCalls = request.mock.calls
+      .filter(([input]) => String(input).includes("/small-model/generate"))
+      .map(([input, init]) => `${String(input)} ${new Headers(init?.headers).get("x-opencode-directory")}`)
+    expect(generateCalls).toEqual([`https://git.test/api/small-model/generate ${encodeURIComponent("/spaces/a1b2c3d4e5f6/repo")}`])
   })
 })

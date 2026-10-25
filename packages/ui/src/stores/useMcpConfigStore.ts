@@ -54,7 +54,7 @@ const getConfigDirectory = (): string | null => {
  * OpenCode 2 splits an MCP server's timeouts by phase, all in milliseconds.
  * `startup` only applies to a local (spawned) server.
  */
-export interface McpTimeout {
+interface McpTimeout {
   startup?: number;
   catalog?: number;
   execution?: number;
@@ -114,7 +114,7 @@ interface McpRemoteConfig extends McpConfigBase {
   oauth?: McpOAuthConfig | false;
 }
 
-export type McpServerConfig = (McpLocalConfig | McpRemoteConfig) & { name: string };
+type McpServerConfig = (McpLocalConfig | McpRemoteConfig) & { name: string };
 
 type McpServerWithScope = McpServerConfig & {
   scope?: McpScope | null;
@@ -348,7 +348,7 @@ export const useMcpConfigStore = create<McpConfigStore>()(
             };
           } catch (error) {
             console.error('[McpConfigStore] Failed to create MCP:', error);
-            return { ok: false };
+            throw error;
           }
         },
 

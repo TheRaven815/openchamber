@@ -1,3 +1,4 @@
+import { registerPlugin } from '@capacitor/core';
 import React from 'react';
 
 import { observeNativeKeyboardHeight, resetHardwareKeyboardDetection, startHardwareKeyboardBridge } from '@/lib/hardwareKeyboard';
@@ -12,6 +13,17 @@ export const isCapacitorMobileApp = (): boolean => {
   if (maybeCapacitor?.isNativePlatform?.() === true) return true;
   return window.location.protocol === 'capacitor:';
 };
+
+interface WindowLayoutPlugin {
+  get(): Promise<{ edgeToEdge: boolean }>;
+}
+
+/**
+ * Android only (WindowLayoutPlugin.java). The OS version comes from native code because
+ * hardened WebViews (GrapheneOS's Vanadium) report "Android 10" in the user agent on
+ * every release.
+ */
+const WindowLayout = registerPlugin<WindowLayoutPlugin>('WindowLayout');
 
 export const useNativeMobileChrome = (): void => {
   React.useEffect(() => {
@@ -55,7 +67,14 @@ export const useNativeMobileChrome = (): void => {
           const themeBg =
             (isDark ? localStorage.getItem('splashBgDark') : localStorage.getItem('splashBgLight')) ||
             (isDark ? '#171515' : '#fffdf4');
-          await StatusBar.setOverlaysWebView({ overlay: false }).catch(() => undefined);
+          const overlayOff = await StatusBar.setOverlaysWebView({ overlay: false }).then(() => true, () => false);
+          // Before Android 15 that call moves the WebView below the status bar natively, so
+          // the page must not reserve the strip again. Marked only once the call succeeded:
+          // until then the WebView still sits under the bar and needs the injected inset.
+          const edgeToEdge = await WindowLayout.get().then(({ edgeToEdge }) => edgeToEdge, () => true);
+          if (overlayOff && !edgeToEdge) {
+            root.classList.add('oc-android-below-status-bar');
+          }
           await StatusBar.setBackgroundColor({ color: themeBg }).catch(() => undefined);
           // Capacitor Style is named for the CONTENT: Style.Light = dark text (light bg),
           // Style.Dark = light text (dark bg). So dark theme → Style.Dark, light theme → Style.Light.
@@ -371,7 +390,7 @@ export const useNativeMobileChrome = (): void => {
       disposed = true;
       cleanup.forEach((remove) => remove());
       resetHardwareKeyboardDetection();
-      root.classList.remove('oc-capacitor-app', 'oc-keyboard-open', 'oc-kb-animating', 'oc-kb-hide', 'oc-kb-caret-hold', 'oc-platform-android');
+      root.classList.remove('oc-capacitor-app', 'oc-keyboard-open', 'oc-kb-animating', 'oc-kb-hide', 'oc-kb-caret-hold', 'oc-platform-android', 'oc-android-below-status-bar');
       root.style.removeProperty('--oc-keyboard-inset');
       root.style.removeProperty('--oc-kb-shift');
       root.style.removeProperty('--oc-kb-layout');

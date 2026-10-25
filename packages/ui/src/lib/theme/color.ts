@@ -61,6 +61,13 @@ export function onColor(background: string, canvas: string): string {
   return black !== null && white !== null && black >= white ? '#000000' : '#ffffff';
 }
 
+/** Hex form of a hex or rgb() color, keeping alpha; null for other CSS colors. */
+export function toHexColor(value: string): string | null {
+  const color = parseColor(value);
+  if (!color) return null;
+  return color.a < 1 ? `${hexColor(color)}${Math.round(color.a * 255).toString(16).padStart(2, '0')}` : hexColor(color);
+}
+
 export function withOpacity(value: string, alpha: number): string {
   const color = parseColor(value);
   return color ? `${hexColor(color)}${Math.round(alpha * 255).toString(16).padStart(2, '0')}` : `color-mix(in srgb, ${value} ${alpha * 100}%, transparent)`;
@@ -84,6 +91,28 @@ function oklab(color: Color) {
   };
 }
 
+function fromOklab(lab: { l: number; a: number; b: number }): Color {
+  const l = (lab.l + 0.3963377774 * lab.a + 0.2158037573 * lab.b) ** 3;
+  const m = (lab.l - 0.1055613458 * lab.a - 0.0638541728 * lab.b) ** 3;
+  const s = (lab.l - 0.0894841775 * lab.a - 1.291485548 * lab.b) ** 3;
+  const gamma = (v: number) => 255 * Math.min(1, Math.max(0, v <= 0.0031308 ? v * 12.92 : 1.055 * v ** (1 / 2.4) - 0.055));
+  return {
+    r: gamma(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+    g: gamma(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+    b: gamma(-0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s),
+    a: 1,
+  };
+}
+
+/** Move a surface toward an accent's hue and chroma while keeping its own
+ * perceptual lightness, so a tint adds color without becoming a brighter patch. */
+export function tintColor(accent: string, surface: string, amount: number, canvas = '#ffffff'): string {
+  const tint = parseColor(accent), base = parseColor(surface), under = parseColor(canvas);
+  if (!tint || !base || !under) return surface;
+  const x = oklab(over(base, under)), y = oklab(over(tint, under));
+  return hexColor(fromOklab({ l: x.l, a: x.a + (y.a - x.a) * amount, b: x.b + (y.b - x.b) * amount }));
+}
+
 /** Perceptual hue/chroma separation after alpha composition; brightness alone
  * must not turn two nearly identical status hues into a distinct pair. */
 export function chromaticDistance(first: string, second: string, background: string, canvas: string): number | null {
@@ -94,24 +123,11 @@ export function chromaticDistance(first: string, second: string, background: str
   return Math.hypot(x.a - y.a, x.b - y.b);
 }
 
-/** Rotate a validated color in OKLCH while retaining lightness. A neutral seed
- * starts from blue when a caller requests chroma. Clamp to the sRGB gamut. */
-export function rotateColorHue(value: string, degrees: number, minimumChroma = 0): string {
-  const parsed = parseColor(value);
-  if (!parsed) return value;
-  const lab = oklab(parsed);
-  const originalChroma = Math.hypot(lab.a, lab.b);
-  const chroma = Math.max(originalChroma, minimumChroma);
-  const hue = (originalChroma < 0.01 ? 250 * Math.PI / 180 : Math.atan2(lab.b, lab.a)) + degrees * Math.PI / 180;
-  const a = chroma * Math.cos(hue), b = chroma * Math.sin(hue);
-  const l = (lab.l + 0.3963377774 * a + 0.2158037573 * b) ** 3;
-  const m = (lab.l - 0.1055613458 * a - 0.0638541728 * b) ** 3;
-  const s = (lab.l - 0.0894841775 * a - 1.291485548 * b) ** 3;
-  const encode = (channel: number) => 255 * Math.max(0, Math.min(1, channel <= 0.0031308 ? 12.92 * channel : 1.055 * channel ** (1 / 2.4) - 0.055));
-  return hexColor({
-    r: encode(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
-    g: encode(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
-    b: encode(-0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s),
-    a: 1,
-  });
+/** Hue of a painted color; near-neutral colors have no semantic hue. */
+export function colorHue(value: string, canvas: string): number | null {
+  const color = parseColor(value), background = parseColor(canvas);
+  if (!color || !background) return null;
+  const lab = oklab(over(color, background));
+  return Math.hypot(lab.a, lab.b) < 0.025 ? null : (Math.atan2(lab.b, lab.a) * 180 / Math.PI + 360) % 360;
 }
+

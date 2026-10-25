@@ -46,6 +46,7 @@ const requiredKeys = [
   'settings.extensions.toast.missingBuild',
   'settings.extensions.toast.hostTooOld',
   'settings.extensions.toast.cloneFailed',
+  'settings.extensions.toast.cloneNeedsSignIn',
   'settings.extensions.toast.extractFailed',
   'settings.extensions.toast.folderNeedsZip',
   'settings.extensions.toast.zipTooLarge',
@@ -54,6 +55,10 @@ const requiredKeys = [
   'settings.extensions.toast.loadFailed',
   'settings.extensions.service.permissions',
   'settings.extensions.status.needsApproval',
+  'settings.extensions.status.unreadable',
+  'settings.extensions.toast.installedUnreadable',
+  'settings.extensions.unreadable.hint',
+  'settings.extensions.unreadable.unnamed',
   'settings.extensions.review',
   'settings.extensions.review.aria',
   'settings.extensions.dialog.approveTitle',
@@ -117,6 +122,8 @@ const requiredKeys = [
   'settings.extensions.toast.updateFailed',
   'settings.extensions.toast.notGit',
   'settings.extensions.toast.swapFailed',
+  'settings.extensions.browse.label',
+  'settings.extensions.browse.hint',
 ] as const;
 
 const allowEnglishLoanword = new Set([

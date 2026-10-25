@@ -33,6 +33,7 @@ import {
   buildItemMessage,
   buildReadyMessage,
   buildResolveMessage,
+  buildGenerateLateMessage,
   buildSessionLifecycleMessage,
   buildSessionMessage,
   buildSettingsMessage,
@@ -44,8 +45,11 @@ import { useGuestBadgeStore } from '@/lib/guests/badge-store';
 import { guestMay, isGuestActive } from '@/lib/guests/capabilities';
 import { guestFileOperation } from '@/lib/guests/files';
 import { guestGenerate } from '@/lib/guests/generate';
+import { guestGenerateResults, lateGenerateResult, type GenerateOwner } from '@/lib/guests/generate-results';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { openGuestCommit, readCurrentBranch } from '@/lib/guests/open-commit';
+import { openGuestSurface } from '@/lib/guests/open-surface';
+import { openGuestUrl } from '@/lib/guests/open-url';
 import { getRegisteredRuntimeAPIs } from '@/contexts/runtimeAPIRegistry';
 import { isVSCodeRuntime } from '@/lib/desktop';
 import { isMobileSurfaceRuntime } from '@/lib/runtimeSurface';
@@ -69,6 +73,7 @@ import { useGuestOauthStore } from '@/lib/guests/oauth-store';
 import { linkGuestSession, promptGuestSession, startGuestSession } from '@/lib/guests/start-session';
 import { useGuestsStore } from '@/lib/guests/store';
 import { readGuestWorkspace, observeGuestWorkspace, openGuestSession } from '@/lib/guests/workspace';
+import { observeGuestShells, readGuestShellOutput } from '@/lib/guests/shells';
 import { guestStorageOperation } from '@/lib/guests/storage';
 import { getGuestPopoverController, guestPopoverOwnerBlocked, positionGuestPopover, type GuestPopoverActivation, type GuestPopoverPosition } from '@/lib/guests/popovers';
 import { createGuestStatusControls, type GuestStatusControlBinding } from '@/lib/guests/status-controls';
@@ -78,11 +83,14 @@ import { openExternalUrl } from '@/lib/url';
 import { cn } from '@/lib/utils';
 import { closeGuestTabsEverywhere } from '@/lib/guests/tabs';
 import { pluginIdFromMode, type PluginContextPanelMode } from '@/lib/surfaces/modes';
-import { useUIStore } from '@/stores/useUIStore';
 import { useInputStore } from '@/sync/input-store';
+import { useBackgroundShellsStore } from '@/sync/background-shells';
+import { useGlobalSessionsStore } from '@/stores/useGlobalSessionsStore';
+import { opencodeClient } from '@/lib/opencode/client';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useSession, useSessionStatus } from '@/sync/sync-context';
 import { GuestPopover } from './GuestPopover';
+import { DockedPanelSurfaceContext, usePageColors } from '@/hooks/usePageColors';
 
 type PluginPaneProps = {
   mode: PluginContextPanelMode;
@@ -228,17 +236,21 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
   );
 
   const readableColors = React.useMemo(() => getReadableThemeColors(currentTheme), [currentTheme]);
+  // A frame in a docked panel paints the panel's colour, not the chat's.
+  const pageColors = usePageColors();
   const ready = React.useMemo<HostReadyContext>(() => {
     const features: NonNullable<HostReadyContext['features']> = {};
     if (guest?.storageId && globalThis.indexedDB) features.deviceStorage = true;
     if (surface === 'status' && onStatusControls) features.statusControls = true;
     if (!popoverHost && !popover && !headless && !isVSCodeRuntime() && !isMobileSurfaceRuntime()
       && (surface === 'panel' || surface === 'page' || surface === 'status')) features.popovers = true;
+    // A hidden frame is nobody's panel: it neither takes kept answers nor leaves any.
+    if (!headless) features.lateGenerateResults = true;
     return {
     theme: {
       mode: currentTheme.metadata.variant === 'dark' ? 'dark' : 'light',
       tokens: {
-        background: currentTheme.colors.surface.background,
+        background: pageColors.background,
         elevated: currentTheme.colors.surface.elevated,
         foreground: currentTheme.colors.surface.foreground,
         muted: currentTheme.colors.surface.mutedForeground,
@@ -248,7 +260,7 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
         selection: currentTheme.colors.interactive.selection,
         focus: currentTheme.colors.interactive.focusRing,
         primary: currentTheme.colors.primary.base,
-        mutedSurface: currentTheme.colors.surface.muted,
+        mutedSurface: pageColors.mutedSurface,
         elevatedForeground: currentTheme.colors.surface.elevatedForeground,
         active: currentTheme.colors.interactive.active,
         selectionForeground: readableColors.selectionForeground,
@@ -286,7 +298,7 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
     popover: popoverHost?.context ?? popover,
     features,
     };
-  }, [currentTheme, readableColors, directory, guest?.backgroundEntry, guest?.storageId, headless, item, locale, oauthStatus, onStatusControls, popover, popoverHost, sessionSnapshot, surface]);
+  }, [currentTheme, pageColors, readableColors, directory, guest?.backgroundEntry, guest?.storageId, headless, item, locale, oauthStatus, onStatusControls, popover, popoverHost, sessionSnapshot, surface]);
 
   const fileEditorEntry = surface === 'file' && fileEditor
     ? guest?.fileEditors?.find((editor) => editor.id === fileEditor.editorId)?.entry ?? null
@@ -314,6 +326,8 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
   readyRef.current = ready;
   const directoryRef = React.useRef(directory);
   directoryRef.current = directory;
+  const effectiveDirectoryRef = React.useRef(effectiveDirectory);
+  effectiveDirectoryRef.current = effectiveDirectory;
   const sessionIdRef = React.useRef(currentSessionId);
   sessionIdRef.current = currentSessionId;
   const sessionBusyRef = React.useRef(sessionBusy);
@@ -354,6 +368,9 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
   // Outstanding `resolve` requests this pane sent; answered by `resolve-result`.
   const resolveWaitersRef = React.useRef(new Map<string, (outcome: GuestResolveOutcome) => void>());
   const resolveIdsRef = React.useRef(0);
+  // Counts `hello`s: each one is a new document in the frame, which has no
+  // waiter for a `generate` the previous document sent.
+  const frameDocumentRef = React.useRef(0);
 
   const stopOauthPoll = React.useCallback(() => {
     if (oauthPollRef.current != null) {
@@ -524,9 +541,21 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
     });
     statusControlsRef.current = statusControls;
     const clearSubscriptions = () => { for (const unsubscribe of subscriptions.values()) unsubscribe(); subscriptions.clear(); };
+    const generateOwner = (): GenerateOwner => ({
+      runtimeKey,
+      guestId: requestingGuestId,
+      storageId: installation?.storageId ?? null,
+      surface: readyRef.current.surface,
+      directory: directoryRef.current || null,
+    });
+    let stopLateGenerate: (() => void) | null = null;
+    const stopLateGenerateListening = () => { stopLateGenerate?.(); stopLateGenerate = null; };
     const runtimeUnsubscribe = subscribeRuntimeEndpointChanged(() => { disposed = true; closeActivePopover('owner'); statusControls.dispose(); clearSubscriptions(); stopOauthPoll(); });
     const requireSessions = () => {
       if (!guestMay(currentGuest(), 'sessions')) throw new HostRequestError('NOT_GRANTED', NOT_GRANTED_MESSAGE);
+    };
+    const requireShells = () => {
+      if (!guestMay(currentGuest(), 'shells')) throw new HostRequestError('NOT_GRANTED', NOT_GRANTED_MESSAGE);
     };
     const onMessage = (event: MessageEvent) => {
       const frame = iframeRef.current;
@@ -548,6 +577,8 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
       if (!ownsFrame()) return;
 
       if (message.type === 'hello') {
+        frameDocumentRef.current += 1;
+        stopLateGenerateListening();
         acknowledgeHandshake();
         clearSubscriptions();
         pushHostState();
@@ -562,10 +593,29 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
         return;
       }
 
+      if (message.type === 'generate-late-listen') {
+        if (headless) return;
+        stopLateGenerateListening();
+        stopLateGenerate = guestGenerateResults.listen({
+          owner: generateOwner,
+          deliver: (result) => {
+            if (!ownsFrame() || iframeRef.current !== frame) return false;
+            postToGuest(buildGenerateLateMessage(result));
+            return true;
+          },
+        });
+        return;
+      }
+
       if (isGuestFileMessage(message)) {
         fileChannelRef.current?.receive(message);
         return;
       }
+
+      // A generate answer that finds its frame gone, or a new document in
+      // it, is kept for the next frame of this extension that listens.
+      const requestOwner = message.type === 'generate' && !headless ? generateOwner() : null;
+      const requestDocument = frameDocumentRef.current;
 
       void answerGuestMessage(message, {
         workspaceRead: (query) => { requireSessions(); return readGuestWorkspace(query, guestIdRef.current); },
@@ -580,6 +630,33 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
           }));
         },
         workspaceUnsubscribe: (id) => { subscriptions.get(id)?.(); subscriptions.delete(id); },
+        shellsSubscribe: ({ subscriptionId, scope }) => {
+          requireShells();
+          subscriptions.get(subscriptionId)?.();
+          subscriptions.delete(subscriptionId);
+          if (subscriptions.size >= 32) throw new HostRequestError('HOST_REJECTED', 'At most 32 subscriptions per frame.');
+          subscriptions.set(subscriptionId, observeGuestShells(scope, (snapshot) => {
+            if (ownsFrame() && guestMay(guestRef.current, 'shells')) postToGuest({ channel: OPENCHAMBER_SDK_CHANNEL, v: OPENCHAMBER_SDK_API_VERSION,
+              type: 'shells', payload: { subscriptionId, snapshot } });
+          }));
+        },
+        shellsUnsubscribe: (id) => { subscriptions.get(id)?.(); subscriptions.delete(id); },
+        shellOutput: async ({ shellId, cursor, tailBytes }) => {
+          requireShells();
+          return readGuestShellOutput(shellId, cursor, tailBytes);
+        },
+        shellStop: async ({ shellId }) => {
+          requireShells();
+          const shell = useBackgroundShellsStore.getState().byId.get(shellId);
+          if (!shell) throw new HostRequestError('NOT_FOUND', 'That shell is not running.');
+          const session = useGlobalSessionsStore.getState().entityById.get(shell.sessionID);
+          await opencodeClient.stopBackgroundShells({
+            sessionID: shell.sessionID,
+            sessionDirectory: session?.directory ?? shell.directory,
+            shells: [{ shellID: shell.id, shellDirectory: shell.directory, command: shell.command }],
+          });
+          return { stopped: true as const };
+        },
         storage: (request) => guestStorageOperation(requestingGuestId, request,
           installation?.storageId ? { runtimeKey, storageId: installation.storageId, authorize: ownsFrame } : undefined),
         setStatusControls: (controls) => {
@@ -592,11 +669,19 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
           if (!guestEnabledRef.current) return;
           showGuestToast(request);
         },
-        openUrl: openExternalUrl,
-        openSurface: (surfaceMode) => {
-          const dir = directoryRef.current || '';
-          if (dir) useUIStore.getState().openContextSurface(dir, surfaceMode);
-        },
+        // Local addresses (a dev server, a container port) open in the browser panel, like chat links.
+        openUrl: (url) => openGuestUrl(
+          url,
+          directoryRef.current || effectiveDirectoryRef.current || null,
+          !isVSCodeRuntime() && !isMobileSurfaceRuntime(),
+        ),
+        openSurface: (surfaceMode) => openGuestSurface({
+          mode: surfaceMode,
+          // A status section in a chat draft without a project has no
+          // directory of its own; the rail opens its panels under the chat's.
+          directory: directoryRef.current || effectiveDirectoryRef.current || null,
+          supported: !isVSCodeRuntime() && !isMobileSurfaceRuntime(),
+        }),
         writeClipboard: async (text) => {
           const result = await copyTextToClipboard(text);
           return result.ok;
@@ -758,7 +843,10 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
             guestIdRef.current,
             request,
             directoryRef.current || null,
-            useConfigStore.getState().currentProviderId || null,
+            {
+              providerID: useConfigStore.getState().currentProviderId || null,
+              modelID: useConfigStore.getState().currentModelId || null,
+            },
           );
         },
         setBadge: (count) => {
@@ -851,7 +939,14 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
           }
         },
       }).then((reply) => {
-        if (reply && ownsFrame() && frame === iframeRef.current) postToGuest(reply);
+        if (!reply) return;
+        const deliverable = ownsFrame() && frame === iframeRef.current;
+        if (message.type === 'generate' && requestOwner && !(deliverable && frameDocumentRef.current === requestDocument)) {
+          const late = lateGenerateResult(message.payload, reply);
+          if (late) guestGenerateResults.keep(requestOwner, late);
+          return;
+        }
+        if (deliverable) postToGuest(reply);
       });
     };
 
@@ -862,6 +957,7 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
       statusControls.dispose();
       if (statusControlsRef.current === statusControls) statusControlsRef.current = null;
       clearSubscriptions();
+      stopLateGenerateListening();
       runtimeUnsubscribe();
       window.removeEventListener('message', onMessage);
     };
@@ -985,6 +1081,8 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
             schedulePopoverClose(activePopover.activation, 'outside');
           }}
         >
+          {/* Floats over the app, so never on a docked panel's page. */}
+          <DockedPanelSurfaceContext.Provider value={false}>
           <PluginPane
             mode={mode}
             surface="popover"
@@ -1028,6 +1126,7 @@ export const PluginPane: React.FC<PluginPaneProps> = ({
               else schedulePopoverClose(activePopover.activation, 'outside');
             }}
           />
+          </DockedPanelSurfaceContext.Provider>
         </GuestPopover>
       ) : null}
     </>

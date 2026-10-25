@@ -1,4 +1,5 @@
 import React from 'react';
+import { AnimatePresence } from 'motion/react';
 import { ComposerFloatingPanel } from '../composer/ui/ComposerFloatingPanel';
 import type { Message, Part } from '@/lib/opencode/model';
 import { getLastConversationRecord, isIncompleteAssistantTurn } from '@/lib/opencode/model';
@@ -8,6 +9,8 @@ import { cn } from '@/lib/utils';
 import { toast } from '@/components/ui';
 import { Button } from '@/components/ui/button';
 import { Icon } from '@/components/icon/Icon';
+import { Spinner } from '@/components/ui/spinner';
+import { PauseClock } from '@/components/ui/pause-clock';
 import { useBtwStore } from '@/stores/useBtwStore';
 import { useSync } from '@/sync/use-sync';
 import {
@@ -44,17 +47,21 @@ const IDLE_SESSION_STATUS = { type: 'idle' as const };
  * and the app navigates to it), destroy (the fork is deleted; the main
  * conversation is never touched).
  */
-export const BtwPanel: React.FC<{ parentSessionId: string; panel: BtwPanelState; onExit: () => void }> = ({
+const BtwPanelView: React.FC<{ parentSessionId: string; panel: BtwPanelState; hidden: boolean; onExit: () => void }> = ({
     parentSessionId,
     panel,
+    hidden,
     onExit,
 }) => {
     const { t } = useI18n();
     useEscapeToExit(onExit, !panel.collapsed && Boolean(panel.pending || panel.creating || panel.btwSessionId));
 
+    // Each stage is its own keyed panel, so moving between them cross-fades.
+    let stage: React.ReactNode = null;
     if (panel.btwSessionId && panel.btwDirectory) {
-        return (
+        stage = (
             <BtwSheet
+                key="sheet"
                 sessionRef={{
                     parentSessionId,
                     btwSessionId: panel.btwSessionId,
@@ -64,22 +71,19 @@ export const BtwPanel: React.FC<{ parentSessionId: string; panel: BtwPanelState;
                 collapsed={panel.collapsed}
             />
         );
-    }
-
-    if (panel.creating) {
-        return (
-            <BtwFrame>
+    } else if (panel.creating) {
+        stage = (
+            <BtwFrame key="creating">
                 <div className="flex items-center gap-2 px-4 py-4 text-sm text-muted-foreground">
                     <Icon name="loader-4" className="size-4 animate-spin" />
                     <span>{t('chat.btw.loading')}</span>
                 </div>
             </BtwFrame>
         );
-    }
-
-    if (panel.pending) {
-        return (
+    } else if (panel.pending) {
+        stage = (
             <BtwFrame
+                key="pending"
                 draftHint={t('chat.btw.draftHint')}
                 collapsed={panel.collapsed}
                 actions={(
@@ -98,7 +102,8 @@ export const BtwPanel: React.FC<{ parentSessionId: string; panel: BtwPanelState;
         );
     }
 
-    return null;
+    // `hidden`: collapsed while the parent's own request takes the dock.
+    return <AnimatePresence>{hidden ? null : stage}</AnimatePresence>;
 };
 
 const useBtwDestroy = (sessionRef: BtwSessionRef | null): (() => void) => {
@@ -249,10 +254,10 @@ const BtwFrame: React.FC<{
                     onClick={onTitleClick}
                     aria-label={titleClickLabel}
                     title={titleClickLabel}
-                    className="flex min-w-0 items-center gap-2 text-left text-muted-foreground transition-colors hover:text-foreground"
+                    className="flex min-w-0 items-center gap-2 text-start text-muted-foreground transition-colors hover:text-foreground"
                 >
                     {headerSpinner ? (
-                        <Icon name="loader-4" className="size-3.5 shrink-0 animate-spin" />
+                        <Spinner className="size-3.5 shrink-0" />
                     ) : (
                         <Icon name="chat-ai-3" className="size-3.5 shrink-0" />
                     )}
@@ -322,25 +327,29 @@ const BtwSheet: React.FC<{
         </div>
     );
 
-    if (collapsed) {
-        return (
-            <BtwCollapsedStrip
-                sessionRef={sessionRef}
-                actions={actions}
-                onExpand={handleToggleCollapsed}
-                expandLabel={toggleLabel}
-            />
-        );
-    }
-
+    // Collapsed strip and expanded sheet are separate panels: cross-fade
+    // between them, and let the whole sheet's exit reach whichever is shown.
     return (
-        <BtwExpandedSheet
-            sessionRef={sessionRef}
-            boundaryMessageID={boundaryMessageID}
-            actions={actions}
-            onTitleClick={handleToggleCollapsed}
-            titleClickLabel={toggleLabel}
-        />
+        <AnimatePresence propagate>
+            {collapsed ? (
+                <BtwCollapsedStrip
+                    key="collapsed"
+                    sessionRef={sessionRef}
+                    actions={actions}
+                    onExpand={handleToggleCollapsed}
+                    expandLabel={toggleLabel}
+                />
+            ) : (
+                <BtwExpandedSheet
+                    key="expanded"
+                    sessionRef={sessionRef}
+                    boundaryMessageID={boundaryMessageID}
+                    actions={actions}
+                    onTitleClick={handleToggleCollapsed}
+                    titleClickLabel={toggleLabel}
+                />
+            )}
+        </AnimatePresence>
     );
 };
 
@@ -441,7 +450,6 @@ const BtwMessages: React.FC<{
                     <ChatMessage
                         key={record.info.id}
                         message={record}
-                        previousMessage={data.messageRecords[index - 1]}
                         nextMessage={data.messageRecords[index + 1]}
                         isInActiveTurn={index === data.messageRecords.length - 1}
                         activeStreamingPhase={
@@ -472,10 +480,16 @@ const BtwMessages: React.FC<{
                     )}
                     aria-hidden={!data.sessionIsWorking}
                 >
-                    <Icon name="loader-4" className="size-3.5 animate-spin" />
+                    {/* Hidden, not removed: it must not keep stepping then. */}
+                    <PauseClock paused={!data.sessionIsWorking}>
+                        <Spinner className="size-3.5" />
+                    </PauseClock>
                     <span>{t('chat.btw.working')}</span>
                 </div>
             </div>
         </ScrollShadow>
     );
 };
+
+/** Memoized: the composer re-renders on every keystroke, and nothing here depends on the draft text. */
+export const BtwPanel = React.memo(BtwPanelView);

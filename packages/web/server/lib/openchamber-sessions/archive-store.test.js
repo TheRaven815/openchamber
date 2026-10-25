@@ -26,8 +26,7 @@ describe('createArchiveStore', () => {
   it('starts empty when the file does not exist', async () => {
     const store = createArchiveStore({ dataDir: makeDataDir() });
     await expect(store.getAll()).resolves.toEqual({});
-    await expect(store.isArchived('ses_1')).resolves.toBe(false);
-    await expect(store.archivedAt('ses_1')).resolves.toBeNull();
+    await expect(store.entry('ses_1')).resolves.toBeUndefined();
   });
 
   it('archives a batch, persists it, and reads it back in a fresh store', async () => {
@@ -46,7 +45,7 @@ describe('createArchiveStore', () => {
 
     const reopened = createArchiveStore({ dataDir });
     await expect(reopened.getAll()).resolves.toEqual({ ses_1: 1_700_000, ses_2: 1_700_000 });
-    await expect(reopened.isArchived('ses_2')).resolves.toBe(true);
+    await expect(reopened.entry('ses_2')).resolves.toBe(1_700_000);
   });
 
   it('honours an explicit archivedAt and ignores a nonsense one', async () => {
@@ -69,7 +68,7 @@ describe('createArchiveStore', () => {
       failedIds: [],
     });
     expect(JSON.parse(readFile(dataDir))).toEqual({ ses_1: null, ses_2: 1 });
-    await expect(store.isArchived('ses_1')).resolves.toBe(false);
+    await expect(store.entry('ses_1')).resolves.toBeNull();
   });
 
   it('ignores blank ids and collapses duplicates', async () => {
@@ -152,7 +151,7 @@ describe('createArchiveStore', () => {
 
     const store = createArchiveStore({ dataDir, fsPromises, now: () => 1 });
     await expect(store.archive(['ses_1'])).resolves.toEqual({ archived: [], failedIds: ['ses_1'] });
-    await expect(store.isArchived('ses_1')).resolves.toBe(false);
+    await expect(store.entry('ses_1')).resolves.toBeUndefined();
   });
 
   it('keeps a later successful batch when an earlier one fails and rolls back', async () => {
@@ -181,7 +180,35 @@ describe('createArchiveStore', () => {
     await expect(failing).resolves.toEqual({ archived: [], failedIds: ['ses_1'] });
     await expect(succeeding).resolves.toEqual({ archived: [{ id: 'ses_1', archivedAt: 20 }], failedIds: [] });
     // The failed batch's rollback must not undo what the later batch committed.
-    await expect(store.archivedAt('ses_1')).resolves.toBe(20);
+    await expect(store.entry('ses_1')).resolves.toBe(20);
     expect(JSON.parse(readFile(dataDir))).toEqual({ ses_1: 20 });
+  });
+
+  it('tells an explicit unarchive from a session it does not mention, and forgets entries', async () => {
+    const dataDir = makeDataDir();
+    const store = createArchiveStore({ dataDir, now: () => 7 });
+    await store.archive(['ses_1', 'ses_2']);
+    await store.unarchive(['ses_3']);
+
+    await expect(store.entry('ses_1')).resolves.toBe(7);
+    await expect(store.entry('ses_3')).resolves.toBeNull();
+    await expect(store.entry('ses_4')).resolves.toBeUndefined();
+
+    await expect(store.forget(['ses_1', 'ses_3', 'ses_4'])).resolves.toEqual({ failedIds: [] });
+    expect(JSON.parse(readFile(dataDir))).toEqual({ ses_2: 7 });
+  });
+
+  it('writes nothing to forget a session it does not hold, and restores entries when the write fails', async () => {
+    const dataDir = makeDataDir();
+    const store = createArchiveStore({ dataDir, now: () => 7 });
+    await store.archive(['ses_1']);
+    const writeSpy = vi.spyOn(fs.promises, 'writeFile');
+    await expect(store.forget(['ses_9'])).resolves.toEqual({ failedIds: [] });
+    expect(writeSpy).not.toHaveBeenCalled();
+
+    writeSpy.mockRejectedValueOnce(new Error('disk full'));
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await expect(store.forget(['ses_1'])).resolves.toEqual({ failedIds: ['ses_1'] });
+    await expect(store.entry('ses_1')).resolves.toBe(7);
   });
 });

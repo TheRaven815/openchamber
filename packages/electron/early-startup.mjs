@@ -61,8 +61,7 @@ export const readLoginItemSettings = () => {
 export const shouldStartInBackground = (loginItemSettings = readLoginItemSettings()) => {
   return (
     process.argv.includes(BACKGROUND_START_ARG) ||
-    loginItemSettings?.wasOpenedAtLogin === true ||
-    loginItemSettings?.wasOpenedAsHidden === true
+    loginItemSettings?.wasOpenedAtLogin === true
   );
 };
 
@@ -160,9 +159,20 @@ export const readThemeSource = () => {
   return 'system';
 };
 
+// The UI language, for the few strings main shows before the renderer runs.
+export const readPreferredLocale = () => {
+  const settings = { ...readSettingsRoot(), ...readPreferencesValues() };
+  return typeof settings.locale === 'string' ? settings.locale : 'en';
+};
+
 export const getWindowIconPath = () => {
   if (process.platform !== 'win32' && process.platform !== 'linux') return undefined;
-  const iconFileName = process.platform === 'linux' ? 'icon.png' : 'icon.ico';
+  // A Windows dev copy shows the Windows icon behind construction tape
+  // (dev-icon-win.svg), like the macOS Dock's dev icon, in its taskbar, window
+  // and tray. GNOME takes the dock icon from the installed app's .desktop
+  // entry, whatever the window sets, so Linux keeps the usual icon.
+  const devWindowsIcon = isDev && process.platform === 'win32';
+  const iconFileName = devWindowsIcon ? 'dev-icon.ico' : process.platform === 'linux' ? 'icon.png' : 'icon.ico';
   const iconPath = isDev
     ? path.join(__dirname, 'resources', 'icons', iconFileName)
     : path.join(process.resourcesPath, 'icons', iconFileName);
@@ -213,6 +223,21 @@ export const macosMajorVersion = () => {
   return major === 10 ? minor : major;
 };
 
+let cachedMacTrafficLightPosition = null;
+
+/**
+ * Where macOS draws the window controls. The renderer sizes its titlebar per
+ * macOS version around this point (`Header.tsx`, `MiniChatLayout.tsx`), so
+ * change them together. macOS 26 draws 14px controls, centred in the 44px
+ * titlebar: y = (44 - 14) / 2. Older releases keep the calibrated 56px layout.
+ */
+export const macTrafficLightPosition = () => {
+  if (!cachedMacTrafficLightPosition) {
+    cachedMacTrafficLightPosition = Object.freeze(macosMajorVersion() >= 26 ? { x: 14, y: 15 } : { x: 16, y: 17 });
+  }
+  return cachedMacTrafficLightPosition;
+};
+
 const SPLASH_DEFAULTS = { bgLight: '#FFFCF0', fgLight: '#100F0F', bgDark: '#151313', fgDark: '#CECDC3' };
 
 const readSplashColor = (settings, key, fallback) => {
@@ -248,9 +273,6 @@ const buildStartupSplashHtml = () => {
       :root {
         --splash-background: ${splashBgLight};
         --splash-stroke: ${splashFgLight};
-        --splash-face-fill: rgba(0, 0, 0, 0.15);
-        --splash-cell-fill: rgba(0, 0, 0, 0.35);
-        --splash-logo-fill: var(--splash-stroke);
       }
       body {
         margin: 0;
@@ -265,14 +287,6 @@ const buildStartupSplashHtml = () => {
         :root {
           --splash-background: ${splashBgDark};
           --splash-stroke: ${splashFgDark};
-          --splash-face-fill: rgba(255, 255, 255, 0.15);
-          --splash-cell-fill: rgba(255, 255, 255, 0.35);
-        }
-      }
-      @supports (color: color-mix(in srgb, white 50%, transparent)) {
-        :root {
-          --splash-face-fill: color-mix(in srgb, var(--splash-stroke) 15%, transparent);
-          --splash-cell-fill: color-mix(in srgb, var(--splash-stroke) 35%, transparent);
         }
       }
       .stack {
@@ -291,46 +305,8 @@ const buildStartupSplashHtml = () => {
   </head>
   <body>
     <div class="stack">
-      <svg width="120" height="120" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="OpenChamber loading icon">
-        <path d="M50 50 L8.432 26 L8.432 74 L50 98 Z" fill="var(--splash-face-fill)" stroke="var(--splash-stroke)" stroke-width="2" stroke-linejoin="round"/>
-        <path d="M50 50 L39.608 44 L39.608 56 L50 62 Z" fill="var(--splash-cell-fill)" opacity="0.2"/>
-        <path d="M39.608 44 L29.216 38 L29.216 50 L39.608 56 Z" fill="var(--splash-cell-fill)" opacity="0.45"/>
-        <path d="M29.216 38 L18.824 32 L18.824 44 L29.216 50 Z" fill="var(--splash-cell-fill)" opacity="0.15"/>
-        <path d="M18.824 32 L8.432 26 L8.432 38 L18.824 44 Z" fill="var(--splash-cell-fill)" opacity="0.55"/>
-        <path d="M50 62 L39.608 56 L39.608 68 L50 74 Z" fill="var(--splash-cell-fill)" opacity="0.35"/>
-        <path d="M39.608 56 L29.216 50 L29.216 62 L39.608 68 Z" fill="var(--splash-cell-fill)" opacity="0.1"/>
-        <path d="M29.216 50 L18.824 44 L18.824 56 L29.216 62 Z" fill="var(--splash-cell-fill)" opacity="0.5"/>
-        <path d="M18.824 44 L8.432 38 L8.432 50 L18.824 56 Z" fill="var(--splash-cell-fill)" opacity="0.25"/>
-        <path d="M50 74 L39.608 68 L39.608 80 L50 86 Z" fill="var(--splash-cell-fill)" opacity="0.4"/>
-        <path d="M39.608 68 L29.216 62 L29.216 74 L39.608 80 Z" fill="var(--splash-cell-fill)" opacity="0.3"/>
-        <path d="M29.216 62 L18.824 56 L18.824 68 L29.216 74 Z" fill="var(--splash-cell-fill)" opacity="0.45"/>
-        <path d="M18.824 56 L8.432 50 L8.432 62 L18.824 68 Z" fill="var(--splash-cell-fill)" opacity="0.15"/>
-        <path d="M50 86 L39.608 80 L39.608 92 L50 98 Z" fill="var(--splash-cell-fill)" opacity="0.55"/>
-        <path d="M39.608 80 L29.216 74 L29.216 86 L39.608 92 Z" fill="var(--splash-cell-fill)" opacity="0.2"/>
-        <path d="M29.216 74 L18.824 68 L18.824 80 L29.216 86 Z" fill="var(--splash-cell-fill)" opacity="0.35"/>
-        <path d="M18.824 68 L8.432 62 L8.432 74 L18.824 80 Z" fill="var(--splash-cell-fill)" opacity="0.1"/>
-        <path d="M50 50 L91.568 26 L91.568 74 L50 98 Z" fill="var(--splash-face-fill)" stroke="var(--splash-stroke)" stroke-width="2" stroke-linejoin="round"/>
-        <path d="M50 50 L60.392 44 L60.392 56 L50 62 Z" fill="var(--splash-cell-fill)" opacity="0.3"/>
-        <path d="M60.392 44 L70.784 38 L70.784 50 L60.392 56 Z" fill="var(--splash-cell-fill)" opacity="0.15"/>
-        <path d="M70.784 38 L81.176 32 L81.176 44 L70.784 50 Z" fill="var(--splash-cell-fill)" opacity="0.45"/>
-        <path d="M81.176 32 L91.568 26 L91.568 38 L81.176 44 Z" fill="var(--splash-cell-fill)" opacity="0.25"/>
-        <path d="M50 62 L60.392 56 L60.392 68 L50 74 Z" fill="var(--splash-cell-fill)" opacity="0.5"/>
-        <path d="M60.392 56 L70.784 50 L70.784 62 L60.392 68 Z" fill="var(--splash-cell-fill)" opacity="0.35"/>
-        <path d="M70.784 50 L81.176 44 L81.176 56 L70.784 62 Z" fill="var(--splash-cell-fill)" opacity="0.1"/>
-        <path d="M81.176 44 L91.568 38 L91.568 50 L81.176 56 Z" fill="var(--splash-cell-fill)" opacity="0.4"/>
-        <path d="M50 74 L60.392 68 L60.392 80 L50 86 Z" fill="var(--splash-cell-fill)" opacity="0.2"/>
-        <path d="M60.392 68 L70.784 62 L70.784 74 L60.392 80 Z" fill="var(--splash-cell-fill)" opacity="0.55"/>
-        <path d="M70.784 62 L81.176 56 L81.176 68 L70.784 74 Z" fill="var(--splash-cell-fill)" opacity="0.3"/>
-        <path d="M81.176 56 L91.568 50 L91.568 62 L81.176 68 Z" fill="var(--splash-cell-fill)" opacity="0.15"/>
-        <path d="M50 86 L60.392 80 L60.392 92 L50 98 Z" fill="var(--splash-cell-fill)" opacity="0.45"/>
-        <path d="M60.392 80 L70.784 74 L70.784 86 L60.392 92 Z" fill="var(--splash-cell-fill)" opacity="0.25"/>
-        <path d="M70.784 74 L81.176 68 L81.176 80 L70.784 86 Z" fill="var(--splash-cell-fill)" opacity="0.4"/>
-        <path d="M81.176 68 L91.568 62 L91.568 74 L81.176 80 Z" fill="var(--splash-cell-fill)" opacity="0.2"/>
-        <path d="M50 2 L8.432 26 L50 50 L91.568 26 Z" fill="none" stroke="var(--splash-stroke)" stroke-width="2" stroke-linejoin="round"/>
-        <g transform="matrix(0.866, 0.5, -0.866, 0.5, 50, 26) scale(0.75)">
-          <path fill-rule="evenodd" clip-rule="evenodd" d="M-16 -20 L16 -20 L16 20 L-16 20 Z M-8 -12 L-8 12 L8 12 L8 -12 Z" fill="var(--splash-logo-fill)"/>
-          <path d="M-8 -4 L8 -4 L8 12 L-8 12 Z" fill="var(--splash-logo-fill)" fill-opacity="0.4"/>
-        </g>
+      <svg width="120" height="120" viewBox="-50 -50 100 100" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="OpenChamber loading icon">
+        <!-- brand:flat-logo:start --><defs><linearGradient id="oc-logo-l" gradientUnits="userSpaceOnUse" x1="-42" y1="-20" x2="-2" y2="12"><stop offset="0" stop-color="currentColor" stop-opacity="0.025"/><stop offset="0.72" stop-color="currentColor" stop-opacity="0.143"/><stop offset="1" stop-color="currentColor" stop-opacity="0.198"/></linearGradient><linearGradient id="oc-logo-r" gradientUnits="userSpaceOnUse" x1="40" y1="3" x2="3" y2="-16"><stop offset="0" stop-color="currentColor" stop-opacity="0.071"/><stop offset="0.68" stop-color="currentColor" stop-opacity="0.174"/><stop offset="1" stop-color="currentColor" stop-opacity="0.223"/></linearGradient></defs><path d="M-41.568 -24 L-41.568 24 L0 0 Z" fill="url(#oc-logo-l)"/><path d="M41.568 -24 L0 0 L41.568 24 Z" fill="url(#oc-logo-r)"/><path d="M0 -48 L41.568 -24 L0 0 L-41.568 -24 Z" fill="currentColor" fill-opacity="0.08"/><path data-tier="0" data-rest="0.12" data-lit="0.55" d="M0 -43.2 L33.254 -24 L0 -4.8 L-33.254 -24 Z" fill="currentColor" fill-opacity="0.22"/><path data-tier="1" data-rest="0.15" data-lit="0.48" d="M0 -37.92 L24.109 -24 L0 -10.08 L-24.109 -24 Z" fill="currentColor" fill-opacity="0.27"/><path data-tier="2" data-rest="0.38" data-lit="0.85" d="M0 -32.64 L14.964 -24 L0 -15.36 L-14.964 -24 Z" fill="currentColor" fill-opacity="0.85"/><g fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"><path d="M0 -48 L-41.568 -24 L0 0 L41.568 -24 Z"/><path d="M-41.568 -24 L-41.568 24 L0 48 L41.568 24 L41.568 -24"/><path d="M0 0 L0 48"/></g><!-- brand:flat-logo:end -->
       </svg>
     </div>
   </body>
@@ -365,6 +341,10 @@ export const resolvePreloadPath = () => (
   isDev ? path.join(__dirname, 'preload.mjs') : path.join(app.getAppPath(), 'preload.mjs')
 );
 
+export const resolveBrowserPanelPreloadPath = () => (
+  isDev ? path.join(__dirname, 'browser-panel-preload.cjs') : path.join(app.getAppPath(), 'browser-panel-preload.cjs')
+);
+
 // Arguments the preload reads from process.argv. They are fixed at window
 // creation: the main window is created before the backend resolves, so it
 // carries empty runtime values and receives them through the init script.
@@ -375,7 +355,9 @@ export const buildRendererAdditionalArguments = ({
   requestHeaders = {},
   bootOutcome = null,
   relayHostId = '',
+  explicitRuntime = false,
   trayEnabled = isMacMenuBarEnabled(),
+  nativeFrame = usesLinuxNativeFrame(),
 } = {}) => [
   `--openchamber-local-origin=${localOrigin}`,
   `--openchamber-api-base-url=${apiBaseUrl}`,
@@ -386,12 +368,23 @@ export const buildRendererAdditionalArguments = ({
   `--openchamber-tray-enabled=${trayEnabled ? '1' : '0'}`,
   `--openchamber-boot-outcome=${JSON.stringify(bootOutcome)}`,
   `--openchamber-relay-host-id=${relayHostId}`,
+  `--openchamber-explicit-runtime=${explicitRuntime ? '1' : '0'}`,
+  `--openchamber-native-frame=${nativeFrame ? '1' : '0'}`,
 ];
 
-export const usesFramelessChrome = process.platform === 'win32' || process.platform === 'linux';
+// Linux can opt into the desktop environment's own title bar (Settings ->
+// Desktop); it takes effect at the next start, like the window it shapes.
+const usesLinuxNativeFrame = () => (
+  process.platform === 'linux' && readSettingsRoot().desktopLinuxNativeFrame === true
+);
+
+export const usesFramelessChrome = () => (
+  process.platform === 'win32' || (process.platform === 'linux' && !usesLinuxNativeFrame())
+);
 
 export const buildMainWindowOptions = ({ bounds, backgroundColor, additionalArguments }) => {
-  const usesCustomTitleBar = process.platform === 'darwin' || usesFramelessChrome;
+  const frameless = usesFramelessChrome();
+  const usesCustomTitleBar = process.platform === 'darwin' || frameless;
   const options = {
     title: 'OpenChamber',
     width: bounds?.width ?? DEFAULT_WINDOW_WIDTH,
@@ -401,13 +394,16 @@ export const buildMainWindowOptions = ({ bounds, backgroundColor, additionalArgu
     icon: getWindowIconPath(),
     show: false,
     backgroundColor,
-    frame: usesFramelessChrome ? false : undefined,
+    frame: frameless ? false : undefined,
     autoHideMenuBar: process.platform !== 'darwin',
     // Electron's hiddenInset adds its own extra inset, which leaves the controls
     // visibly lower than the app header. Use a plain hidden title bar instead.
     titleBarStyle: usesCustomTitleBar ? 'hidden' : 'default',
     titleBarOverlay: false,
-    trafficLightPosition: process.platform === 'darwin' ? { x: 16, y: 17 } : undefined,
+    trafficLightPosition: process.platform === 'darwin' ? macTrafficLightPosition() : undefined,
+    // macOS otherwise spends the first click on an inactive window activating
+    // it, so a button pressed while coming from another app needs two clicks.
+    acceptFirstMouse: true,
     webPreferences: {
       additionalArguments,
       preload: resolvePreloadPath(),

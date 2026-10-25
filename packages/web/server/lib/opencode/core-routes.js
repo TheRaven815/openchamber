@@ -1,6 +1,18 @@
 import { buildExternalManualRestartResponse } from './config-mutation-response.js';
 import { ThemeImportStorageError } from './theme-runtime.js';
 import { registerThemeCatalogRoutes } from './theme-catalog.js';
+import { collectLocalFileDiagnostics } from '../diagnostics/local-files.js';
+import { serverDiagnosticJournal } from '../diagnostics/server-journal.js';
+
+// Install before any routes or body parsers so early 4xx responses are covered too.
+export const registerHttpResponseDiagnostics = (app, journal = serverDiagnosticJournal) => {
+  app.use((req, res, next) => {
+    res.once('finish', () => {
+      journal.recordHttpResponse(req.method, req.path, res.statusCode);
+    });
+    next();
+  });
+};
 
 const parseLoopbackUrl = (rawUrl) => {
   if (typeof rawUrl !== 'string') {
@@ -61,6 +73,9 @@ export const registerServerStatusRoutes = (app, dependencies) => {
     getServerId = async () => null,
     tunnelAuthController = null,
     uiAuthController = null,
+    // Loaded OpenCode directories and process counts for the diagnostic
+    // export (`../diagnostics/opencode-load.js`); older wiring omits it.
+    readOpenCodeLoad = null,
   } = dependencies;
 
   // The identity is immutable for the process lifetime; resolve once, and never
@@ -111,6 +126,8 @@ export const registerServerStatusRoutes = (app, dependencies) => {
       'realtime.sse.v1',
       'realtime.websocket.global-events.v1',
       'terminal.websocket.v1',
+      // Message pages honour `x-openchamber-part-shells` (message-shells.js).
+      'api.message-part-shells.v1',
     ],
   };
 
@@ -231,6 +248,40 @@ export const registerServerStatusRoutes = (app, dependencies) => {
       ...(serverId ? { serverId } : {}),
       ...getHealthSnapshot(),
     });
+  });
+
+  // This is a local support export, not an API for connected remote clients.
+  // Check the socket address rather than proxy-provided forwarding headers.
+  // The private relay also dials loopback, and stamps every request it forwards.
+  const requireLocalDiagnostics = (req, res, next) => {
+    if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket?.remoteAddress)
+      || req.headers['x-openchamber-relay-connection']
+      || (tunnelAuthController?.classifyRequestScope && tunnelAuthController.classifyRequestScope(req) !== 'local')) {
+      res.status(403).json({ error: 'Local diagnostics require a loopback connection' });
+      return;
+    }
+    if (uiAuthController?.requireAuth) return uiAuthController.requireAuth(req, res, next);
+    next();
+  };
+
+  app.get('/api/diagnostics/local-files', requireLocalDiagnostics, async (_req, res) => {
+    try {
+      res.json(await collectLocalFileDiagnostics({ webPort: getServerPort() }));
+    } catch {
+      res.status(500).json({ error: 'Diagnostics unavailable' });
+    }
+  });
+
+  app.get('/api/diagnostics/opencode-load', requireLocalDiagnostics, async (_req, res) => {
+    if (!readOpenCodeLoad) {
+      res.status(404).json({ error: 'Diagnostics unavailable' });
+      return;
+    }
+    try {
+      res.json(await readOpenCodeLoad());
+    } catch {
+      res.status(500).json({ error: 'Diagnostics unavailable' });
+    }
   });
 
   app.get('/api/version', async (_req, res) => {
@@ -636,10 +687,17 @@ export const registerAuthAndAccessRoutes = (app, dependencies) => {
     && /^\/fs\/preview\/[^/]+\/./.test(req.path || '')
   );
 
+  // An extension frame is sandboxed the same way and loads its package
+  // through a grant in the path; the guests route checks it.
+  const isGuestFrameFileRead = (req) => (
+    req.method === 'GET'
+    && /^\/guest-files\/[^/]+\/./.test(req.path || '')
+  );
+
   const requireApiAuth = async (req, res, next) => {
     const pathname = (req.originalUrl || '').split('?')[0];
     if (selfAuthenticatedApiPaths.has(pathname)) return next();
-    if (isGuestOauthCallback(req) || isFilePreviewRead(req)) {
+    if (isGuestOauthCallback(req) || isFilePreviewRead(req) || isGuestFrameFileRead(req)) {
       return next();
     }
     const requestScope = tunnelAuthController.classifyRequestScope(req);
@@ -757,6 +815,20 @@ export const registerAuthAndAccessRoutes = (app, dependencies) => {
     try {
       await uiAuthController.requireSessionAuth(req, res, async () => {
         await uiAuthController.handlePasskeyRevoke(req, res);
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.patch('/api/passkeys/:id', express.json({ limit: '8kb' }), async (req, res, next) => {
+    const requestScope = tunnelAuthController.classifyRequestScope(req);
+    if (requestScope === 'tunnel' || requestScope === 'unknown-public') {
+      return res.status(403).json({ error: 'Passkey management is disabled for tunnel scope', tunnelLocked: true });
+    }
+    try {
+      await uiAuthController.requireSessionAuth(req, res, async () => {
+        await uiAuthController.handlePasskeyRename(req, res);
       });
     } catch (error) {
       next(error);
@@ -1141,9 +1213,11 @@ export const registerCommonRequestMiddleware = (app, dependencies) => {
       req.path.startsWith('/api/config/snippets') ||
       req.path.startsWith('/api/config/settings') ||
       req.path.startsWith('/api/config/skills') ||
+      req.path === '/api/config/skill-switch' ||
       req.path.startsWith('/api/config/plugins') ||
       req.path.startsWith('/api/config/websearch') ||
       req.path.startsWith('/api/config/warming') ||
+      req.path.startsWith('/api/session-warming') ||
       req.path.startsWith('/api/projects') ||
       req.path.startsWith('/api/fs') ||
       req.path.startsWith('/api/git') ||
@@ -1163,6 +1237,7 @@ export const registerCommonRequestMiddleware = (app, dependencies) => {
       req.path.startsWith('/api/goals') ||
       req.path.startsWith('/api/text') ||
       req.path.startsWith('/api/voice') ||
+      req.path.startsWith('/api/environment') ||
       req.path.startsWith('/api/tts') ||
       req.path.startsWith('/api/openchamber/tunnel') ||
       req.path.startsWith('/api/openchamber/spaces')

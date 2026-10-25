@@ -5,7 +5,7 @@ description: Richte Jev ein, das kleine Klassifizierungsmodell hinter Entscheidu
 
 # Klassifizierungsanbieter (Jev)
 
-Manche Funktionen von OpenChamber brauchen eine schnelle Entscheidung, bevor sie handeln: Ist dieser Befehl riskant, was für eine Aufgabe ist dieser Prompt, hat der Nutzer gerade mit echter Arbeit angefangen? Diese Fragen beantwortet Jev, ein kleines Entscheidungsmodell von TypeSafe. Auf dieser Seite erfährst du, wie du OpenChamber Zugang zu Jev gibst.
+Manche Funktionen von OpenChamber brauchen eine schnelle Entscheidung, bevor sie handeln: Ist dieser Befehl riskant, was für eine Aufgabe ist dieser Prompt, scheint diese Arbeit erledigt? Diese Fragen beantwortet Jev, ein kleines Entscheidungsmodell von TypeSafe. Auf dieser Seite erfährst du, wie du OpenChamber Zugang zu Jev gibst.
 
 Jev schreibt keinen Code und antwortet nicht in deinem Chat. Es liefert nur ein Urteil, und OpenChamber handelt danach. Auf eine Antwort wartet OpenChamber höchstens vier Sekunden.
 
@@ -15,10 +15,10 @@ Jev schreibt keinen Code und antwortet nicht in deinem Chat. Es liefert nur ein 
 | --- | --- |
 | [Berechtigungen und Sicherheitsnetz](/de/permissions/) | Soll der Agent dich fragen, bevor er diese Aktion ausführt? |
 | [Automatische Modellwahl](/de/auto-model-routing/) | Zu welcher deiner Kategorien gehört dieser Prompt? |
-| [Sitzungen in Arbeit](/de/sessions-in-work/) | Hast du gerade um echte Arbeit gebeten? Sieht dieser Zug nach ihrem Ende aus? |
+| [Sitzungen in Arbeit](/de/sessions-in-work/) | Sieht dieser Zug nach dem Ende der Arbeit aus? |
 | [Zusammenfassung und Vorschlag für die nächste Nachricht](/de/sessions-in-work/) | Lohnt sich nach diesem Zug eine Zusammenfassung oder ein Vorschlag? |
 
-Ohne Anbieter sind das Sicherheitsnetz und Auto ausgeblendet, und Sitzungen kommen nur in Arbeit, wenn du sie selbst verschiebst. Zusammenfassungen und Vorschläge funktionieren weiter, nur ohne den Filter.
+Ohne Anbieter sind das Sicherheitsnetz und Auto ausgeblendet, und Sitzungen in Arbeit bekommen keinen Hinweis „scheint erledigt“. In Arbeit kommen Sitzungen trotzdem, sobald du eine Nachricht sendest. Zusammenfassungen und Vorschläge funktionieren weiter, nur ohne den Filter.
 
 ## Einrichtung
 
@@ -70,14 +70,14 @@ Jeder Dienst, der die System One API von TypeSafe spricht: ein selbst gehostetes
 2. Füge einen **API-Schlüssel** hinzu, falls der Dienst einen braucht. Er wird als `Bearer`-Token gesendet.
 3. Klicke auf **Speichern**.
 
-Als URL kannst du die vollständige Adresse mit `/v1/systemone` am Ende einfügen, eine Basis-URL im OpenAI-Stil mit `/v1` am Ende oder die API-Wurzel (etwa `https://api.typesafe.ai`). OpenChamber ergänzt den fehlenden Teil und zeigt die genaue Adresse, die es aufruft. Nur `http` und `https` funktionieren, und der Schlüssel gehört in sein eigenes Feld, nie in die URL.
+Füge die vollständige Adresse ein, unter der der Dienst antwortet, etwa `https://api.typesafe.ai/v1/systemone` oder `https://proxy.company.internal/v1/decision` bei einem Firmen-Proxy. OpenChamber ruft sie genau so auf, wie du sie einfügst, und hängt nichts an den Pfad an. Nur `http` und `https` funktionieren, und der Schlüssel gehört in sein eigenes Feld, nie in die URL.
 
 Speichern wählt den Endpunkt auch gleich aus. Wie der TypeSafe-Schlüssel bleiben der Endpunkt und sein Schlüssel in einer eigenen Datei auf dem OpenChamber-Server, und der Schlüssel wird nie an den Browser gesendet.
 
 Ein Server kann seinen Endpunkt auch aus der Umgebung beziehen. Das ist praktisch, wenn du OpenChamber für ein Team einrichtest:
 
 ```bash
-OPENCHAMBER_JEV_URL=https://jev.example.com/v1
+OPENCHAMBER_JEV_URL=https://jev.example.com/v1/systemone
 OPENCHAMBER_JEV_MODEL=jev-latest        # optional, das ist der Standard
 OPENCHAMBER_JEV_API_KEY=...             # optional
 ```
@@ -96,7 +96,7 @@ Ist Jev bei einer einzelnen Anfrage langsam oder schlägt fehl, geht nichts kapu
 
 - Das Sicherheitsnetz lässt die Aktion auf dich warten.
 - Auto schickt den Prompt an dein Fallback-Modell.
-- Sitzungen in Arbeit bleiben, wie sie sind.
+- Der Hinweis „scheint erledigt“ erscheint bei Sitzungen in Arbeit nicht.
 - Zusammenfassung und Vorschlag entstehen so, als gäbe es Jev nicht.
 
 ## Was Jev sieht
@@ -107,7 +107,7 @@ Anfragen gehen vom OpenChamber-Server direkt an OpenCode Zen, OpenRouter, Vercel
 
 ## Wo es funktioniert
 
-Jev läuft im OpenChamber-Server, also in der Desktop-App, in der Web-App und auf deinem Handy, wenn es mit einer der beiden verbunden ist. Die VS-Code-Erweiterung spricht direkt mit OpenCode und hat kein Jev: Dort gibt es kein Sicherheitsnetz, kein Auto, und Sitzungen kommen nur von Hand in Arbeit.
+Jev läuft im OpenChamber-Server, also in der Desktop-App, in der Web-App und auf deinem Handy, wenn es mit einer der beiden verbunden ist. Die VS-Code-Erweiterung spricht direkt mit OpenCode und hat kein Jev: Dort gibt es kein Sicherheitsnetz, kein Auto und keinen Hinweis „scheint erledigt“.
 
 ## Verwandt
 

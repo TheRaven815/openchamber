@@ -11,6 +11,9 @@ let formReplyError: unknown | null = null
 let formCancelError: unknown | null = null
 let permissionReplyError: unknown | null = null
 const sessionMessageRecords = new Map<string, Array<{ info: Message; parts: Part[] }>>()
+// Optional cursor pages for getSessionMessages: the request's cursor selects
+// the page by index, so a paged lookup can be pinned without the flat records.
+let cursorMessagePages: Array<{ items: Array<{ info: Message; parts: Part[] }>; cursor: { next?: string } }> | null = null
 const sessionRecords = new Map<string, Session>()
 const failingRevertSessionIds = new Set<string>()
 let sessionDeleteError: unknown | null = null
@@ -42,6 +45,10 @@ let unarchiveBatchResponse: MockRouteResponse = {
   status: 404,
   body: { error: 'not found' },
 }
+let linksRouteResponse: MockRouteResponse = {
+  status: 404,
+  body: { error: 'not found' },
+}
 let activeStatusSnapshot: Record<string, SessionStatus> | null = {}
 let readActiveStatusSnapshot: (directory?: string | null) => Promise<Record<string, SessionStatus> | null> = async () => activeStatusSnapshot
 const deletedCleanupIdentities: Array<{ runtimeKey: string; directory: string; sessionId: string }> = []
@@ -69,7 +76,9 @@ mock.module("@/lib/opencode/client", () => ({
       options?: { limit?: number; cursor?: string },
       directory?: string | null,
     ) => {
-      replyCalls.push({ method: "session.messages", params: { sessionID: sessionId, directory, limit: options?.limit } })
+      replyCalls.push({ method: "session.messages", params: { sessionID: sessionId, directory, limit: options?.limit, cursor: options?.cursor } })
+      const page = cursorMessagePages ? cursorMessagePages[Number(options?.cursor ?? "0")] : undefined
+      if (page) return page
       return { items: sessionMessageRecords.get(sessionId) ?? [], cursor: {} }
     }),
     createSession: mock(async (params: Record<string, unknown>, directory?: string | null): Promise<Session> => {
@@ -109,9 +118,6 @@ mock.module("@/lib/opencode/client", () => ({
       const record = sessionRecords.get(sessionId)
       sessionRecords.set(sessionId, { ...(record ?? sessionFixture(sessionId)), revert: { messageID: messageId } })
       return { messageID: messageId }
-    }),
-    commitRevert: mock(async (sessionId: string, directory?: string | null) => {
-      replyCalls.push({ method: "session.revert.commit", params: { sessionID: sessionId, directory } })
     }),
     forkSession: mock(async (
       sessionId: string,
@@ -275,7 +281,11 @@ mock.module("@/lib/runtime-fetch", () => ({
     const payload = JSON.parse(String(init?.body ?? "{}"))
     openchamberRouteRequests.push({ path, body: payload })
     beforeArchiveRouteResolve?.(path)
-    const answer = path.endsWith("/unarchive") ? unarchiveBatchResponse : archiveBatchResponse
+    const answer = path.endsWith("/unarchive")
+      ? unarchiveBatchResponse
+      : path.endsWith("/links")
+        ? linksRouteResponse
+        : archiveBatchResponse
     return new Response(JSON.stringify(answer.body), {
       status: answer.status,
       headers: { "content-type": "application/json" },
@@ -377,6 +387,7 @@ mock.module("./sync-refs", () => ({
 import { INITIAL_STATE } from "./types"
 import type { DirectoryStore } from "./child-store"
 import type { Message, Part, Session, SessionStatus } from "@/lib/opencode/model"
+import type { LinkedIssue } from "@/lib/linkedIssues"
 
 type OptimisticAddCall = { sessionID: string; directory?: string | null; message: Message; parts: Part[] }
 type OptimisticRemoveCall = { sessionID: string; directory?: string | null; messageID: string }
@@ -495,6 +506,30 @@ describe("moveSessionToDirectory", () => {
     expect(destination.getState().session).toHaveLength(0)
     expect(destination.getState().message["session-a"]).toBe(undefined)
     expect(destination.getState().part["message-a"]).toBe(undefined)
+  })
+
+  test("keeps the move the session.moved event already applied", async () => {
+    const message = { id: "message-a", sessionID: "session-a", role: "user", time: { created: 1 } } as Message
+    const requested = { id: "session-a", title: "Before", directory: "/source" } as Session
+    const source = createStore({}, {
+      session: [{ ...requested, title: "Renamed", directory: "/destination" } as Session],
+      sessionTotal: 1,
+      message: { "session-a": [message] },
+    })
+    const destination = createStore({})
+    const childStores = createChildStores([["/source", source], ["/destination", destination]])
+    const { adoptSessionMove, moveSessionToDirectory, setActionRefs } = await import("./session-actions")
+    setActionRefs(childStores, () => "/source")
+
+    adoptSessionMove("session-a", "/source", "/destination")
+    await moveSessionToDirectory(requested, "/source", "/destination")
+
+    expect(source.getState().session).toHaveLength(0)
+    expect(destination.getState().session).toHaveLength(1)
+    expect(destination.getState().session[0]?.title).toBe("Renamed")
+    expect(destination.getState().sessionTotal).toBe(1)
+    expect(destination.getState().message["session-a"]?.[0]?.id).toBe("message-a")
+    expect((globalUpsertedSessions.at(-1) as Session).title).toBe("Renamed")
   })
 })
 
@@ -816,14 +851,15 @@ describe("confirmed session removal", () => {
   })
 })
 
-describe("archiving a batch through the server", () => {
-  const liveSession = (id: string, metadata?: Record<string, unknown>): Session => ({
-    id,
-    directory: "/test/project",
-    time: { created: 1 },
-    ...(metadata ? { metadata } : {}),
-  } as unknown as Session)
+/** A minimal active-session record: enough for the actions' store mirroring. */
+const liveSession = (id: string, metadata?: Record<string, unknown>): Session => ({
+  id,
+  directory: "/test/project",
+  time: { created: 1 },
+  ...(metadata ? { metadata } : {}),
+} as unknown as Session)
 
+describe("archiving a batch through the server", () => {
   const archivedSession = (id: string) => ({ id, archivedAt: 2 })
 
   beforeEach(() => {
@@ -972,6 +1008,123 @@ describe("archiving a batch through the server", () => {
   })
 })
 
+describe("linking items through the server", () => {
+  const issue: LinkedIssue = {
+    id: "owner/repo#12",
+    number: 12,
+    title: "Rail badge count",
+    url: "https://github.com/owner/repo/issues/12",
+    kind: "issue",
+    author: "someone",
+    linkedAt: 1,
+  }
+  const guestEntry: LinkedIssue = {
+    id: "guest:linear:ENG-1",
+    providerId: "linear",
+    identifier: "ENG-1",
+    title: "Spec",
+    url: "https://linear.app/openchamber/issue/ENG-1",
+    kind: "guest",
+    thread: "issue",
+    linkedAt: 2,
+  }
+
+  beforeEach(() => {
+    replyCalls.length = 0
+    globalUpsertedSessions.length = 0
+    registeredSessionDirectories.length = 0
+    openchamberRouteRequests.length = 0
+    linksRouteResponse = { status: 404, body: { error: "not found" } }
+  })
+
+  test("sends the operation to the links route and mirrors the answer into the stores", async () => {
+    // The metadata is what the server answered, not a list the client computed
+    // from its own read.
+    const metadata = { openchamber: { linked_issues: [issue, guestEntry] } }
+    linksRouteResponse = { status: 200, body: { metadata } }
+    const source = createStore({}, { session: [liveSession("session-a")] })
+    const { setLinkedIssue, setActionRefs } = await import("./session-actions")
+    setActionRefs(createChildStores([["/test/project", source]]), () => "/test/project")
+
+    const updated = await setLinkedIssue("session-a", "/test/project", guestEntry, true)
+
+    expect(openchamberRouteRequests).toHaveLength(1)
+    expect(openchamberRouteRequests[0].path).toBe("/api/openchamber/sessions/session-a/links")
+    expect(openchamberRouteRequests[0].body).toEqual({ entries: [guestEntry], linked: true })
+    // No session read is spent computing the list.
+    expect(replyCalls.filter((call) => call.method === "session.get")).toEqual([])
+    expect(updated.metadata).toEqual(metadata)
+    expect(globalUpsertedSessions).toHaveLength(1)
+    expect(globalUpsertedSessions[0]).toMatchObject({ id: "session-a", metadata })
+    expect(source.getState().session[0]?.metadata).toEqual(metadata)
+    expect(registeredSessionDirectories.some((entry) => entry.sessionID === "session-a" && entry.directory === "/test/project")).toBe(true)
+  })
+
+  test("adds every item of a batch in one request", async () => {
+    const metadata = { openchamber: { linked_issues: [issue, guestEntry] } }
+    linksRouteResponse = { status: 200, body: { metadata } }
+    const source = createStore({}, { session: [liveSession("session-a")] })
+    const { addLinkedIssues, setActionRefs } = await import("./session-actions")
+    setActionRefs(createChildStores([["/test/project", source]]), () => "/test/project")
+
+    await addLinkedIssues("session-a", "/test/project", [issue, guestEntry])
+
+    expect(openchamberRouteRequests).toHaveLength(1)
+    expect(openchamberRouteRequests[0].body).toEqual({ entries: [issue, guestEntry], linked: true })
+  })
+
+  test("reads the record only for display when no store holds it yet", async () => {
+    const metadata = { openchamber: { linked_issues: [issue] } }
+    linksRouteResponse = { status: 200, body: { metadata } }
+    const record = liveSession("session-x")
+    sessionRecords.set("session-x", record)
+    const { setLinkedIssue } = await import("./session-actions")
+
+    const updated = await setLinkedIssue("session-x", "/test/project", issue, true)
+
+    // The read feeds the mirrored record only, and happens before the request:
+    // the link list is the server's.
+    expect(replyCalls.filter((call) => call.method === "session.get")).toHaveLength(1)
+    expect(openchamberRouteRequests).toHaveLength(1)
+    expect(updated.metadata).toEqual(metadata)
+    expect(updated.id).toBe("session-x")
+  })
+
+  test("rejects before any network write when the display read fails for a session no store holds", async () => {
+    const { setLinkedIssue, addLinkedIssues } = await import("./session-actions")
+
+    // No store holds the session and the client cannot read it: the action
+    // must reject before the links request leaves, so a rejection never
+    // reports a link that landed on the server.
+    await expect(setLinkedIssue("session-never-read", "/test/project", issue, true))
+      .rejects.toThrow("SessionNotFoundError")
+    await expect(addLinkedIssues("session-never-read", "/test/project", [issue]))
+      .rejects.toThrow("SessionNotFoundError")
+    expect(openchamberRouteRequests).toHaveLength(0)
+    expect(globalUpsertedSessions).toEqual([])
+  })
+
+  test("rejects when the server cannot serve the route, like the callers' catch expects", async () => {
+    linksRouteResponse = { status: 501, body: { error: "not supported in VS Code" } }
+    const { setLinkedIssue, setActionRefs } = await import("./session-actions")
+    setActionRefs(createChildStores([["/test/project", createStore({})]]), () => "/test/project")
+
+    await expect(setLinkedIssue("session-a", "/test/project", issue, true))
+      .rejects.toThrow("session link update failed")
+    expect(globalUpsertedSessions).toEqual([])
+  })
+
+  test("treats a malformed answer as unavailable instead of as a success", async () => {
+    linksRouteResponse = { status: 200, body: { nope: true } }
+    const { setLinkedIssue, setActionRefs } = await import("./session-actions")
+    setActionRefs(createChildStores([["/test/project", createStore({})]]), () => "/test/project")
+
+    await expect(setLinkedIssue("session-a", "/test/project", issue, true))
+      .rejects.toThrow("session link update failed")
+    expect(globalUpsertedSessions).toEqual([])
+  })
+})
+
 describe("session restore (unarchive)", () => {
   // The route answers with stamps; the full record comes from the archived
   // list the global store already holds.
@@ -1057,7 +1210,24 @@ describe("session restore (unarchive)", () => {
     expect(openchamberRouteRequests.map((request) => request.body.ids)).toEqual([["parent"], ["child"], ["grandchild"]])
   })
 
-  test("never restores a subsession on its own", async () => {
+  test("restores a subsession on its own when its parent is active", async () => {
+    globalActiveSessions = [sessionFixture("parent")]
+    globalArchivedSessions.push({ ...archivedFixture("child"), parentID: "parent" }, { ...archivedFixture("grandchild"), parentID: "child" })
+    beforeArchiveRouteResolve = (path) => {
+      if (!path.endsWith("/unarchive")) return
+      const ids = openchamberRouteRequests.at(-1)?.body.ids
+      unarchiveBatchResponse = { status: 200, body: { restored: [{ id: Array.isArray(ids) ? String(ids[0]) : "", archivedAt: null }], failedIds: [] } }
+    }
+    const source = createStore({}, { session: [] })
+    const { unarchiveSession, setActionRefs } = await import("./session-actions")
+    setActionRefs(createChildStores([["/test/project", source]]), () => "/test/project")
+
+    // Its own archived subsessions come back with it.
+    expect(await unarchiveSession("child")).toBe(true)
+    expect(openchamberRouteRequests.map((request) => request.body.ids)).toEqual([["child"], ["grandchild"]])
+  })
+
+  test("never restores a subsession of an archived or unknown parent on its own", async () => {
     globalArchivedSessions.push(
       { ...sessionFixture("child"), directory: "/test/project", parentID: "parent", time: { created: 1, updated: 1, archived: 5 } } as unknown as Session,
     )
@@ -1068,6 +1238,11 @@ describe("session restore (unarchive)", () => {
 
     expect(await unarchiveSession("child")).toBe(false)
     expect(await unarchiveSessions(["child"])).toEqual({ restoredIds: [], failedIds: ["child"] })
+    expect(openchamberRouteRequests).toEqual([])
+
+    // The same once the parent is known and archived.
+    globalArchivedSessions.push(archivedFixture("parent"))
+    expect(await unarchiveSession("child")).toBe(false)
     expect(openchamberRouteRequests).toEqual([])
 
     // Undo puts back exactly what an archive just moved, subsessions included.
@@ -1389,6 +1564,34 @@ describe("optimisticSend target directory", () => {
     expect(currentStore.getState().session_status["session-new"]).toBe(undefined)
   })
 
+  test("marks the prompt as being sent until its request settles, accepted or rejected", async () => {
+    const targetStore = createStore({})
+    const childStores = createChildStores([["/target/project", targetStore]])
+    const { optimisticSend, setActionRefs, setOptimisticRefs } = await import("./session-actions")
+    const { hasPromptInFlight } = await import("./prompts-in-flight")
+    setActionRefs(childStores, () => "/target/project")
+    setOptimisticRefs(() => {}, () => {})
+
+    let inFlightDuringSend = false
+    await optimisticSend({
+      sessionId: "session-cold",
+      directory: "/target/project",
+      content: "hello",
+      send: async () => { inFlightDuringSend = hasPromptInFlight("session-cold") },
+    })
+    expect(inFlightDuringSend).toBe(true)
+    expect(hasPromptInFlight("session-cold")).toBe(false)
+
+    await expect(optimisticSend({
+      sessionId: "session-cold",
+      directory: "/target/project",
+      content: "again",
+      send: async () => { throw new Error("rejected") },
+    })).rejects.toThrow("rejected")
+    expect(hasPromptInFlight("session-cold")).toBe(false)
+    expect(targetStore.getState().session_status["session-cold"]?.type).toBe("idle")
+  })
+
   test("commits the new branch locally and discards its optimistic shadow when sending after a revert", async () => {
     const retainedMessage = { id: "msg_ffffffffffffRetained", role: "user", sessionID: "session-reverted", time: { created: 1 } } as Message
     const revertedMessage = { id: "msg_000000000000Reverted", role: "user", sessionID: "session-reverted", time: { created: 2 } } as Message
@@ -1568,6 +1771,42 @@ describe("optimisticSend target directory", () => {
     expect(sent).toEqual({ messageID: ids[2], contextIDs: [ids[0], ids[1]] })
     // A rejected send takes the context records down with the prompt.
     expect(removed).toEqual(ids)
+  })
+
+  test("shows the prompt before the knowledge write finishes, and sends only after it", async () => {
+    const targetStore = createStore({})
+    const childStores = createChildStores([["/target/project", targetStore]])
+    const added: Message[] = []
+    let sent: { messageID: string; texts: string[] } | null = null
+    let finishWrite: () => void = () => {}
+    const ready = new Promise<void>((resolve) => { finishWrite = resolve })
+
+    const { optimisticSend, setActionRefs, setOptimisticRefs } = await import("./session-actions")
+    setActionRefs(childStores, () => "/target/project")
+    setOptimisticRefs((input) => { added.push(input.message) }, () => {})
+
+    const sending = optimisticSend({
+      sessionId: "session-ready",
+      directory: "/target/project",
+      content: "hello",
+      context: [{ text: "quoted" }],
+      ready,
+      send: async (messageID, context) => {
+        sent = { messageID, texts: context.map((item) => item.text) }
+      },
+    })
+    for (let tick = 0; tick < 50 && !added.some((message) => message.role === "user"); tick += 1) {
+      await Promise.resolve()
+    }
+
+    // The bubble is on screen while the knowledge is still being written, and
+    // nothing has been sent ahead of it.
+    expect(added.map((message) => message.role)).toEqual(["synthetic", "user"])
+    expect(sent).toBe(null)
+
+    finishWrite()
+    await sending
+    expect(sent).toEqual({ messageID: added[1].id, texts: ["quoted"] })
   })
 
   test("runs appendSubmissions once for an ambiguous confirmation", async () => {
@@ -2357,8 +2596,8 @@ describe("revertToMessage passes session directory", () => {
     const session = sessionFixture("session-a")
     sessionRecords.set(session.id, session)
     const earlier = { id: "msg_1", sessionID: "session-a", role: "user", time: { created: 1 } } as Message
-    const firstCarrier = { id: "msg_ctx_1", sessionID: "session-a", role: "synthetic", time: { created: 2 } } as Message
-    const secondCarrier = { id: "msg_ctx_2", sessionID: "session-a", role: "synthetic", time: { created: 3 } } as Message
+    const firstCarrier = { id: "msg_ctx_1", sessionID: "session-a", role: "synthetic", time: { created: 2 }, text: "quoted selection" } as Message
+    const secondCarrier = { id: "msg_ctx_2", sessionID: "session-a", role: "synthetic", time: { created: 3 }, text: "review comment" } as Message
     const targetMessage = { id: "msg_2", sessionID: "session-a", role: "user", time: { created: 4 } } as Message
     const sessionStore = createStore({}, {
       session: [session],
@@ -2367,6 +2606,7 @@ describe("revertToMessage passes session directory", () => {
     })
     const { setActionRefs, revertToMessage } = await import("./session-actions")
     setActionRefs(createChildStores([["/test/project", sessionStore]]), () => "/test/project")
+    openchamberRouteRequests.length = 0
 
     await revertToMessage("session-a", "msg_2")
 
@@ -2542,6 +2782,51 @@ describe("revertToMessage passes session directory", () => {
   })
 })
 
+describe("revertToMessage paged message lookup", () => {
+  beforeEach(() => {
+    replyCalls.length = 0
+    sessionMessageRecords.clear()
+    sessionRecords.clear()
+    failingRevertSessionIds.clear()
+    cursorMessagePages = null
+    Object.assign(inputState, {
+      pendingInputText: "",
+      pendingInputMode: "replace",
+      attachedFiles: [],
+    })
+  })
+
+  test("stages the revert when the target message is only on a later page", async () => {
+    const session = sessionFixture("session-a")
+    sessionRecords.set(session.id, session)
+    const newer: Message = { id: "msg_newer", sessionID: "session-a", role: "user", time: { created: 3 } }
+    const older: Message = { id: "msg_old", sessionID: "session-a", role: "user", time: { created: 1 } }
+    const sessionStore = createStore({}, {
+      session: [session],
+      message: { "session-a": [newer] },
+      part: {},
+    })
+    const currentStore = createStore({})
+    const childStores = createChildStores([
+      ["/test/project", sessionStore],
+      ["/current/project", currentStore],
+    ])
+    // The local store holds only the newest page; the target sits behind a cursor.
+    cursorMessagePages = [
+      { items: [{ info: newer, parts: [] }], cursor: { next: "1" } },
+      { items: [{ info: older, parts: [] }], cursor: {} },
+    ]
+    const { setActionRefs, revertToMessage } = await import("./session-actions")
+    setActionRefs(childStores, () => "/current/project")
+
+    await revertToMessage("session-a", "msg_old")
+
+    expect(replyCalls.find((call) => call.method === "session.revert.stage")?.params.messageID).toBe("msg_old")
+    expect(sessionStore.getState().session[0]?.revert?.messageID).toBe("msg_old")
+    expect(replyCalls.filter((call) => call.method === "session.messages")).toHaveLength(2)
+  })
+})
+
 describe("dismissPermission passes directory", () => {
   beforeEach(() => {
     replyCalls.length = 0
@@ -2633,6 +2918,10 @@ describe("cancelForm passes directory", () => {
     expect(replyCalls[0].params.directory).toBe("/test/project")
   })
 })
+
+function archivedFixture(id: string): Session {
+  return { ...sessionFixture(id), time: { created: 1, updated: 1, archived: 5 } }
+}
 
 function sessionFixture(id: string): Session {
   return {
@@ -2907,6 +3196,7 @@ describe("dismissOpenFormsForSession", () => {
   beforeEach(() => {
     replyCalls.length = 0
     formReplyError = null
+    formCancelError = null
   })
 
   test("returns false and rejects nothing when no forms are pending", async () => {
@@ -2974,6 +3264,34 @@ describe("dismissOpenFormsForSession", () => {
     // The stale entry is cleared from the store even though the server reported not-found.
     expect(store.getState().form["session-a"]).toBe(undefined)
   })
+
+  test("puts the forms back when the cancel fails for another reason (#2448)", async () => {
+    const rootForm = buildForm("q-root", "session-a")
+    const childForm = buildForm("q-child", "session-child")
+    const store = createStore({}, {
+      session: [sessionFixture("session-a")],
+      form: { "session-a": [rootForm] },
+    })
+    // The subagent's session lives in its own worktree store.
+    const worktreeStore = createStore({}, {
+      session: [{ ...sessionFixture("session-child"), parentID: "session-a" }],
+      form: { "session-child": [childForm] },
+    })
+    const childStores = createChildStores([["/test/project", store], ["/test/project/wt", worktreeStore]])
+    formCancelError = Object.assign(new Error("session.form.cancel failed (500): unexpected status"), { status: 500 })
+
+    const { setActionRefs, dismissOpenFormsForSession } = await import("./session-actions")
+    setActionRefs(childStores, () => "/test/project")
+
+    const dismissed = await dismissOpenFormsForSession("session-a")
+
+    expect(dismissed).toBe(true)
+    // The agent is still waiting on both forms, so each goes back to the store it came from.
+    expect(store.getState().form["session-a"]).toEqual([rootForm])
+    expect(store.getState().form["session-child"]).toBe(undefined)
+    expect(worktreeStore.getState().form["session-child"]).toEqual([childForm])
+    expect(worktreeStore.getState().form["session-a"]).toBe(undefined)
+  })
 })
 
 describe("dismissPermission not-found handling", () => {
@@ -3008,6 +3326,32 @@ describe("dismissPermission not-found handling", () => {
 
     await expect(dismissPermission("session-a", "perm-500")).rejects.toThrow()
     // A non-not-found failure leaves store reconciliation to the next server event.
+    expect(store.getState().permission["session-a"]).toHaveLength(1)
+  })
+
+  test("an allow on a permission the server no longer has clears the card", async () => {
+    const permission = buildPermission("perm-stale", "session-a")
+    const store = createStore({ "session-a": [permission] })
+    const childStores = createChildStores([["/test/project", store]])
+    permissionReplyError = Object.assign(new Error("permission.reply failed (404): PermissionNotFoundError"), { status: 404 })
+
+    const { setActionRefs, respondToPermission } = await import("./session-actions")
+    setActionRefs(childStores, () => "/test/project")
+
+    await expect(respondToPermission("session-a", "perm-stale", "once")).rejects.toThrow()
+    expect(store.getState().permission["session-a"]).toBe(undefined)
+  })
+
+  test("an allow that fails for another reason keeps the card", async () => {
+    const permission = buildPermission("perm-500", "session-a")
+    const store = createStore({ "session-a": [permission] })
+    const childStores = createChildStores([["/test/project", store]])
+    permissionReplyError = Object.assign(new Error("permission.reply failed (500)"), { status: 500 })
+
+    const { setActionRefs, respondToPermission } = await import("./session-actions")
+    setActionRefs(childStores, () => "/test/project")
+
+    await expect(respondToPermission("session-a", "perm-500", "once")).rejects.toThrow()
     expect(store.getState().permission["session-a"]).toHaveLength(1)
   })
 })
@@ -3110,6 +3454,39 @@ describe("dismissOpenPermissionsForSession", () => {
       console.error = originalError
     }
   })
+
+  test("puts the permissions back when the reject fails for another reason", async () => {
+    const rootPermission = buildPermission("perm-root", "session-a")
+    const childPermission = buildPermission("perm-child", "session-child")
+    const store = createStore({ "session-a": [rootPermission] }, {
+      session: [sessionFixture("session-a")],
+    })
+    // The subagent's session lives in its own worktree store.
+    const worktreeStore = createStore({ "session-child": [childPermission] }, {
+      session: [{ ...sessionFixture("session-child"), parentID: "session-a" }],
+    })
+    const childStores = createChildStores([["/test/project", store], ["/test/project/wt", worktreeStore]])
+    permissionReplyError = Object.assign(new Error("permission.reply failed (500): unexpected status"), { status: 500 })
+
+    const { setActionRefs, dismissOpenPermissionsForSession } = await import("./session-actions")
+    setActionRefs(childStores, () => "/test/project")
+
+    const originalError = console.error
+    console.error = () => {}
+    let dismissed: boolean
+    try {
+      dismissed = await dismissOpenPermissionsForSession("session-a")
+    } finally {
+      console.error = originalError
+    }
+
+    expect(dismissed).toBe(true)
+    // The agent is still waiting on both permissions, so each goes back to the store it came from.
+    expect(store.getState().permission["session-a"]).toEqual([rootPermission])
+    expect(store.getState().permission["session-child"]).toBe(undefined)
+    expect(worktreeStore.getState().permission["session-child"]).toEqual([childPermission])
+    expect(worktreeStore.getState().permission["session-a"]).toBe(undefined)
+  })
 })
 
 describe("setSessionWorkState", () => {
@@ -3139,6 +3516,26 @@ describe("setSessionWorkState", () => {
     expect(updated?.metadata).toEqual({ openchamber: { work: { state: "open" } } })
     const request = openchamberRouteRequests.find((entry) => entry.path.endsWith("/ses-work/metadata"))
     expect(request?.body).toMatchObject({ patch: { openchamber: { work: { state: "open", openedBy: "user" } } } })
+  })
+
+  test("reports a deleted session folder as its own error", async () => {
+    const { SessionDirectoryMissingError, setSessionWorkState } = await import("./session-actions")
+    archiveBatchResponse = { status: 409, body: { error: "Location not found: /gone", code: "SESSION_DIRECTORY_MISSING" } }
+
+    const failure = await setSessionWorkState("ses-work", "/gone", "done").catch((error: Error) => error)
+
+    expect(failure instanceof SessionDirectoryMissingError).toBe(true)
+    expect(globalUpsertedSessions).toHaveLength(0)
+  })
+
+  test("keeps any other failed write a plain error", async () => {
+    const { SessionDirectoryMissingError, setSessionWorkState } = await import("./session-actions")
+    archiveBatchResponse = { status: 500, body: { error: "OpenCode is down" } }
+
+    const failure = await setSessionWorkState("ses-work", "/test/project", "done").catch((error: Error) => error)
+
+    expect(failure instanceof Error).toBe(true)
+    expect(failure instanceof SessionDirectoryMissingError).toBe(false)
   })
 
   test("writes nothing to the new server when the runtime switches during the read", async () => {

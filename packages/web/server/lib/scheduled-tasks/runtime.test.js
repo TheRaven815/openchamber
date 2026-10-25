@@ -334,8 +334,7 @@ describe('scheduled-tasks runtime prompt dispatch', () => {
       waitForOpenCodeReady: async () => {},
       persistSessionGoal: async () => undefined,
       sessionKnowledgeRuntime: {
-        resolvePendingForSession: async () => ({ text: 'Project background', signature: 'sig' }),
-        recordDelivered: async () => undefined,
+        sync: async (sessionID, directory) => { posts.push({ pathname: `knowledge:${sessionID}`, body: { directory } }); return true; },
       },
       logger: { info: () => {}, warn: () => {}, error: () => {} },
     });
@@ -343,12 +342,63 @@ describe('scheduled-tasks runtime prompt dispatch', () => {
     await runtime.runNow('proj', 'task-1');
     runtime.stop();
 
-    const dispatch = posts.filter((post) => post.pathname.startsWith('/api/session/ses_run/'));
-    expect(dispatch.map((post) => post.pathname.split('/').at(-1))).toEqual(['synthetic', 'synthetic', 'prompt']);
-    expect(dispatch[0].body).toMatchObject({ text: 'Project background', resume: false });
+    // The run is marked, so it stays out of In work.
+    expect(posts.find((post) => post.pathname === '/api/session')?.body.metadata).toEqual({ openchamber: { kind: 'scheduled' } });
+    // The project knowledge is written into the session before anything is sent to it.
+    const dispatch = posts.filter((post) => post.pathname.startsWith('/api/session/ses_run/') || post.pathname.startsWith('knowledge:'));
+    expect(dispatch.map((post) => post.pathname.split('/').at(-1))).toEqual(['knowledge:ses_run', 'synthetic', 'prompt']);
+    expect(dispatch[0].body).toEqual({ directory: '/repo' });
     expect(dispatch[1].body.resume).toBe(false);
     expect(dispatch[2].body).toMatchObject({ text: 'Review open issues' });
     expect(dispatch[2].body.resume).toBeUndefined();
+  });
+
+  it('points a run that fails after creating its session at that session', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input, init = {}) => {
+      const { pathname } = new URL(String(input));
+      if (init.method === 'POST' && pathname.endsWith('/prompt')) {
+        return new Response(JSON.stringify({ error: 'provider down' }), { status: 500 });
+      }
+      const data = pathname === '/api/session' ? { id: 'ses_failed' } : pathname === '/api/command' ? [] : {};
+      return new Response(JSON.stringify({ location: { directory: '/repo' }, data }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }));
+    const task = {
+      id: 'task-1',
+      name: 'Nightly',
+      enabled: true,
+      schedule: { kind: 'daily', times: ['03:00'], timezone: 'UTC' },
+      execution: { prompt: 'Review open issues', providerID: 'openai', modelID: 'gpt-5' },
+      state: { createdAt: 1, updatedAt: 1, lastSessionId: 'ses_previous' },
+    };
+    const patches = [];
+    const runtime = createScheduledTasksRuntime({
+      projectConfigRuntime: {
+        listScheduledTasks: async () => [task],
+        reconcileLoopTasks: async () => [task],
+        updateScheduledTaskState: async (_projectID, _taskID, patch) => {
+          patches.push(patch);
+          return { task, updated: true };
+        },
+        updateScheduledTaskStateIf: async () => ({ task, updated: true }),
+      },
+      listProjects: async () => [{ id: 'proj', path: '/repo' }],
+      buildOpenCodeUrl: () => 'http://127.0.0.1:1/',
+      getOpenCodeAuthHeaders: () => ({}),
+      waitForOpenCodeReady: async () => {},
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    await runtime.start();
+    const result = await runtime.runNow('proj', 'task-1');
+    runtime.stop();
+
+    expect(result.ok).toBe(false);
+    // The start clears the previous run's session, creation records this one,
+    // and the failure keeps it.
+    const startIndex = patches.findIndex((patch) => patch.lastStatus === 'running');
+    expect(Object.hasOwn(patches[startIndex], 'lastSessionId')).toBe(true);
+    expect(patches[startIndex].lastSessionId).toBeUndefined();
+    expect(patches[startIndex + 1]).toEqual({ lastSessionId: 'ses_failed' });
+    expect(patches.at(-1)).toMatchObject({ lastStatus: 'error', lastSessionId: 'ses_failed' });
   });
 });
 

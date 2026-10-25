@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { injectedEnvKeys } from '../injected-env.js';
+
 const spawnMock = vi.fn();
 const spawnSyncMock = vi.fn();
 const recordStartupPerformanceMock = vi.fn();
@@ -22,6 +24,7 @@ vi.mock('./startup-performance.js', () => ({
 }));
 
 const { createOpenCodeLifecycleRuntime } = await import('./lifecycle.js');
+const { createServerDiagnosticJournal } = await import('../diagnostics/server-journal.js');
 
 const originalOpencodeBinary = process.env.OPENCODE_BINARY;
 const originalPath = process.env.PATH;
@@ -165,10 +168,42 @@ describe('OpenCode lifecycle', () => {
     }
   });
 
+  it('journals managed launch, readiness, exit and restart as fixed actions only', async () => {
+    const journal = createServerDiagnosticJournal();
+    spawnMock.mockImplementation(() => {
+      const child = createMockChild();
+      queueMicrotask(() => {
+        child.stderr.emit('data', 'plugin failed: token=secret-123 /private/file\n');
+        child.stdout.emit('data', 'opencode server listening on http://127.0.0.1:45678\n');
+      });
+      return child;
+    });
+    globalThis.fetch = vi.fn(async () => ({ ok: false }));
+    const runtime = createRuntime({ diagnosticJournal: journal });
+    const firstServer = await runtime.startOpenCode();
+    runtime.testState.openCodeProcess = firstServer;
+    try {
+      await runtime.restartOpenCode();
+      expect(journal.snapshot().events.map(({ action, detail }) => [action, detail])).toEqual([
+        ['managed launch', 'attempt=1'],
+        ['managed ready', 'attempt=1'],
+        ['managed restart started', undefined],
+        ['managed process exited', undefined],
+        ['managed launch', 'attempt=1'],
+        ['managed ready', 'attempt=1'],
+        ['managed restart ready', undefined],
+      ]);
+      expect(spawnMock.mock.calls[0][2].env).not.toHaveProperty('OPENCODE_PRINT_LOGS');
+      expect(JSON.stringify(journal.snapshot())).not.toMatch(/secret|private/);
+    } finally {
+      await runtime.testState.openCodeProcess.close();
+    }
+  });
+
   it('records an authoritative ready terminal event for external startup', async () => {
     globalThis.fetch = vi.fn(async () => ({
       ok: true,
-      json: async () => ({ version: '2.0.20', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
     }));
     const runtime = createRuntime({
       env: {
@@ -200,7 +235,7 @@ describe('OpenCode lifecycle', () => {
   it('recovers an external OPENCODE_HOST connection using its configured endpoint', async () => {
     const fetchMock = vi.fn(async () => ({
       ok: true,
-      json: async () => ({ version: '2.0.20', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
     }));
     globalThis.fetch = fetchMock;
     const runtime = createRuntime({}, {
@@ -283,7 +318,7 @@ describe('OpenCode lifecycle', () => {
     await fs.mkdir(otherProject);
     const fetchMock = vi.fn(async () => ({
       ok: true,
-      json: async () => ({ version: '2.0.20', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
     }));
     globalThis.fetch = fetchMock;
     const runtime = createRuntime({
@@ -321,7 +356,7 @@ describe('OpenCode lifecycle', () => {
     await fs.mkdir(stale);
     globalThis.fetch = vi.fn(async () => ({
       ok: true,
-      json: async () => ({ version: '2.0.20', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
     }));
     const runtime = createRuntime({
       env: {
@@ -353,6 +388,82 @@ describe('OpenCode lifecycle', () => {
     await fs.rm(root, { recursive: true, force: true });
   });
 
+  it('scopes default reads to the chats root while no project directory is usable', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-no-project-'));
+    const chats = path.join(root, 'chats');
+    const project = path.join(root, 'project');
+    await fs.mkdir(chats);
+    await fs.mkdir(project);
+    let warmup = [];
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+    }));
+    const runtime = createRuntime({
+      env: {
+        ENV_CONFIGURED_OPENCODE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOST: null,
+        ENV_EFFECTIVE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOSTNAME: '127.0.0.1',
+        ENV_SKIP_OPENCODE_START: true,
+      },
+      reapManagedOrphanedProcesses: vi.fn(async () => ({ reaped: 0 })),
+      getWarmupDirectories: vi.fn(async () => warmup),
+      noProjectDirectory: chats,
+    });
+
+    await runtime.bootstrapOpenCodeAtStartup();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // No project: a read without a directory would start OpenCode over the
+    // whole home, its working directory.
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(chats);
+    expect(globalThis.fetch.mock.calls.filter(([url]) => String(url).endsWith('/api/location'))).toEqual([]);
+
+    // A project opened later takes over once the warmup source names it.
+    warmup = [project];
+    await runtime.bootstrapOpenCodeAtStartup();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(project);
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  // The UI stops a chat's location once the user leaves it. A read that went
+  // to the chat used last at startup would start it again, every quota poll.
+  it('scopes reads without a directory to the directory the user works in now', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-current-'));
+    const leftChat = path.join(root, 'left-chat');
+    const current = path.join(root, 'current');
+    await fs.mkdir(leftChat);
+    await fs.mkdir(current);
+    globalThis.fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+    }));
+    const runtime = createRuntime({
+      env: {
+        ENV_CONFIGURED_OPENCODE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOST: null,
+        ENV_EFFECTIVE_PORT: 45678,
+        ENV_CONFIGURED_OPENCODE_HOSTNAME: '127.0.0.1',
+        ENV_SKIP_OPENCODE_START: true,
+      },
+      reapManagedOrphanedProcesses: vi.fn(async () => ({ reaped: 0 })),
+      getWarmupDirectories: vi.fn(async () => [leftChat]),
+    });
+
+    await runtime.bootstrapOpenCodeAtStartup();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(leftChat);
+
+    runtime.noteCurrentDirectory(current);
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(current);
+
+    // A directory that is not there is never sent.
+    runtime.noteCurrentDirectory(path.join(root, 'missing'));
+    expect(runtime.getDefaultOpenCodeDirectory()).toBe(current);
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
   it('advances to a currently-valid warmup directory when the cached default goes stale', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-replace-'));
     const stale = path.join(root, 'gone');
@@ -361,7 +472,7 @@ describe('OpenCode lifecycle', () => {
     await fs.mkdir(surviving);
     globalThis.fetch = vi.fn(async () => ({
       ok: true,
-      json: async () => ({ version: '2.0.20', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
     }));
     // The warm pass offered both; only the first was cached as the default.
     const runtime = createRuntime({
@@ -396,7 +507,7 @@ describe('OpenCode lifecycle', () => {
     let current = stale;
     globalThis.fetch = vi.fn(async () => ({
       ok: true,
-      json: async () => ({ version: '2.0.20', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
     }));
     const runtime = createRuntime({
       env: {
@@ -435,7 +546,7 @@ describe('OpenCode lifecycle', () => {
     await fs.mkdir(locked);
     globalThis.fetch = vi.fn(async () => ({
       ok: true,
-      json: async () => ({ version: '2.0.20', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
+      json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }),
     }));
     const runtime = createRuntime({
       env: {
@@ -472,7 +583,7 @@ describe('OpenCode lifecycle', () => {
     globalThis.fetch = vi.fn(async (url, init) => {
       requested.push([String(url), init?.headers?.['x-opencode-directory'] ?? null]);
       if (String(url).endsWith('/api/info')) {
-        return { ok: true, json: async () => ({ version: '2.0.20', pid: 1, urls: [], paths: { tmp: '/tmp' } }) };
+        return { ok: true, json: async () => ({ version: '2.1.2', pid: 1, urls: [], paths: { tmp: '/tmp' } }) };
       }
       return { ok: true, json: async () => ({ data: [{ id: 'build' }] }) };
     });
@@ -959,6 +1070,42 @@ describe('OpenCode lifecycle', () => {
     }
   });
 
+  it('passes the user variables to OpenCode under the variables OpenChamber owns', async () => {
+    const child = createMockChild();
+    spawnMock.mockImplementationOnce(() => {
+      queueMicrotask(() => {
+        child.stdout.emit('data', 'opencode server listening on http://127.0.0.1:45678\n');
+      });
+      return child;
+    });
+    const getUserEnvironment = vi.fn(() => ({
+      DATABASE_URL: 'postgres://db',
+      PATH: '/opt/tools/bin',
+      OPENCODE_PASSWORD: 'user-password',
+      OPENCHAMBER_AGENT_TOOL_TOKEN: 'user-token',
+    }));
+    const getManagedOpenCodeEnv = vi.fn(async () => ({ OPENCHAMBER_AGENT_TOOL_TOKEN: 'ephemeral' }));
+
+    const runtime = createRuntime({ getUserEnvironment, getManagedOpenCodeEnv });
+    const server = await runtime.startOpenCode();
+    const [, , options] = spawnMock.mock.calls[0];
+
+    expect(options.env.DATABASE_URL).toBe('postgres://db');
+    expect(options.env.PATH).toBe('/opt/tools/bin:/home/user/.bun/bin:/usr/local/bin:/usr/bin');
+    expect(options.env.OPENCODE_PASSWORD).toBe('password');
+    expect(options.env.OPENCHAMBER_AGENT_TOOL_TOKEN).toBe('ephemeral');
+    expect(runtime.getManagedOpenCodeProcessEnv().DATABASE_URL).toBe('postgres://db');
+    // The replaced values are recorded as OpenChamber's; the user's are not.
+    const injected = injectedEnvKeys(options.env);
+    for (const key of ['OPENCODE_PASSWORD', 'OPENCODE_SERVER_PASSWORD', 'OPENCHAMBER_AGENT_TOOL_TOKEN']) {
+      expect(injected.has(key)).toBe(true);
+    }
+    expect(injected.has('DATABASE_URL')).toBe(false);
+    expect(injected.has('PATH')).toBe(false);
+
+    await server.close();
+  });
+
   it('adds managed OpenChamber tool environment without allowing it to replace launch invariants', async () => {
     const child = createMockChild();
     spawnMock.mockImplementationOnce(() => {
@@ -1252,7 +1399,7 @@ it('shares the managed CLI preflight with desktop while startup is pending', asy
   await checking;
   const desktopVerdict = runtime.getManagedOpenCodePreflight();
   expect(runtime.testState.isOpenCodeReady).toBe(false);
-  finish('2.0.20');
+  finish('2.1.2');
   expect(await desktopVerdict).toBe(true);
   expect(checks).toBe(1);
   const server = await starting;

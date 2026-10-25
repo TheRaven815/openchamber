@@ -1,4 +1,5 @@
 import React from 'react';
+import { z } from 'zod';
 import { ErrorBoundary } from '@/components/ui/ErrorBoundary';
 import { RuntimeAPIProvider } from '@/contexts/RuntimeAPIProvider';
 import { registerRuntimeAPIs } from '@/contexts/runtimeAPIRegistry';
@@ -11,6 +12,7 @@ import { usePushVisibilityBeacon } from '@/hooks/usePushVisibilityBeacon';
 import { useWindowTitle } from '@/hooks/useWindowTitle';
 import { useRoutingSync } from '@/hooks/useRoutingSync';
 import { useRootScrollLock } from '@/hooks/useRootScrollLock';
+import { useGlobalSessionsPolling } from '@/hooks/useGlobalSessionsPolling';
 import { opencodeClient } from '@/lib/opencode/client';
 import type { RuntimeAPIs } from '@/lib/api/types';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
@@ -32,6 +34,7 @@ import { refreshWorktreeTopologyForChange } from '@/lib/worktrees/worktreeTopolo
 import { subscribeOpenchamberEvents } from '@/lib/openchamberEvents';
 import type { WorktreeMetadata } from '@/types/worktree';
 import { CHAT_DRAFT_PROJECT_ID } from '@/lib/chatDirectories';
+import { openSessionInOwningHostWindow } from '@/lib/desktop';
 
 const MINI_CHAT_PRESENCE_CHANNEL = 'openchamber:mini-chat-presence';
 
@@ -47,6 +50,16 @@ type MiniChatConfig = {
 type ElectronMiniChatAppProps = {
   apis: RuntimeAPIs;
 };
+
+// `openchamber:open-session` from the desktop shell: a tray pick, a deep link
+// or a notification click. A malformed optional field is dropped on its own.
+const optionalTrimmedString = z.string().trim().optional().catch(undefined);
+const openSessionDetailSchema = z.object({
+  sessionId: z.string().trim().min(1),
+  directory: optionalTrimmedString,
+  messageId: optionalTrimmedString,
+  runtimeKey: optionalTrimmedString,
+});
 
 const readMiniChatConfig = (): MiniChatConfig => {
   const params = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : new URLSearchParams();
@@ -154,15 +167,17 @@ const MiniChatBootstrap: React.FC<{ config: MiniChatConfig }> = ({ config }) => 
 
   // Switch this mini-chat to another session in place (e.g. picked from the
   // tray while this window was focused) instead of spawning a new window.
+  // With the main window closed, a link or a notification click for another
+  // instance lands here too; that session opens in its instance's window.
   React.useEffect(() => {
     const onOpenSession = (event: Event) => {
-      const detail = (event as CustomEvent<{ sessionId?: string; directory?: string }>).detail;
-      const sessionId = typeof detail?.sessionId === 'string' ? detail.sessionId.trim() : '';
-      if (!sessionId) return;
+      const parsed = openSessionDetailSchema.safeParse(event instanceof CustomEvent ? event.detail : null);
+      if (!parsed.success) return;
+      const { sessionId, messageId, runtimeKey } = parsed.data;
+      if (openSessionInOwningHostWindow(sessionId, runtimeKey || null, messageId || null)) return;
       if (useSessionUIStore.getState().currentSessionId === sessionId) return;
       const sessionDirectory = (sessions.find((entry) => entry.id === sessionId) as { directory?: string | null } | undefined)?.directory?.trim();
-      const directory = sessionDirectory
-        || (typeof detail?.directory === 'string' && detail.directory.trim().length > 0 ? detail.directory.trim() : null);
+      const directory = sessionDirectory || parsed.data.directory || null;
       void sync.ensureSessionRenderable(sessionId);
       setCurrentSession(sessionId, directory);
       sessionBootstrappedRef.current = true;
@@ -341,6 +356,9 @@ export function ElectronMiniChatApp({ apis }: ElectronMiniChatAppProps) {
   useWindowTitle();
   useRoutingSync();
   useRootScrollLock();
+  // The header session switcher lists the global session list; this window
+  // is its own app root, so it loads that list itself.
+  useGlobalSessionsPolling(true);
 
   return (
     <ErrorBoundary>

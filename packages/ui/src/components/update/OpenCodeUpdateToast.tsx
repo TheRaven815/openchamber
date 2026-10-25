@@ -1,5 +1,6 @@
 import * as React from 'react';
 import { Icon } from '@/components/icon/Icon';
+import { Spinner } from '@/components/ui/spinner';
 import { toast } from '@/components/ui/toast';
 import { reloadOpenCodeConfiguration } from '@/stores/useAgentsStore';
 import { useUIStore } from '@/stores/useUIStore';
@@ -48,7 +49,7 @@ export const OpenCodeUpdateToast: React.FC = () => {
       id: UPGRADE_TOAST_ID,
       description: t('opencodeUpdate.toast.upgrading.description'),
       duration: Infinity,
-      icon: <Icon name="refresh" className="h-4 w-4 animate-spin text-muted-foreground" />,
+      icon: <Spinner className="h-4 w-4 text-muted-foreground" />,
     });
 
     try {
@@ -98,29 +99,28 @@ export const OpenCodeUpdateToast: React.FC = () => {
       }
       seenVersionsRef.current.add(version);
 
-      const dismiss = {
-        label: t('opencodeUpdate.toast.actions.dismiss'),
-        onClick: () => {
-          getDeferredSafeStorage().setItem(UPDATE_TOAST_DISMISSED_VERSION_KEY, version);
-          void updateDesktopSettings({ openCodeUpdateToastDismissedVersion: version });
-          toast.dismiss(UPDATE_TOAST_ID);
-        },
+      // Closing it with the cross, or swiping it away, skips this version:
+      // the cross is the only way to put it away, so it does what a Dismiss
+      // button did. Update replaces it without skipping anything, and the app
+      // closing it (notifications turned off) is not the user's answer.
+      const skipVersion = () => {
+        if (!useUIStore.getState().showOpenCodeUpdateNotifications) return;
+        getDeferredSafeStorage().setItem(UPDATE_TOAST_DISMISSED_VERSION_KEY, version);
+        void updateDesktopSettings({ openCodeUpdateToastDismissedVersion: version });
       };
-      // The toast wrapper adds an "OK" action when none is given, so the
-      // informational variant makes Dismiss its only button.
       toast.info(t('opencodeUpdate.toast.available.title'), supported
         ? {
           id: UPDATE_TOAST_ID,
           description: t('opencodeUpdate.toast.available.description', { version }),
           duration: Infinity,
           action: { label: t('opencodeUpdate.toast.actions.update'), onClick: runUpgrade },
-          cancel: dismiss,
+          onDismiss: skipVersion,
         }
         : {
           id: UPDATE_TOAST_ID,
           description: t('opencodeUpdate.toast.available.manualDescription', { version }),
           duration: Infinity,
-          action: dismiss,
+          onDismiss: skipVersion,
         });
     };
 

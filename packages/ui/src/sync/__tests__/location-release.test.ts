@@ -2,6 +2,12 @@ import { afterEach, describe, expect, test } from "bun:test"
 import { createLocationRelease, directoryUse, isWorktreeDirectory, type DirectoryUse } from "../location-release"
 import { replaceGlobalSessionStatusById } from "../global-session-status"
 import { replaceDirectoryShells, resetBackgroundShells } from "../background-shells"
+import {
+  PENDING_ASSIST_MAX_AGE_MS,
+  applySessionAssistEvent,
+  resetPendingSessionAssists,
+  subscribeSessionAssistSettled,
+} from "../pending-session-assists"
 import type { WorktreeMetadata } from "@/types/worktree"
 
 // Leaving a chat or worktree directory releases its OpenCode location (and with
@@ -11,8 +17,10 @@ const CHAT = "/home/u/.config/openchamber/chats/2026-10-03/session-a"
 const OTHER_CHAT = "/home/u/.config/openchamber/chats/2026-10-03/session-b"
 const WORKTREE = "/repo/app-worktrees/feature"
 const PROJECT = "/repo/app"
+const OTHER_PROJECT = "/repo/other"
 const CHAT_DELAY = 30_000
 const WORKTREE_DELAY = 300_000
+const PROJECT_DELAY = 900_000
 
 type ManualTimer = { run: () => void; ms: number; cleared: boolean }
 
@@ -25,7 +33,7 @@ function harness(options: { busy?: Set<string>; unknown?: Set<string>; failRelea
   const release = createLocationRelease<ManualTimer>({
     releaseDelayMs: (directory) => {
       if (directory.includes("/chats/")) return CHAT_DELAY
-      return directory === WORKTREE ? WORKTREE_DELAY : null
+      return directory === WORKTREE ? WORKTREE_DELAY : PROJECT_DELAY
     },
     isCurrentDirectory: (directory) => directory === current.value,
     directoryUse: (directory): DirectoryUse => {
@@ -55,7 +63,8 @@ function harness(options: { busy?: Set<string>; unknown?: Set<string>; failRelea
   const fire = () => {
     for (const timer of timers.splice(0)) if (!timer.cleared) timer.run()
   }
-  return { release, released, fire, timers, busy, move }
+  const live = () => timers.filter((timer) => !timer.cleared).map((timer) => timer.ms)
+  return { release, released, fire, timers, live, busy, move }
 }
 
 describe("location release", () => {
@@ -64,7 +73,7 @@ describe("location release", () => {
     h.move(CHAT)
     h.move(PROJECT)
     expect(h.released).toEqual([])
-    expect(h.timers.map((timer) => timer.ms)).toEqual([CHAT_DELAY])
+    expect(h.live()).toEqual([CHAT_DELAY])
     h.fire()
     expect(h.released).toEqual([CHAT])
   })
@@ -73,16 +82,26 @@ describe("location release", () => {
     const h = harness()
     h.move(WORKTREE)
     h.move(PROJECT)
-    expect(h.timers.map((timer) => timer.ms)).toEqual([WORKTREE_DELAY])
+    expect(h.live()).toEqual([WORKTREE_DELAY])
     h.fire()
     expect(h.released).toEqual([WORKTREE])
   })
 
-  test("a project directory is never released", () => {
+  // A user switching between projects held a full MCP set for each of them
+  // until OpenCode's own hour-long sweep.
+  test("leaving a project releases it after the longest delay", () => {
+    const h = harness()
+    h.move(OTHER_PROJECT)
+    expect(h.live()).toEqual([PROJECT_DELAY])
+    h.fire()
+    expect(h.released).toEqual([PROJECT])
+  })
+
+  test("the directory the user is in is never released", () => {
     const h = harness()
     h.move(CHAT)
     h.fire()
-    expect(h.released).toEqual([])
+    expect(h.released).toEqual([PROJECT])
   })
 
   test("coming back before the delay keeps the directory running", () => {
@@ -93,7 +112,7 @@ describe("location release", () => {
     h.move(CHAT)
     h.fire()
     // Only the directories just left are released; the one returned to is not.
-    expect(h.released).toEqual([OTHER_CHAT, WORKTREE])
+    expect(h.released).toEqual([PROJECT, OTHER_CHAT, WORKTREE])
   })
 
   test("busy work is released once it settles, rechecked at the directory's own delay", () => {
@@ -117,6 +136,42 @@ describe("location release", () => {
     h.move(CHAT)
     h.busy.delete(CHAT)
     h.fire()
+    expect(h.released).toEqual([PROJECT])
+  })
+
+  // The server writes a left chat's recap a minute after its answer, reading
+  // the chat's directory. A release before that only starts it again.
+  test("a chat waiting for its recap is released the moment the recap is written", () => {
+    const h = harness({ busy: new Set([CHAT]) })
+    h.move(CHAT)
+    h.move(PROJECT)
+    h.fire()
+    expect(h.released).toEqual([])
+    h.busy.delete(CHAT)
+    h.release.recheck((directory) => directory === CHAT)
+    expect(h.released).toEqual([CHAT])
+    h.fire()
+    expect(h.released).toEqual([CHAT])
+  })
+
+  test("a recap written before the chat delay leaves the delay as it was", () => {
+    const h = harness()
+    h.move(CHAT)
+    h.move(PROJECT)
+    h.release.recheck(() => true)
+    expect(h.released).toEqual([])
+    h.fire()
+    expect(h.released).toEqual([CHAT])
+  })
+
+  test("a recap written after the user came back releases nothing", () => {
+    const h = harness({ busy: new Set([CHAT]) })
+    h.move(CHAT)
+    h.move(PROJECT)
+    h.fire()
+    h.move(CHAT)
+    h.busy.delete(CHAT)
+    h.release.recheck(() => true)
     expect(h.released).toEqual([])
   })
 
@@ -157,6 +212,7 @@ describe("directoryUse", () => {
   afterEach(() => {
     replaceGlobalSessionStatusById(new Map())
     resetBackgroundShells()
+    resetPendingSessionAssists()
   })
 
   test("a directory whose state this window does not hold is unknown", () => {
@@ -172,6 +228,33 @@ describe("directoryUse", () => {
     replaceGlobalSessionStatusById(new Map([["ses_2", { status: { type: "busy" }, directory: CHAT }]]))
     expect(directoryUse(CHAT, idle)).toBe("busy")
     expect(directoryUse(OTHER_CHAT, idle)).toBe("free")
+  })
+
+  test("a recap the server is still to write holds it until the server says it is done", () => {
+    const settled: boolean[] = []
+    const unsubscribe = subscribeSessionAssistSettled((isSettled) => settled.push(isSettled(CHAT)))
+    applySessionAssistEvent({ sessionID: "ses_1", directory: CHAT, pending: true }, () => null)
+    expect(directoryUse(CHAT, idle)).toBe("busy")
+    expect(directoryUse(OTHER_CHAT, idle)).toBe("free")
+    // A failed or dropped assist ends the wait the same way.
+    applySessionAssistEvent({ sessionID: "ses_1", directory: CHAT, pending: false }, () => null)
+    expect(directoryUse(CHAT, idle)).toBe("free")
+    expect(settled).toEqual([true])
+    unsubscribe()
+  })
+
+  test("a wait whose end never arrives stops holding the directory", () => {
+    const realNow = Date.now
+    const announcedAt = realNow()
+    applySessionAssistEvent({ sessionID: "ses_1", directory: CHAT, pending: true }, () => null, announcedAt)
+    expect(directoryUse(CHAT, idle)).toBe("busy")
+    const later = announcedAt + PENDING_ASSIST_MAX_AGE_MS + 1
+    Date.now = () => later
+    try {
+      expect(directoryUse(CHAT, idle)).toBe("free")
+    } finally {
+      Date.now = realNow
+    }
   })
 
   test("a background command holds it", () => {
@@ -190,5 +273,11 @@ describe("isWorktreeDirectory", () => {
     expect(isWorktreeDirectory(`${WORKTREE}/`, byProject)).toBe(true)
     expect(isWorktreeDirectory(PROJECT, byProject)).toBe(false)
     expect(isWorktreeDirectory("/elsewhere", byProject)).toBe(false)
+  })
+
+  test("a sub-folder of a listed worktree is one, a sibling that only shares the name prefix is not", () => {
+    const byProject = new Map([[PROJECT, [worktree(WORKTREE)]]])
+    expect(isWorktreeDirectory(`${WORKTREE}/ai`, byProject)).toBe(true)
+    expect(isWorktreeDirectory(`${WORKTREE}-other`, byProject)).toBe(false)
   })
 })

@@ -19,6 +19,8 @@ const homeDirectory = readArgValue('--openchamber-home');
 const macosMajorRaw = readArgValue('--openchamber-macos-major');
 const macosMajor = Number.parseInt(macosMajorRaw, 10);
 const trayEnabled = process.platform !== 'darwin' || readArgValue('--openchamber-tray-enabled') !== '0';
+// The window has the desktop environment's own title bar, so the page draws no window controls.
+const nativeFrame = readArgValue('--openchamber-native-frame') === '1';
 
 // Preload re-executes on every cross-origin navigation (we run with
 // sandbox:false, per-document). Two separate concerns to balance:
@@ -67,6 +69,14 @@ if (relayHostId && isLocalPage) {
   contextBridge.exposeInMainWorld('__OPENCHAMBER_RELAY_HOST_ID__', relayHostId);
 }
 
+// A window opened for a specific instance carries an explicit runtime, so the
+// renderer keeps that endpoint instead of running the default-host relaunch
+// restore. Exposed on any page (dev direct-host windows are remote-origin);
+// the value is a hint that carries no secret.
+if (readArgValue('--openchamber-explicit-runtime') === '1') {
+  contextBridge.exposeInMainWorld('__OPENCHAMBER_EXPLICIT_RUNTIME__', true);
+}
+
 if (runtimeHeadersRaw && isLocalPage) {
   try {
     const runtimeHeaders = JSON.parse(runtimeHeadersRaw);
@@ -94,9 +104,26 @@ contextBridge.exposeInMainWorld('__OPENCHAMBER_ELECTRON__', {
   runtime: 'electron',
   arch: process.arch,
   trayEnabled,
+  nativeFrame,
 });
 
 contextBridge.exposeInMainWorld('__OPENCHAMBER_PLATFORM__', process.platform);
+
+// Main reloads a window that crashed several times in a row once without its
+// saved layout (expanded folders, open panels), so a layout that crashes the
+// window on load cannot loop forever. The startup splash (a data: page in
+// development, /__splash in packaged UI) loads before main.mjs listens and is
+// never the page that crashed, so it does not ask.
+const isStartupSplash = (() => {
+  try {
+    return location.protocol === 'data:' || location.pathname === '/__splash';
+  } catch {
+    return false;
+  }
+})();
+if (!isStartupSplash && ipcRenderer.sendSync('openchamber:take-safe-start') === true) {
+  contextBridge.exposeInMainWorld('__OPENCHAMBER_SAFE_START__', true);
+}
 
 // Note: bootOutcome must stay writable from the main world's initScript so
 // re-navigations (host switch via deep link) can refresh it. contextBridge-
@@ -164,13 +191,16 @@ ipcRenderer.on('openchamber:relay-dev-tunnel-connect', (event, payload) => {
   if (!isLocalPage || !payload || typeof payload.connectionId !== 'string' || !event.ports?.[0]) return;
   const port = event.ports[0];
   relayDevTunnelPorts.set(payload.connectionId, port);
+  // Main's own payload: the id it opened the tunnel for, or null for the host.
+  const spaceId = payload.spaceId ?? null;
   port.onmessage = (messageEvent) => relayDevTunnelHandler?.({
     connectionId: payload.connectionId,
     remotePort: payload.remotePort,
+    spaceId,
     message: messageEvent.data,
   });
   port.start();
-  relayDevTunnelHandler?.({ connectionId: payload.connectionId, remotePort: payload.remotePort, message: { type: 'connect' } });
+  relayDevTunnelHandler?.({ connectionId: payload.connectionId, remotePort: payload.remotePort, spaceId, message: { type: 'connect' } });
 });
 
 // The desktop bridge is exposed on all pages; the main-process gate in

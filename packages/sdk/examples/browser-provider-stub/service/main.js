@@ -5,8 +5,9 @@ import { deflateSync } from "node:zlib";
 var GUEST_SCROLLING_ATTRIBUTE = "data-oc-scrolling";
 var GUEST_SCROLLBAR_CSS = `
 :root {
-  --oc-scrollbar-thumb: color-mix(in srgb, var(--oc-muted, currentColor) 40%, transparent);
-  --oc-scrollbar-thumb-hover: color-mix(in srgb, var(--oc-muted, currentColor) 65%, transparent);
+  /* Quiet at rest like the app's own thumbs; hover gives a clear grab target. */
+  --oc-scrollbar-thumb: color-mix(in srgb, var(--oc-muted, currentColor) 18%, transparent);
+  --oc-scrollbar-thumb-hover: color-mix(in srgb, var(--oc-muted, currentColor) 36%, transparent);
   scrollbar-gutter: stable;
 }
 * {
@@ -63,6 +64,7 @@ var GUEST_SCROLLBAR_SCRIPT = `(${installGuestScrollbarActivity.toString()})(docu
 var patternExpressions = new Map;
 // packages/sdk/src/contract.ts
 var GUEST_FILE_STAT_KINDS = ["file", "directory", "other", "missing"];
+var GUEST_GENERATE_LATE_KEEP_MS = 60 * 60000;
 var HOST_REQUEST_ERROR_CODES = [
   "HOST_UNAVAILABLE",
   "HOST_TIMEOUT",
@@ -73,6 +75,8 @@ var HOST_REQUEST_ERROR_CODES = [
   "NO_INTEGRATION",
   "NO_SERVICE",
   "SERVICE_FAILED",
+  "REQUEST_FAILED",
+  "RESPONSE_TOO_LARGE",
   "NO_SESSION",
   "SESSION_BUSY",
   "NOT_GRANTED",
@@ -90,6 +94,7 @@ var serviceStatusSet = new Set(SERVICE_STATUS_VALUES);
 var fileStatKindSet = new Set(GUEST_FILE_STAT_KINDS);
 var HOST_PUSH_TYPES = new Set([
   "workspace",
+  "shells",
   "ready",
   "directory",
   "session",
@@ -103,7 +108,8 @@ var HOST_PUSH_TYPES = new Set([
   "popover-closed",
   "file-open",
   "file-snapshot",
-  "file-saved"
+  "file-saved",
+  "generate-late"
 ]);
 // packages/sdk/src/service-providers.ts
 var BROWSER_PROVIDER_PATH = "/browser-control";
@@ -112,12 +118,14 @@ var BROWSER_CONTROL_ACTIONS = [
   "browser.snapshot",
   "browser.click",
   "browser.type",
+  "browser.select",
   "browser.scroll",
   "browser.back",
   "browser.forward",
   "browser.inspect",
   "browser.capture",
-  "browser.resize"
+  "browser.resize",
+  "browser.close"
 ];
 var BROWSER_PROVIDER_IDLE_MS = 10 * 60000;
 var CONTROL_ACTIONS = new Set(BROWSER_CONTROL_ACTIONS);
@@ -149,6 +157,7 @@ var readBrowserProviderRequest = (body) => {
     return null;
   return { requestId, action, parameters, context: readContext(context) };
 };
+var SOURCE_CONTROL_PROVIDER_IDLE_MS = 10 * 60000;
 // packages/sdk/src/service-surface.ts
 var SURFACE_FRAME_PATH = "/surface/frame";
 var SURFACE_INPUT_PATH = "/surface/input";
@@ -282,13 +291,19 @@ var page = {
   forward: [],
   viewport: "fill",
   scrollY: 0,
-  fields: new Map
+  fields: new Map,
+  select: { label: "United States", value: "us" }
 };
 var viewport = () => ({ mode: page.viewport, ...VIEWPORTS[page.viewport] });
+var selectOptions = () => [
+  { label: "United States", value: "us", selected: page.select.value === "us", disabled: false },
+  { label: "Canada", value: "ca", selected: page.select.value === "ca", disabled: false }
+];
 var elements = () => [
   { selector: "#name", tag: "input", type: "text", label: "Name", bounds: { x: 16, y: 40, width: 240, height: 32 }, inViewport: true },
+  { selector: "#country", tag: "select", label: "Country", multiple: false, options: selectOptions(), bounds: { x: 16, y: 136, width: 240, height: 32 }, inViewport: true },
   { selector: "#save", tag: "button", label: "Save", bounds: { x: 16, y: 88, width: 80, height: 32 }, inViewport: true },
-  { selector: 'a[href="/about"]', tag: "a", label: "About", bounds: { x: 16, y: 140, width: 60, height: 20 }, inViewport: true }
+  { selector: 'a[href="/about"]', tag: "a", label: "About", bounds: { x: 16, y: 188, width: 60, height: 20 }, inViewport: true }
 ];
 var navigate = (url) => {
   if (page.url !== "about:blank")
@@ -321,7 +336,8 @@ var handle = (request) => {
           scrollY: page.scrollY,
           maxScrollY: 600,
           text: `This page is served by the browser provider stub, not a browser.
-Name: ${page.fields.get("#name") ?? ""}`,
+Name: ${page.fields.get("#name") ?? ""}
+Country: ${page.select.label}`,
           elements: elements(),
           viewport: viewport()
         }
@@ -339,6 +355,21 @@ Name: ${page.fields.get("#name") ?? ""}`,
         return { ok: false, error: `${request.parameters.selector} is not a text field` };
       page.fields.set("#name", request.parameters.value);
       return { ok: true, data: { selector: "#name", url: page.url } };
+    }
+    case "browser.select": {
+      if (request.parameters.selector !== "#country")
+        return { ok: false, error: `No element matches ${request.parameters.selector}` };
+      const options = [
+        { label: "United States", value: "us" },
+        { label: "Canada", value: "ca" }
+      ];
+      const target = options.filter((option) => ("label" in request.parameters) ? option.label === request.parameters.label : option.value === request.parameters.value);
+      if (target.length === 0)
+        return { ok: false, error: "No option matches the exact label or value" };
+      if (target.length > 1)
+        return { ok: false, error: "More than one option matches the exact label or value" };
+      page.select = target[0];
+      return { ok: true, data: { selector: "#country", label: page.select.label, value: page.select.value, url: page.url } };
     }
     case "browser.scroll": {
       const { direction } = request.parameters;
@@ -382,6 +413,8 @@ Name: ${page.fields.get("#name") ?? ""}`,
     case "browser.resize":
       page.viewport = request.parameters.viewport;
       return { ok: true, data: { viewport: viewport() } };
+    case "browser.close":
+      return { ok: false, error: "This browser has a single page and no tabs; there is nothing to close." };
   }
 };
 var surface = {

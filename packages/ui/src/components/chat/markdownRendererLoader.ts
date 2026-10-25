@@ -1,11 +1,12 @@
-type MarkdownRendererModule = typeof import('./MarkdownRendererImpl');
+type MarkdownRendererModule = Pick<typeof import('./MarkdownRendererImpl'), 'MarkdownRenderer' | 'SimpleMarkdownRenderer'>;
 
 let markdownRendererModulePromise: Promise<MarkdownRendererModule> | null = null;
 let markdownRendererModule: MarkdownRendererModule | null = null;
 
 export const loadMarkdownRendererModule = () => {
   markdownRendererModulePromise ??= import('./MarkdownRendererImpl')
-    .then((module) => {
+    .then(({ MarkdownRenderer, SimpleMarkdownRenderer }) => {
+      const module = { MarkdownRenderer, SimpleMarkdownRenderer };
       markdownRendererModule = module;
       return module;
     })

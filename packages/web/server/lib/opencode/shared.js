@@ -14,6 +14,7 @@ import {
 } from 'jsonc-parser';
 import { readSectionEntry, readMcpEntry } from './config-v2.js';
 import { resolveWorktreeDirectory } from './worktree-directory.js';
+import { writeFileAtomic } from './atomic-write.js';
 
 // ============== PATH CONSTANTS ==============
 
@@ -87,7 +88,14 @@ function sanitizeFrontmatter(frontmatter) {
 }
 
 function parseMdFile(filePath) {
-  const rawContent = fs.readFileSync(filePath, 'utf8');
+  return parseMdContent(fs.readFileSync(filePath, 'utf8'), filePath);
+}
+
+async function parseMdFileAsync(filePath) {
+  return parseMdContent(await fs.promises.readFile(filePath, 'utf8'), filePath);
+}
+
+function parseMdContent(rawContent, filePath) {
   // Strip a UTF-8 BOM so frontmatter is recognized regardless of the editor
   // that saved the file.
   const content = rawContent.charCodeAt(0) === 0xfeff ? rawContent.slice(1) : rawContent;
@@ -119,16 +127,25 @@ function parseMdFile(filePath) {
   return { frontmatter, body };
 }
 
-function writeMdFile(filePath, frontmatter, body) {
+// `flag: 'wx'` creates the file and fails with EEXIST when it is already
+// there; that error is passed on as is so a caller can tell it apart.
+function writeMdFile(filePath, frontmatter, body, { flag = 'w' } = {}) {
   try {
     const cleanedFrontmatter = Object.fromEntries(
       Object.entries(frontmatter).filter(([, value]) => value != null)
     );
     const yamlStr = yaml.stringify(cleanedFrontmatter);
     const content = `---\n${yamlStr}---\n\n${body}`;
-    fs.writeFileSync(filePath, content, 'utf8');
+    if (flag === 'wx') {
+      fs.writeFileSync(filePath, content, { encoding: 'utf8', flag });
+    } else {
+      // OpenCode watches its agent and command folders, so a rewrite must not
+      // expose a half-written file.
+      writeFileAtomic(filePath, content);
+    }
     console.log(`Successfully wrote markdown file: ${filePath}`);
   } catch (error) {
+    if (error?.code === 'EEXIST') throw error;
     console.error(`Failed to write markdown file ${filePath}:`, error);
     throw new Error('Failed to write agent markdown file');
   }
@@ -181,6 +198,51 @@ function getConfigPaths(workingDirectory) {
       ? path.resolve(process.env.OPENCODE_CONFIG)
       : null,
   };
+}
+
+function realPathOrResolved(filePath) {
+  try {
+    return fs.realpathSync(filePath);
+  } catch {
+    return path.resolve(filePath);
+  }
+}
+
+function isFile(filePath) {
+  try {
+    return fs.statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Every config file OpenCode 2 finds by walking up from the project folder to
+ * the filesystem root, lowest priority first, as `ConfigDiscovery.discover`
+ * and `Config.load` order them: each folder's `opencode.json` then
+ * `opencode.jsonc`, outermost folder first, followed by each folder's
+ * `.opencode/opencode.json(c)` in the same order. The global config files are
+ * left out, and there is no walk when the project folder is the global config
+ * folder itself.
+ */
+function getFolderConfigPaths(workingDirectory) {
+  if (!workingDirectory) return [];
+  const globalDirectory = realPathOrResolved(OPENCODE_CONFIG_DIR);
+  if (realPathOrResolved(workingDirectory) === globalDirectory) return [];
+  const globalFiles = ['opencode.json', 'opencode.jsonc']
+    .map((name) => realPathOrResolved(path.join(OPENCODE_CONFIG_DIR, name)));
+  const isGlobal = (filePath) => globalFiles.includes(realPathOrResolved(filePath));
+  const folders = getAncestors(workingDirectory).reverse();
+  const configFilesIn = (folder) => ['opencode.json', 'opencode.jsonc']
+    .map((name) => path.join(folder, name))
+    .filter((filePath) => isFile(filePath) && !isGlobal(filePath));
+  return [
+    ...folders.flatMap(configFilesIn),
+    ...folders
+      .map((folder) => path.join(folder, '.opencode'))
+      .filter((folder) => realPathOrResolved(folder) !== globalDirectory)
+      .flatMap(configFilesIn),
+  ];
 }
 
 function getPrimaryUserConfigPath(userPaths) {
@@ -533,7 +595,7 @@ function writeConfig(config, filePath = CONFIG_FILE) {
     // A JSON round-trip normalizes the config at the write boundary: it drops
     // `undefined` values exactly like the serialized write would.
     const desired = JSON.parse(JSON.stringify(config));
-    fs.writeFileSync(filePath, buildConfigFileContent(desired, existingRaw, existingParse), 'utf8');
+    writeFileAtomic(filePath, buildConfigFileContent(desired, existingRaw, existingParse));
     console.log(`Successfully wrote config file: ${filePath}`);
   } catch (error) {
     if (isInvalidJsoncError(error)) {
@@ -703,34 +765,62 @@ function writePromptFile(filePath, content) {
 
 // ============== SKILL FILE OPERATIONS ==============
 
-function walkSkillMdFiles(rootDir) {
-  if (!rootDir || !fs.existsSync(rootDir)) return [];
+async function pathExists(target) {
+  try {
+    await fs.promises.access(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
-  const results = [];
-  // Real paths of the directories on the current walk path. Links (symlinks and
-  // Windows junctions) are followed at any depth; a link back to one of its own
-  // ancestors is skipped instead of recursing forever. Two links to the same
-  // target elsewhere in the tree are both walked, as the top level always did.
-  const ancestors = new Set();
-  const walk = (dir) => {
+// At most this many file-system calls of one walk are in flight at once.
+const SKILL_WALK_CONCURRENCY = 8;
+
+// Async so a skills tree with tens of thousands of entries (a bundled `.venv`
+// or `node_modules`) does not hold the server's event loop for seconds.
+// Sibling directories are read in parallel, a few calls at a time, and their
+// results are joined in readdir order, so the order matches the old
+// synchronous depth-first walk exactly.
+async function walkSkillMdFiles(rootDir) {
+  if (!rootDir || !(await pathExists(rootDir))) return [];
+
+  let active = 0;
+  const waiting = [];
+  const limited = async (call) => {
+    if (active >= SKILL_WALK_CONCURRENCY) await new Promise((resolve) => waiting.push(resolve));
+    active += 1;
+    try {
+      return await call();
+    } finally {
+      active -= 1;
+      waiting.shift()?.();
+    }
+  };
+
+  // `ancestors` holds the real paths of the directories on the path to `dir`.
+  // Links (symlinks and Windows junctions) are followed at any depth; a link
+  // back to one of its own ancestors is skipped instead of recursing forever.
+  // Two links to the same target elsewhere in the tree are both walked, as the
+  // top level always did.
+  const walk = async (dir, ancestors) => {
     let realDir;
     try {
-      realDir = fs.realpathSync(dir);
+      realDir = await limited(() => fs.promises.realpath(dir));
     } catch {
-      return;
+      return [];
     }
-    if (ancestors.has(realDir)) return;
+    if (ancestors.has(realDir)) return [];
 
     let entries = [];
     try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
+      entries = await limited(() => fs.promises.readdir(dir, { withFileTypes: true }));
     } catch {
-      return;
+      return [];
     }
 
-    ancestors.add(realDir);
-
-    for (const entry of entries) {
+    const childAncestors = new Set(ancestors).add(realDir);
+    const found = await Promise.all(entries.map(async (entry) => {
       const fullPath = path.join(dir, entry.name);
       // Junctions report as links, not directories. A link whose target cannot be
       // stat'ed is skipped, the way an unreadable directory is, instead of failing
@@ -739,33 +829,26 @@ function walkSkillMdFiles(rootDir) {
       let isFileEntry = entry.isFile();
       if (entry.isSymbolicLink()) {
         try {
-          const target = fs.statSync(fullPath);
+          const target = await limited(() => fs.promises.stat(fullPath));
           isDirectoryEntry = target.isDirectory();
           isFileEntry = target.isFile();
         } catch {
-          continue;
+          return [];
         }
       }
-      if (isDirectoryEntry) {
-        walk(fullPath);
-        continue;
-      }
-      if (isFileEntry && entry.name === 'SKILL.md') {
-        results.push(fullPath);
-      }
-    }
-    ancestors.delete(realDir);
+      if (isDirectoryEntry) return walk(fullPath, childAncestors);
+      return isFileEntry && entry.name === 'SKILL.md' ? [fullPath] : [];
+    }));
+    return found.flat();
   };
 
-  walk(rootDir);
-  return results;
+  return walk(rootDir, new Set());
 }
 
-function addSkillFromMdFile(skillsMap, skillMdPath, scope, source) {
-  let parsed;
-  try {
-    parsed = parseMdFile(skillMdPath);
-  } catch {
+// `parsed` is what `parseMdFileAsync(skillMdPath)` resolved to, or null when
+// the file could not be read; an unreadable file adds nothing.
+function addSkillFromMdFile(skillsMap, skillMdPath, parsed, scope, source) {
+  if (!parsed) {
     return;
   }
 
@@ -818,21 +901,21 @@ function resolveSkillSearchDirectories(workingDirectory) {
   return directories;
 }
 
-function listSkillSupportingFiles(skillDir) {
-  if (!fs.existsSync(skillDir)) {
+async function listSkillSupportingFiles(skillDir) {
+  if (!(await pathExists(skillDir))) {
     return [];
   }
 
   const files = [];
 
-  function walkDir(dir, relativePath = '') {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
+  async function walkDir(dir, relativePath = '') {
+    const entries = await fs.promises.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       const relPath = relativePath ? path.join(relativePath, entry.name) : entry.name;
 
       if (entry.isDirectory()) {
-        walkDir(fullPath, relPath);
+        await walkDir(fullPath, relPath);
       } else if (entry.name !== 'SKILL.md') {
         files.push({
           name: entry.name,
@@ -843,7 +926,7 @@ function listSkillSupportingFiles(skillDir) {
     }
   }
 
-  walkDir(skillDir);
+  await walkDir(skillDir);
   return files;
 }
 
@@ -910,6 +993,7 @@ export {
   SKILL_SCOPE,
   ensureDirs,
   parseMdFile,
+  parseMdFileAsync,
   writeMdFile,
   readConfigFile,
   readConfigLayer,
@@ -919,19 +1003,22 @@ export {
   readWorktreeDirectorySetting,
   getConfigForPath,
   writeConfig,
-  lookupSectionEntry,
   getJsonEntrySource,
   getJsonWriteTarget,
+  getLayerError,
+  getProjectConfigCandidates,
+  getFolderConfigPaths,
   getAncestors,
   findWorktreeRoot,
   isPromptFileReference,
   resolvePromptFilePath,
   writePromptFile,
   walkSkillMdFiles,
+  pathExists,
   addSkillFromMdFile,
   resolveSkillSearchDirectories,
   listSkillSupportingFiles,
   readSkillSupportingFile,
   writeSkillSupportingFile,
-  deleteSkillSupportingFile,
+  deleteSkillSupportingFile
 };
