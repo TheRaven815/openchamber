@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { createRequire } from 'node:module';
 
 import { isAgentMemoryFeatureAvailable } from '../agent-memory/feature-flag.js';
+import { isWorkflowFeatureAvailable } from '../workflows/feature-flag.js';
 import { isOverviewFeatureAvailable } from '../overview/feature-flag.js';
 import { isPermissionMode } from '../permission-auto-accept/modes.js';
 import { asNonEmptyString } from '../shared/guards.js';
@@ -772,6 +773,9 @@ export const createSettingsHelpers = (dependencies) => {
     if (candidate.agentKnowledgeToolEnabled === true || candidate.agentKnowledgeToolEnabled === false) {
       result.agentKnowledgeToolEnabled = candidate.agentKnowledgeToolEnabled;
     }
+    if (candidate.agentWorkflowToolEnabled === true || candidate.agentWorkflowToolEnabled === false) {
+      result.agentWorkflowToolEnabled = candidate.agentWorkflowToolEnabled;
+    }
     if (typeof candidate.agentNotifyToolEnabled === 'boolean') {
       result.agentNotifyToolEnabled = candidate.agentNotifyToolEnabled;
     }
@@ -1198,6 +1202,8 @@ export const createSettingsHelpers = (dependencies) => {
       // Tells the client whether agent memory exists in this build at all, so
       // its settings row and panel tab can be absent rather than merely off.
       agentMemoryFeatureAvailable: isAgentMemoryFeatureAvailable(),
+      // The same for agent workflows (`OPENCHAMBER_WORKFLOWS_ENABLE`).
+      agentWorkflowFeatureAvailable: isWorkflowFeatureAvailable(),
       // The overview page ships dark until `OPENCHAMBER_OVERVIEW_ENABLED` is set.
       overviewFeatureAvailable: isOverviewFeatureAvailable(),
       // Jev routing needs the OpenChamber server, so it is present here and

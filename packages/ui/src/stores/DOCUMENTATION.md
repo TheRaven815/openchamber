@@ -399,6 +399,15 @@ switches and reloads. Following moves the agent only (`setAgent(name, {
 keepModel: true })`): the session keeps running on its own model, so neither
 the agent's pinned nor its remembered model is applied, and Auto stays.
 
+The agent shown is the agent sent. The picker labels an open session with its
+`sessionAgentSelections` entry, while a send carries the config store's
+`currentAgentName`, which other sessions, directory snapshots and agent-list
+reloads also write. `ModelControls` therefore brings `currentAgentName` back to
+the session's entry whenever the two differ, through `setAgent` so the
+session's remembered model for that agent comes with it (`keepModel` under
+Auto). Without it, returning to a session could show Build and send the agent
+another session left behind.
+
 The model follows the same rule through `isSessionModelSwitched` /
 `markSessionModelFollowed`, keyed `provider/model#variant`. A record model the
 composer has not reconciled with yet outranks a manual model and its effort

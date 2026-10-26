@@ -183,6 +183,10 @@ no Shift.
   desktop's selection fill and title colour, painted over the row's opaque
   background (`MOBILE_ACTIVE_ROW_CLASS`): the selection token is translucent,
   and as a background it let the swipe actions behind the row show through.
+  The actions are also hidden (`visibility`) whenever the row covers them:
+  while a header opens or closes, WebKit stops painting the sliding and fading
+  rows over their actions, and every row below the header showed its buttons
+  through its text.
 - The phone shows folders and folds them, but does not create, rename, delete
   or file them: folders are edited on the desktop or the web.
 - Search filters the list in place, as on the desktop.
@@ -296,10 +300,12 @@ owns the details). A work is either a linked worktree with every session in
 it, or a root session of the project root (or of a space) with what nests
 under it. Nesting is display lineage (`lib/sessionWorkLineage.ts`,
 `resolveSessionNestingParentId`): a subagent under its run (`parentID`), and
-under the session it grew out of an auto-review (`originalSessionID`), a fork
-or promoted `/btw` (`fork.sessionID`), and a session another session's agent
-started through the openchamber tool (`metadata.openchamber.originSessionID`,
-written by the server's create route). The folder decides first: a session in
+under the session it grew out of an auto-review (`originalSessionID`), and a
+fork or promoted `/btw` (`fork.sessionID`). A session another session's agent
+started through the openchamber tool stays a root: it is the user's own
+conversation, and its prompt links back to the sender in the transcript
+(`metadata.openchamber.promptedBy`). The `originSessionID` older builds wrote
+on such sessions is ignored. The folder decides first: a session in
 another folder stays a root there, and so does a multi-run lane. Archive,
 restore and the Archive page keep OpenCode's `parentID` only.
 `list/sessionCollection.ts` and `projects/useSessionGrouping.ts` both build
@@ -753,9 +759,12 @@ matching and ordering. Search does not fetch sessions or broaden list membership
   and every row after them slides with it. A closed block is drawn as inert
   ghost rows at its old place until the motion ends; rows sliding in from past
   the virtual range stay mounted meanwhile. The block also fades: closing rows
-  are gone by 60% of the motion and opening rows come up after its first 20%.
-  Clipped at full strength, a closing row stayed legible until the rows
-  sliding up cut through it, which read as old content lingering over the new. Collapse all, search, Show more and
+  are gone by 60% of the motion, and an opening row comes up as the boundary
+  uncovers it, solid once half of it shows. Clipped at full strength, a
+  closing row stayed legible until the rows sliding up cut through it, which
+  read as old content lingering over the new. An opening fade on a clock of
+  its own (clear for the first 20%) left the first rows under the header
+  empty while the rows below already slid away. Collapse all, search, Show more and
   live list changes do not animate, nor does anything under reduced motion.
   The phone's list is drawn by the same renderer and animates the same way.
 - Shift selection and Ctrl/Cmd+A consume the model's logical row order. API

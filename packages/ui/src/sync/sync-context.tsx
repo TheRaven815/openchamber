@@ -117,6 +117,8 @@ import {
   type LocationRelease,
 } from "./location-release"
 import { applySessionAssistEvent, subscribeSessionAssistSettled } from "./pending-session-assists"
+import { useWorkflowRunsStore } from "@/lib/workflows/store"
+import { setWorkflowRunningSessions } from "./workflow-activity"
 import { isChatDirectoryPath } from "@/lib/chatDirectories"
 import type { State } from "./types"
 import {
@@ -148,6 +150,14 @@ import {
 } from "./session-message-loader"
 import { openCodeStartupSignal } from "./opencode-startup-gate"
 import { claimFirstServerConnect, notifyFirstServerConnect } from "./first-server-connect"
+
+// Session rows read which sessions run a workflow from a small store of their
+// own (`workflow-activity.ts`), kept here from the runs the server reports.
+useWorkflowRunsStore.subscribe((state) => {
+  setWorkflowRunningSessions(Object.entries(state.bySession).flatMap(([sessionId, entry]) => (
+    entry.runs.some((run) => run.state === "running") ? [sessionId] : []
+  )))
+})
 
 // ---------------------------------------------------------------------------
 // Context
@@ -2013,6 +2023,18 @@ export function handleEvent(
     return
   }
 
+  // Workflow runs live in their own store, keyed by the session that proposed them.
+  if (payload.type === "openchamber.workflow-run") {
+    if (expectedRuntimeKey !== getRuntimeKey()) return
+    useWorkflowRunsStore.getState().apply(payload.properties.run)
+    return
+  }
+  if (payload.type === "openchamber.workflow-run-removed") {
+    if (expectedRuntimeKey !== getRuntimeKey()) return
+    useWorkflowRunsStore.getState().remove(payload.properties.parentSessionId, payload.properties.runId)
+    return
+  }
+
   if (payload.type === "openchamber.permission-auto-accept") {
     usePermissionStore.getState().applySnapshot(policySnapshotFromWire(payload.properties), expectedRuntimeKey, payload.properties.spaceId ?? "")
     return
@@ -3227,6 +3249,8 @@ export function SyncProvider(props: {
         }
         // Queue recovery is independent of the directory-bootstrap debounce.
         void useMessageQueueStore.getState().resync().catch(() => undefined)
+        // Workflow run changes during a gap are not replayed: read the shown sessions' runs again.
+        useWorkflowRunsStore.getState().reloadLoaded()
         useConfigStore.setState({
           isConnected: true,
           hasEverConnected: true,

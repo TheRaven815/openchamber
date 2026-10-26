@@ -26,7 +26,6 @@ import { isDictationCaptureSupported } from '@/lib/dictation/use-dictation-audio
 import { ModelControls } from '../../ModelControls';
 import { ComposerActionButtons } from './ComposerActionButtons';
 import { ComposerAttachmentControls, type ComposerTrackerPicker } from './ComposerAttachmentControls';
-import { FocusModeButton } from './FocusModeButton';
 import { PermissionAutoAcceptButton } from './PermissionAutoAcceptButton';
 import type { PermissionMode } from '@/stores/utils/permissionAutoAccept';
 import type { BtwSelection } from '@/stores/useBtwStore';
@@ -53,7 +52,6 @@ interface ComposerFooterProps {
     canSend: boolean;
     canAbort: boolean;
     hasContent: boolean;
-    isExpandedInput: boolean;
     permissionMode: PermissionMode;
     isPermissionAutoAcceptInteractive: boolean;
     dictationActive: boolean;
@@ -67,7 +65,6 @@ interface ComposerFooterProps {
     attachGuests?: readonly GuestAttachItem[];
     onOpenGuestAttach?: (guestId: string) => void;
     onOpenAttachSheet: () => void;
-    onToggleExpandedInput: () => void;
     onCyclePermissionMode: () => void;
     onPrimaryAction: () => void;
     onAbort: () => void;
@@ -125,7 +122,6 @@ function ComposerFooterView(props: ComposerFooterProps) {
         canSend,
         canAbort,
         hasContent,
-        isExpandedInput,
         permissionMode,
         isPermissionAutoAcceptInteractive,
         dictationActive,
@@ -137,7 +133,6 @@ function ComposerFooterView(props: ComposerFooterProps) {
         attachGuests,
         onOpenGuestAttach,
         onOpenAttachSheet,
-        onToggleExpandedInput,
         onCyclePermissionMode,
         onPrimaryAction,
         onAbort,
@@ -267,12 +262,6 @@ function ComposerFooterView(props: ComposerFooterProps) {
                             onOpenGuestAttach={onOpenGuestAttach}
                             filesOnly={isBtw}
                         />
-                        {!isBtw ? <FocusModeButton
-                            footerIconButtonClass={footerIconButtonClass}
-                            iconSizeClass={iconSizeClass}
-                            isExpandedInput={isExpandedInput}
-                            onToggle={onToggleExpandedInput}
-                        /> : null}
                         <PermissionAutoAcceptButton
                             footerIconButtonClass={footerIconButtonClass}
                             iconSizeClass={iconSizeClass}

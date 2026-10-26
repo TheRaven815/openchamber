@@ -1028,6 +1028,8 @@ export interface CreateGitWorktreePayload {
   taskTitle?: string;
   /** Set to the branch name when OpenChamber generated it, so the agent may later rename it after the task. */
   generatedBranchName?: string;
+  /** The part of a generated name the rename keeps, such as an issue's `issue-180-`. */
+  generatedBranchPrefix?: string;
 }
 
 export interface GitChangeRequestSourceRequest {
@@ -1733,6 +1735,8 @@ export type RepositoryChangeRequestReference = RepositoryReferenceCommon & {
   revisionNumber?: number;
 };
 
+export type ReviewCommentExcerpt = { startLine: number; lines: string[] };
+
 /** A comment as the picker preview shows it; review entries carry their verdict or file and line. */
 export type RepositoryReferenceComment = {
   author: { login: string; avatarUrl?: string } | null;
@@ -1742,6 +1746,8 @@ export type RepositoryReferenceComment = {
   path: string | null;
   line: number | null;
   review: 'approved' | 'changes_requested' | 'commented' | 'dismissed' | null;
+  /** A line comment's lines as its diff showed them (new side), where the host sends them; a suggestion is drawn against them. */
+  excerpt?: ReviewCommentExcerpt;
   /** Set when the comment opens a review thread, or on a discussion, the thread of its replies. */
   thread?: RepositoryReferenceThread;
   /** A discussion comment in a category that takes answers: whether it is the answer, and whether this account may change that. */

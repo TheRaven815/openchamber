@@ -641,6 +641,13 @@
   padding-bottom: var(--oc-kb-scroll-inset, var(--oc-kb-layout, 0px));
 }
 
+/* The iPad sidebar stays where it is when the keyboard opens, as iPadOS apps
+   do: it extends behind the keyboard by exactly what the shell gives up (the
+   same leg as the scroller above), so only the chat column moves. */
+:root.oc-capacitor-app .oc-mobile-app-shell .oc-ipad-sidebar {
+  height: calc(100% + max(var(--oc-kb-layout, 0px) - var(--oc-app-bottom-safe, 0px), 0px));
+}
+
 /* The transcript's end fade band (index.css `.chat-scroll-fade--end`) is
    measured from the scroller's bottom edge, so it extends with it. */
 :root.oc-capacitor-app .oc-mobile-app-shell .chat-scroll-fade--end {

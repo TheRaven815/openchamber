@@ -244,6 +244,8 @@ const UserContextPart: React.FC<{
         case 'tracker-item':
         case 'guest-issue':
         case 'guest-pr':
+        case 'session':
+        case 'session-message':
             // Rendered as link attachments by normalizeUserDisplayParts.
             return null;
     }

@@ -61,6 +61,8 @@ import { useDeviceInfo } from '@/lib/device';
 import { cn, getRevealLabelKey } from '@/lib/utils';
 import { getLanguageFromExtension, getImageMimeType, isAudioFile, isBinaryFile, isDelimitedTableFile, isDrawioFile, isExcalidrawFile, isFontFile, isImageFile, isMermaidFile, isPdfFile, isSvgFile, isVideoFile, looksLikeBinaryText } from '@/lib/toolHelpers';
 import { shouldAllowFileDraftSave, shouldScheduleFileAutosave } from '@/lib/fileEditorAutosave';
+import { MAX_OPEN_FILE_BYTES } from '@/lib/fileOpenLimits';
+import { formatFileSize } from '@/lib/fileSize';
 import { LARGE_FILE_CHAR_THRESHOLD, initialFileTextMode, makeFileContentCacheKey, prepareFileEditorContent, serializeEditorContent, type FileLineEnding } from './fileEditorContent';
 import { getRuntimeKey } from '@/lib/runtime-switch';
 import { subscribeToFileContentInvalidation } from '@/lib/fileContentInvalidation';
@@ -2136,6 +2138,22 @@ export const FilesView: React.FC<FilesViewProps> = ({ mode = 'full', visible = t
       setFileContent('');
       setDraftContent('');
       setLoadedFilePath(node.path);
+      setFileLoading(false);
+      return;
+    }
+
+    // A file past the size limit shows as a failed read instead of being
+    // pulled in whole; a file whose size is unknown is read as before.
+    const sizeStat = await readFileStat(node.path).catch(() => null);
+    if (!isCurrentLoad()) {
+      return;
+    }
+    if (sizeStat && sizeStat.size > MAX_OPEN_FILE_BYTES) {
+      setFileContent('');
+      setDraftContent('');
+      setFileError(t('contextFileOpen.failure.tooLargeSize', { size: formatFileSize(MAX_OPEN_FILE_BYTES) }));
+      setFailedFilePath(node.path);
+      lastLoadedFileStatRef.current = null;
       setFileLoading(false);
       return;
     }

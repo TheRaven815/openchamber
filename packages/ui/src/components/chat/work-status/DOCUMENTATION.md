@@ -54,7 +54,8 @@ The overlay form stays inside the chat column in `ChatContainer`.
 `useWorkStatusVisibility` hides the panel when any of these hold:
 
 - the user switched it off;
-- the runtime is mobile or VS Code;
+- the runtime is mobile or VS Code (the phone shows the sections in its own
+  tab, see below);
 - the context panel is open for the directory the app is effectively on —
   looked up through `useEffectiveDirectory` and `normalizeContextPanelDirectoryKey`,
   the same key the rail and the panel use. It is deliberately **not** the
@@ -101,6 +102,45 @@ The context-panel check mirrors `ContextPanel`'s own derivation: `isOpen` alone
 is not enough, because a panel with no resolvable active tab renders nothing
 and therefore displaces nothing.
 
+## On the phone
+
+The phone has no card. Its workspace drawer opens on a Work status tab
+(`apps/MobileStatusPane.tsx`), first by default, that renders the same
+`WorkStatusSectionList` the card renders, for the session on screen. It
+replaced the drawer's MCP tab: the MCP section carries the same switches.
+
+- **Its own hidden list.** `mobileWorkStatusHiddenSections` is per device and
+  starts with Subagents hidden; the order is the shared
+  `workStatusSectionOrder`. `useWorkStatusHiddenSections` picks the list by
+  `isMobile`, so the sections dialog edits whichever one is on screen.
+- **Usage is left out** (`useUnavailableWorkStatusSections`). The phone has its
+  own Usage page, which reads better there than these compact rows.
+- **Rows go where the phone can show them.** The rows read
+  `useMobileAppActions`: Branch and Changes switch to the drawer's Changes tab,
+  PR and Checks open the PR on the issues and PRs board by its link, and the
+  Context row and the project's app and run controls are absent, since they
+  need a desktop host. A row that opens something outside the drawer (a
+  subagent's session, a pinned message, the board) closes the drawer through
+  `LeaveWorkStatusContext`; the desktop card provides none.
+- **The phone's look, from the same primitives.** Under `WorkStatusTouchContext`
+  (`touchContext.ts`) the primitives draw what the phone's Usage popover draws:
+  a quiet heading over one toned card per section, rows at least 44px with a
+  20px icon column, label then value on the end, text from the typography
+  scale (`typography-ui-label`, `typography-meta`) so it follows the phone's
+  text size. Sections take no props for it. The one section that reads the
+  context itself is MCP: its switch moves from the icon column to the row's
+  end, full size, where a phone puts a switch.
+- The sections dialog opens from a button in the drawer's tab row, shown while
+  this tab is open, rather than over the first heading as on the card.
+- Sections mount only while the tab is on screen, so a closed drawer holds no
+  subscriptions.
+
+### Why a separate hidden list and not the shared one
+
+Subagents are off on the phone unless the user turns them on, while on desktop
+every section is on. One shared list could not hold both defaults, and a phone
+and a laptop are set up apart anyway, as the drawer's tabs already are.
+
 ## Data sources
 
 Everything is read from already-warm caches. The panel adds no aggregated
@@ -115,6 +155,7 @@ which requests only providers enabled for this panel.
 | PR + checks | `useFreshestSourceControlVisualSummaryForBranch` | **read-only**; follows the freshest bound-identity entry for the branch |
 | Subagents | child sessions from `useAllLiveSessions` (`parentID`) + `useAllSessionStatuses`; per-row cost from `computeRollup`'s `perChildCost` (each child's own subtree total, so nested subagent-of-subagent cost rolls up under its immediate parent row) | |
 | Subagent blockers | directory `permission` / `question` maps | one subscription covers every child |
+| Workflows | `useSessionWorkflowRuns` (`lib/workflows/store.ts`): the session's runs read once from the server, then kept current by `openchamber:workflow-run` events | only in builds with workflows |
 | Usage | `components/usage/usageGroups.ts` over `useQuotaStore` | grouping shared with the mobile popover; presentation is not |
 | Linked threads | `lib/linkedIssues.ts` over session metadata; state from tracked items | written by the flows that attach an issue or PR, and removable from the row; a linked PR that is also the checked-out branch's PR shows the branch summary, as its sidebar row does |
 | Turn stats | `telemetry.ts` over `useSessionMessageRecords` | computed while authoritatively idle, including when collapsed so the headline stays current; either rate above 5,000 tok/s is reported as unknown (see the two-rate description below) |
@@ -321,6 +362,31 @@ changes on the branch, so the panel neither fetches status nor renders the
 changed-files row until the bootstrap settles, then forces one status fetch so
 the row reflects the reset tree rather than a mid-creation snapshot.
 
+### Workflow rows
+
+The Workflows section lists the runs the session proposed
+(`packages/web/server/lib/workflows`), newest first. Where the context panel
+exists (desktop and web), a run is one row that opens it in the Workflows
+panel (`components/chat/workflows/WorkflowsPanel.tsx`), which shows its agents,
+log, result and script. The row carries Run and Don't run while the run waits
+for approval and Resume after a failure or a stop; a running run shows its
+current phase and how many of its agents finished; a finished run's icon is
+its state, with no word beside it, as in Subagents. Stop lives in the panel
+and on the chat card. On the phone, which has no context panel, a run's row
+carries the same actions plus Stop, an open run lists its phases with how many
+agents finished and each phase its agents, and a finished run folds to its row
+until pressed. An agent row opens its session like a subagent row
+(`useOpenChildSession`, shared with the Subagents section).
+
+A workflow's agents are child sessions of the session too. The Subagents
+section leaves them out, so a run of fifty agents does not bury the session's
+own subagents and each session shows in one place.
+
+In a build without workflows the section exists in no list: the panel and the
+sections dialog both drop it (`useUnavailableWorkStatusSections`), so the name
+of an unreleased feature does not appear in the dialog. Its id stays in the
+saved order, so it comes back where the user put it.
+
 ## Section order
 
 The default order is by durability:
@@ -330,7 +396,7 @@ The default order is by durability:
    throughput, duration, TTFT, cache hit rate) — true for as long as the session
    is open. Usage sits here rather than lower down because a spent quota stops the
    work outright;
-2. **Subagents** — what is happening right now;
+2. **Subagents** and **Workflows** — what is happening right now;
 3. **MCP**, **Pinned messages**, **Context sources** — supporting material.
 
 The sections dialog has drag handles for changing this order, including hidden

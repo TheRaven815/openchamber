@@ -11,12 +11,26 @@ const encodeHrefPart = (value: string): string =>
  * Inline chip for a reference in a user message or the composer: an attachment
  * citation or a skill, each with its own icon.
  *
+ * The chip keeps one line at its fixed height: a name wider than the field
+ * is cut (`REFERENCE_CHIP_LABEL_CLASS`), never wrapped out of the chip.
  * The negative vertical margins keep the chip's margin box well inside the
  * text line, so inserting one never grows the line box and nudges the lines
  * below by a pixel; the chip still paints at its full height.
  */
 export const INLINE_REFERENCE_CHIP_CLASS =
-    'mx-px -my-[0.2em] inline-flex h-[1.3em] max-w-full items-center gap-1 rounded-md border border-border/70 bg-background/50 px-1.5 align-middle text-[0.875em] leading-none text-foreground';
+    'mx-px -my-[0.2em] inline-flex h-[1.3em] max-w-full items-center gap-1 overflow-hidden whitespace-nowrap rounded-md border border-border/70 bg-background/50 px-1.5 align-middle text-[0.875em] leading-none text-foreground';
+
+/** The label inside a reference chip: one line, cut with an ellipsis where the field is narrower than the name. */
+export const REFERENCE_CHIP_LABEL_CLASS = 'min-w-0 truncate';
+
+/**
+ * Punctuation the user typed right after a chip (`, . : ; ! ? …`, closing
+ * brackets and quotes). A browser may break a line between a chip and the
+ * text after it, which a word and its comma never allow, so each surface
+ * keeps this run on the chip's line: the composer and plain messages wrap
+ * both in a `nowrap` span, Markdown joins them with a word joiner (U+2060).
+ */
+export const CHIP_TRAILING_PUNCTUATION = /^[.,;:!?…)\]}»”’"'%]+/;
 
 /** A chip that opens something (a skill) reacts to hover with a firmer border, not a fill. */
 export const INTERACTIVE_REFERENCE_CHIP_CLASS = `${INLINE_REFERENCE_CHIP_CLASS} cursor-pointer transition-colors hover:border-foreground/40`;

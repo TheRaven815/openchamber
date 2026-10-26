@@ -26,7 +26,7 @@ import type {
 } from '@/lib/api/types';
 import { useSessionUIStore } from '@/sync/session-ui-store';
 import { useSessionWorktreeStore } from '@/sync/session-worktree-store';
-import { isGeneratedBranchName } from '@/lib/git/branchNameGenerator';
+import { generatedBranchPrefix } from '@/lib/git/branchNameGenerator';
 
 type WorktreeListEntry = {
   path?: string;
@@ -274,8 +274,13 @@ const toCreatePayload = (args: {
   if (args.changeRequestSource) payload.changeRequestSource = args.changeRequestSource;
   if (args.returnAfterDirectoryCreated) payload.returnAfterDirectoryCreated = true;
   if (args.taskTitle?.trim()) payload.taskTitle = args.taskTitle.trim();
-  // Quick worktree's `agile-chipmunk`, or the dialog's suggestion kept as is.
-  if (mode === 'new' && branchName && isGeneratedBranchName(branchName)) payload.generatedBranchName = branchName;
+  // Quick worktree's `agile-chipmunk`, or the dialog's suggestion kept as is
+  // (an issue's `issue-180-merry-salamander` keeps `issue-180-` on rename).
+  const generatedPrefix = mode === 'new' && branchName ? generatedBranchPrefix(branchName) : null;
+  if (generatedPrefix !== null) {
+    payload.generatedBranchName = branchName;
+    if (generatedPrefix) payload.generatedBranchPrefix = generatedPrefix;
+  }
   return payload;
 };
 

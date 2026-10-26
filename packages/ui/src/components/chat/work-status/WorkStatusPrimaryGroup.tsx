@@ -21,6 +21,7 @@ import { useSubagentCostRollup } from './useSubagentCostRollup';
 import {
   WorkStatusCallout,
   WorkStatusMeter,
+  WorkStatusNote,
   WorkStatusPill,
   WorkStatusRow,
   WorkStatusSection,
@@ -35,6 +36,9 @@ import { ProjectActionsButton } from '@/components/layout/ProjectActionsButton';
 import { OpenInAppButton } from '@/components/desktop/OpenInAppButton';
 import { useProjectActionsContext } from '@/hooks/useProjectActionsContext';
 import { PrChecksValue } from './PrChecksValue';
+import { useMobileAppActions } from '@/apps/mobileAppContext';
+import { useOpenTrackerItem } from '@/components/sourceBoard/openTrackerItem';
+import { useLeaveWorkStatus } from './leaveWorkStatus';
 import { prChecksTooltip } from './prChecks';
 
 type Props = {
@@ -61,7 +65,13 @@ const UNKNOWN_PERCENT = '\u2014';
  */
 export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, goalRow, showSession, showRepository, children }) => {
   const { t } = useI18n();
-  const projectActionsContext = useProjectActionsContext();
+  // On the phone the rows lead to the phone's own pages, and the project's
+  // app and run controls, which need a desktop host, are left out.
+  const mobile = useMobileAppActions();
+  const leaveWorkStatus = useLeaveWorkStatus();
+  const openTrackerItem = useOpenTrackerItem();
+  const desktopProjectActionsContext = useProjectActionsContext();
+  const projectActionsContext = mobile ? null : desktopProjectActionsContext;
   const { git } = useRuntimeAPIs();
   const ensureStatus = useGitStore((state) => state.ensureStatus);
   const fetchStatus = useGitStore((state) => state.fetchStatus);
@@ -170,6 +180,7 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
   // here would multiply GitHub requests per open session, which is exactly the
   // fan-out the PR-status concurrency gate exists to prevent.
   const prSummary = useFreshestSourceControlVisualSummaryForBranch(gitDirectory, branch);
+  const prUrl = prSummary?.url ?? null;
   const prDescriptor = useSourceControlProvider(prSummary?.provider);
   const prTerm = prDescriptor.terminology.changeRequest;
 
@@ -190,12 +201,23 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
   const openSurface = React.useCallback(
     (mode: 'git' | 'pr') => {
       if (!directory) return;
+      if (mobile) {
+        // The phone's Changes tab holds the branch; the board shows the PR.
+        if (mode === 'git') mobile.openChanges();
+        else if (prUrl) {
+          openTrackerItem(prUrl, directory);
+          leaveWorkStatus?.();
+        }
+        return;
+      }
       // The branch's pull request is the Tracker's branch tab, whichever item tab was last in front.
       if (mode === 'pr') openContextPanelTab(directory, { mode: 'pr' });
       else openContextSurface(directory, mode);
     },
-    [directory, openContextPanelTab, openContextSurface],
+    [directory, leaveWorkStatus, mobile, openContextPanelTab, openContextSurface, openTrackerItem, prUrl],
   );
+  // The phone opens the PR by its link on the board; without one there is nowhere to go.
+  const openPr = directory && (!mobile || prUrl) ? () => openSurface('pr') : undefined;
   // Working-tree diff without a target path: the panel opens on the whole
   // change set rather than picking a file on the user's behalf.
   // Same destination as the header's context readout.
@@ -204,8 +226,10 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
   }, [directory, openContextOverview]);
 
   const openChanges = React.useCallback(() => {
-    if (directory) openContextPanelTab(directory, { mode: 'diff', diffScope: 'working' });
-  }, [directory, openContextPanelTab]);
+    if (!directory) return;
+    if (mobile) mobile.openChanges();
+    else openContextPanelTab(directory, { mode: 'diff', diffScope: 'working' });
+  }, [directory, mobile, openContextPanelTab]);
 
   // Working-tree changes, from the same git status the Git panel reads.
   //
@@ -272,7 +296,8 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
             <>
               <WorkStatusRow
                 icon="donut-chart"
-                onClick={directory ? openContext : undefined}
+                // The context overview is a desktop panel; the phone has none.
+                onClick={directory && !mobile ? openContext : undefined}
                 ariaLabel={t('chat.workStatus.action.openContext')}
                 label={t('chat.workStatus.context.label')}
                 value={(
@@ -288,20 +313,18 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
               />
               <WorkStatusMeter percent={usagePercent ?? 0} color={meterColor} />
               {contextUsage.state === 'compacted' ? (
-                <p className="mx-1 mb-1 text-[0.6875rem] leading-4 text-muted-foreground">
-                  {t('contextUsage.compacted.description')}
-                </p>
+                <WorkStatusNote>{t('contextUsage.compacted.description')}</WorkStatusNote>
               ) : null}
               {/* Caption, not a row: it explains the figure above it rather
                   than reporting a reading of its own, so it carries no icon
                   and no label column. */}
               {showCostBreakdown ? (
-                <p className="mx-1 mb-1 truncate text-[0.6875rem] leading-4 text-muted-foreground tabular-nums">
+                <WorkStatusNote truncate>
                   {t('chat.workStatus.cost.breakdown', {
                     session: formatCost(ownCost),
                     subagents: formatCost(subagentCost),
                   })}
-                </p>
+                </WorkStatusNote>
               ) : null}
             </>
           ) : null}
@@ -376,7 +399,7 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
             <>
               <WorkStatusRow
                 icon="git-pull-request"
-                onClick={directory ? () => openSurface('pr') : undefined}
+                onClick={openPr}
                 ariaLabel={t(changeRequestCopy('chat.workStatus.action.openPr', prTerm))}
                 iconColor={`var(--pr-${prSummary.visualState})`}
                 label={prSummary.title ?? t(changeRequestCopy('chat.workStatus.pr.untitled', prTerm))}
@@ -392,7 +415,7 @@ export const WorkStatusPrimaryGroup: React.FC<Props> = ({ sessionId, directory, 
               {prSummary.checks && prSummary.checks.total > 0 ? (
                 <WorkStatusRow
                   icon="checkbox-circle"
-                  onClick={directory ? () => openSurface('pr') : undefined}
+                  onClick={openPr}
                   ariaLabel={t(changeRequestCopy('chat.workStatus.action.openPr', prTerm))}
                   label={t('chat.workStatus.pr.checks')}
                   muted

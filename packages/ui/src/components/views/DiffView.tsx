@@ -1369,9 +1369,9 @@ export const MultiFileDiffEntry = React.memo<MultiFileDiffEntryProps>(({
                             </Button>
                         ) : null}
                         <WholeFileCommentButton
-                            onClick={wholeFileComment.open}
+                            onClick={wholeFileComment.toggle}
                             active={wholeFileComment.isOpen}
-                            hoverGroupClass="group-hover/header:opacity-70"
+                            className="opacity-70"
                         />
                         <DiffViewToggle
                             mode={renderSideBySide ? 'side-by-side' : 'unified'}

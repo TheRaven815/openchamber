@@ -1,12 +1,14 @@
 import React, { useRef, useEffect } from 'react';
 import { cn } from '@/lib/utils';
+import { textareaCaretCoords } from '@/components/inline-picker/placement';
+import { isPastedInput } from '@/components/inline-picker/useTextareaInlinePicker';
 import { Icon } from '@/components/icon/Icon';
 import { useDeviceInfo } from '@/lib/device';
 import { useI18n } from '@/lib/i18n';
 import { isIMECompositionEvent } from '@/lib/ime';
 import { formatShortcutForDisplay } from '@/lib/shortcuts';
 import { useCommentImagePaste } from './useCommentImagePaste';
-import { useCommentSnippetPicker } from './useCommentSnippetPicker';
+import { useCommentFieldPicker } from './useCommentFieldPicker';
 
 export interface InlineCommentInputProps {
   initialText?: string;
@@ -129,7 +131,8 @@ export function InlineCommentInput({
 
   // `#` opens the composer's snippet picker; references expand on send.
   const getCaret = React.useCallback(() => textareaRef.current?.selectionStart ?? 0, []);
-  const snippetPicker = useCommentSnippetPicker({ text, getCaret, replaceRange });
+  const caretCoords = React.useCallback((position: number) => (textareaRef.current ? textareaCaretCoords(textareaRef.current, position) : null), []);
+  const fieldPicker = useCommentFieldPicker({ text, getCaret, replaceRange, caretCoords });
 
   const handlePaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const field = event.currentTarget;
@@ -151,7 +154,7 @@ export function InlineCommentInput({
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (isIMECompositionEvent(event)) return;
-    if (snippetPicker.handleKeyDown(event)) return;
+    if (fieldPicker.handleKeyDown(event)) return;
     // Desktop Enter attaches; Shift+Enter and mobile Enter break the line.
     // Cmd/Ctrl+Enter stays available for hardware keyboards on mobile.
     if (event.key === 'Enter' && !event.shiftKey && (!isMobile || event.metaKey || event.ctrlKey)) {
@@ -192,16 +195,16 @@ export function InlineCommentInput({
             : 'oc-raised oc-field rounded-lg bg-[var(--surface-elevated)] ps-3',
         )}
       >
-        {snippetPicker.picker}
+        {fieldPicker.picker}
         <textarea
           ref={textareaRef}
           rows={1}
           value={text}
           onChange={(event) => {
             handleTextChange(event.target.value);
-            snippetPicker.sync(event.target.value, event.target.selectionStart);
+            fieldPicker.sync(event.target.value, event.target.selectionStart, !isPastedInput(event.nativeEvent));
           }}
-          onSelect={(event) => snippetPicker.sync(event.currentTarget.value, event.currentTarget.selectionStart)}
+          onSelect={(event) => fieldPicker.sync(event.currentTarget.value, event.currentTarget.selectionStart, false)}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
           placeholder={isMobile

@@ -213,6 +213,10 @@ const TextSelectionMenuImpl: React.FC<TextSelectionMenuProps> = ({ containerRef,
     isMenuVisibleRef.current = false;
   }, []);
 
+  // The chat stays mounted behind a new-session draft and across session
+  // switches, and leaving it fires no selectionchange: its menu closes here.
+  React.useEffect(() => hideMenu, [currentSessionId, newSessionDraftOpen, hideMenu]);
+
   // Listener-facing mirror of the composer's comment state: the document
   // listeners below must not clear the quote highlight for taps inside the
   // comment shell, which lives outside this menu's DOM.

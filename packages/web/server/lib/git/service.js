@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import simpleGit from 'simple-git';
+import { simpleGit } from 'simple-git';
 import { createSerialRefresh } from './serial-refresh.js';
 import { stripAppImageLauncherEnv } from '../inherited-env.js';
 import fs from 'fs';
@@ -384,18 +384,35 @@ export const configureGitEnvironment = (runtime) => {
   gitEnvironment = runtime;
 };
 
-// Names simple-git refuses in a command's environment unless the matching
-// unsafe option is on (EDITOR, PAGER, GIT_SSH_COMMAND, GIT_ASKPASS, ...; see
-// toSimpleGitEnv). One of them from a project environment would make every
-// Git command fail, so the overlay leaves them out for Git only.
-const SIMPLE_GIT_REFUSED_ENV_NAMES = new Set([
-  'editor', 'git_askpass', 'git_config', 'git_config_global', 'git_config_system', 'git_config_count',
-  'git_editor', 'git_exec_path', 'git_external_diff', 'git_pager', 'git_proxy_command', 'git_template_dir',
-  'git_sequence_editor', 'git_ssh', 'git_ssh_command', 'pager', 'prefix', 'ssh_askpass',
+// Names simple-git refuses in a command's environment, each with the unsafe
+// category that lets it through (a copy of @simple-git/argv-parser's table;
+// see simpleGitEnvOptions). One of them from a project environment would make
+// every Git command fail, so the overlay leaves them out for Git only.
+const SIMPLE_GIT_REFUSED_ENV_CATEGORIES = new Map([
+  ['editor', 'allowUnsafeEditor'],
+  ['git_askpass', 'allowUnsafeAskPass'],
+  ['git_config', 'allowUnsafeConfigPaths'],
+  ['git_config_count', 'allowUnsafeConfigEnvCount'],
+  ['git_config_global', 'allowUnsafeConfigPaths'],
+  ['git_config_parameters', 'allowUnsafeConfigEnvCount'],
+  ['git_config_system', 'allowUnsafeConfigPaths'],
+  ['git_editor', 'allowUnsafeEditor'],
+  ['git_exec_path', 'allowUnsafeExec'],
+  ['git_external_diff', 'allowUnsafeDiffExternal'],
+  ['git_pager', 'allowUnsafePager'],
+  ['git_proxy_command', 'allowUnsafeGitProxy'],
+  ['git_sequence_editor', 'allowUnsafeEditor'],
+  ['git_ssh', 'allowUnsafeSshCommand'],
+  ['git_ssh_command', 'allowUnsafeSshCommand'],
+  ['git_template_dir', 'allowUnsafeTemplateDir'],
+  ['pager', 'allowUnsafePager'],
+  ['prefix', 'allowUnsafeConfigPaths'],
+  ['ssh_askpass', 'allowUnsafeAskPass'],
+  ['visual', 'allowUnsafeEditor'],
 ]);
 const isRefusedBySimpleGit = (name) => {
   const lower = name.toLowerCase();
-  return SIMPLE_GIT_REFUSED_ENV_NAMES.has(lower) || lower.startsWith('git_config_key_') || lower.startsWith('git_config_value_');
+  return SIMPLE_GIT_REFUSED_ENV_CATEGORIES.has(lower) || lower.startsWith('git_config_key_') || lower.startsWith('git_config_value_');
 };
 // OpenChamber names the repository each command works on; a project variable
 // must not quietly point Git at another one.
@@ -439,32 +456,33 @@ const buildGitEnv = async (directory) => {
   return env;
 };
 
-// simple-git refuses every command whose env holds a variable that runs a
-// program (EDITOR, PAGER, GIT_SSH_COMMAND, GIT_ASKPASS, ...) unless its unsafe
-// category is enabled, and the same categories also guard -c and other
-// arguments, so enabling them would weaken argument protection. A variable the
-// server's own environment passes through unchanged is what git would inherit
-// without an env anyway, so it goes on the prototype: simple-git's check copies
-// only own keys, while child_process.spawn passes inherited keys to the child.
-// Whatever OpenChamber sets or changes stays an own key and is still checked.
-const toSimpleGitEnv = (env) => {
-  const passedThrough = {};
-  const changed = {};
+// simple-git 4 hands git only the variables of an explicit env that it allows:
+// every GIT_* name and every name that runs a program needs allowEnvironment,
+// and a program-running name (EDITOR, PAGER, GIT_SSH_COMMAND, GIT_ASKPASS, ...)
+// also needs its unsafe category, which guards -c and other arguments too.
+// buildGitEnv already decided what git sees, so every name it holds is
+// allowed. A program-running variable the server's own environment passes
+// through unchanged is what git would inherit without an env anyway, so its
+// category is enabled; one that OpenChamber set or changed stays refused.
+const simpleGitEnvOptions = (env) => {
+  const unsafe = {};
   for (const [key, value] of Object.entries(env)) {
-    if (process.env[key] === value) {
-      passedThrough[key] = value;
-    } else {
-      changed[key] = value;
+    const category = SIMPLE_GIT_REFUSED_ENV_CATEGORIES.get(key.toLowerCase());
+    if (category && process.env[key] === value) {
+      unsafe[category] = true;
     }
   }
-  return Object.assign(Object.create(passedThrough), changed);
+  return { allowEnvironment: Object.keys(env), unsafe };
 };
 
 // Transport configuration is owned by repository bindings and the credential
-// broker, so no caller needs simple-git's unsafe SSH-command or
-// credential-helper escapes any more.
-const createGit = async (directory, { stallTimeoutMs = 0, optionalLocks = true } = {}) => {
-  const env = await buildGitEnv(directory);
+// broker, so no caller asks for simple-git's unsafe SSH-command or
+// credential-helper escapes; simpleGitEnvOptions turns a category on only to
+// let an inherited variable through.
+// `extraEnv` adds variables for this instance only, such as a temporary
+// GIT_INDEX_FILE; simple-git refuses a GIT_* name added later through .env().
+const createGit = async (directory, { stallTimeoutMs = 0, optionalLocks = true, extraEnv } = {}) => {
+  const env = { ...(await buildGitEnv(directory)), ...extraEnv };
   // `git status` holds `.git/index.lock` while it refreshes the index, and a
   // `git commit` the user runs in a terminal at that moment fails with
   // "index.lock: File exists" (#2229). Read-only callers opt out of that
@@ -479,7 +497,10 @@ const createGit = async (directory, { stallTimeoutMs = 0, optionalLocks = true }
   const timeout = stallTimeoutMs > 0 ? { block: stallTimeoutMs } : undefined;
   const binary = getGitBinary();
   const hasCustomBinary = typeof binary === 'string' && binary.trim() && binary !== 'git' && binary !== 'git.exe';
-  const unsafe = hasCustomBinary ? { allowUnsafeCustomBinary: true } : undefined;
+  const { allowEnvironment, unsafe } = simpleGitEnvOptions(env);
+  if (hasCustomBinary) {
+    unsafe.allowUnsafeCustomBinary = true;
+  }
   // Always pin simple-git to an explicit working directory. Omitting baseDir
   // makes simple-git use process.cwd(), which breaks when the OpenChamber
   // server was launched from a neutral directory (e.g. $HOME) and the opened
@@ -495,8 +516,9 @@ const createGit = async (directory, { stallTimeoutMs = 0, optionalLocks = true }
     spawnOptions,
     binary,
     unsafe,
+    allowEnvironment,
     ...(timeout ? { timeout } : {}),
-  }).env(toSimpleGitEnv(env));
+  }).env(env);
 };
 
 // Global config reads do not need a repository; use the home directory as a
@@ -1206,9 +1228,9 @@ const resolveGitCommitFilePath = async (repoRoot, hash, candidates) => {
   throw new Error('Invalid file path');
 };
 
-// simple-git 3.36 refuses GIT_EDITOR unless allowUnsafeEditor is enabled, and
-// once an instance has an explicit env it also rejects inherited PAGER or
-// GIT_ASKPASS values. Run editor-free continuation commands directly instead.
+// simple-git refuses a GIT_EDITOR that OpenChamber sets unless
+// allowUnsafeEditor is enabled, which would also let -c core.editor through.
+// Run editor-free continuation commands directly instead.
 // The full git environment must survive the override: git execs the no-op
 // editor through PATH, and an env of only GIT_EDITOR makes that spawn search
 // the execvp fallback (/bin:/usr/bin), where NixOS has no `true`.
@@ -3560,9 +3582,9 @@ async function runWorkingTreeRangeDiff(context, baseRef, headRef, args, paths = 
     await fsp.copyFile(path.resolve(repoRoot, indexPath), temporaryIndex);
     const pathspecFile = path.join(temporaryDirectory, 'paths');
     await fsp.writeFile(pathspecFile, untracked);
-    const comparisonGit = await createGit(repoRoot);
-    comparisonGit.env('GIT_INDEX_FILE', temporaryIndex);
-    comparisonGit.env('GIT_LITERAL_PATHSPECS', '1');
+    const comparisonGit = await createGit(repoRoot, {
+      extraEnv: { GIT_INDEX_FILE: temporaryIndex, GIT_LITERAL_PATHSPECS: '1' },
+    });
     await comparisonGit.raw(['add', '--intent-to-add', '--pathspec-from-file=' + pathspecFile, '--pathspec-file-nul']);
     return await readDiff(comparisonGit);
   } finally {
@@ -5062,15 +5084,22 @@ const applyBranchTaskTitle = async (directory, branch, by, title) => {
  * `agile-chipmunk`), not one the user chose: `branch.<name>.openchamberGeneratedName`
  * holds the generated name itself, so once the branch is renamed the record,
  * which `git branch -m` carries along, no longer matches and stops applying.
- * Best effort.
+ * `prefix`, the start of the name an issue's branch keeps (`issue-180-`), is
+ * recorded beside it in `openchamberGeneratedPrefix`. Best effort.
  */
-export async function markGeneratedBranchName(directory, branch) {
+export async function markGeneratedBranchName(directory, branch, prefix = null) {
   const branchName = String(branch || '').trim();
   const directoryPath = normalizeDirectoryPath(directory);
   if (!branchName || !directoryPath) return;
-  await writeGitConfigValue(directoryPath, `branch.${branchName}.openchamberGeneratedName`, branchName).catch((error) => {
+  const keep = String(prefix || '').trim();
+  try {
+    await writeGitConfigValue(directoryPath, `branch.${branchName}.openchamberGeneratedName`, branchName);
+    if (keep && keep.length < branchName.length && branchName.startsWith(keep)) {
+      await writeGitConfigValue(directoryPath, `branch.${branchName}.openchamberGeneratedPrefix`, keep);
+    }
+  } catch (error) {
     console.warn('Failed to mark a generated branch name:', error instanceof Error ? error.message : String(error));
-  });
+  }
 }
 
 /**
@@ -5102,13 +5131,19 @@ export async function readRenameableGeneratedBranch(directory, checkedOutBranch 
  * name and it was never pushed (`readRenameableGeneratedBranch`), for
  * `work.name`. Answers `{ from, to }`, or null when the branch is not such a
  * placeholder, which then stays as it is. A name git does not accept, the
- * placeholder itself, or one already taken fails with a status.
+ * placeholder itself, or one already taken fails with a status. A placeholder
+ * with a recorded prefix keeps it: `fix/login-timeout` for
+ * `issue-180-merry-salamander` becomes `issue-180-login-timeout`.
  */
 export async function renameGeneratedWorktreeBranch(directory, newName) {
   const directoryPath = normalizeDirectoryPath(directory);
   const current = directoryPath ? await readRenameableGeneratedBranch(directoryPath) : null;
   if (!current) return null;
-  const name = String(newName || '').trim();
+  const prefix = (await readGitConfigValue(directoryPath, `branch.${current}.openchamberGeneratedPrefix`)).trim();
+  const requested = String(newName || '').trim();
+  const name = prefix && requested && !requested.startsWith(prefix)
+    ? `${prefix}${requested.split('/').pop() || requested}`
+    : requested;
   const fail = (message, status) => Object.assign(new Error(message), { status });
   if (!name || name === current) throw fail(`Name the branch after the task, not \`${current}\``, 400);
   const valid = await runGitCommand(directoryPath, ['check-ref-format', '--branch', name]);

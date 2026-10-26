@@ -174,3 +174,25 @@ describe('matchSnippetTrigger', () => {
         expect(snippetAt('#review done|')).toBeNull();
     });
 });
+
+describe('emoji trigger', () => {
+    test('opens on a typed colon and two letters at a word boundary', () => {
+        expect(at('shipped :ta|')).toEqual({ kind: 'emoji', query: 'ta' });
+        expect(at(':+1|')).toEqual({ kind: 'emoji', query: '+1' });
+        expect(at(':Party|')).toEqual({ kind: 'emoji', query: 'party' });
+    });
+
+    test('stays shut for times, links, key: value, smileys and finished shortcodes', () => {
+        expect(at('at 12:30|')).toBeNull();
+        expect(at('http://ex|')).toBeNull();
+        expect(at('key: value|')).toBeNull();
+        expect(at(':D|')).toBeNull();
+        expect(at(':tada:|')).toBeNull();
+        expect(at('a :ta|', { inputMode: 'shell' })).toBeNull();
+        expect(at('a :ta|', { inputMode: 'normal', inputSource: 'paste' })).toBeNull();
+    });
+
+    test('a mention outranks it', () => {
+        expect(at('@ab:cd|')?.kind).toBe('mention');
+    });
+});

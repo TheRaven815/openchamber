@@ -1,6 +1,7 @@
 import React from 'react';
 import type { FilePart, Part } from '@/lib/opencode/model';
 
+import { sessionMentionChipsOf } from './parts/sessionMentionChips';
 import UserTextPart from './parts/UserTextPart';
 import ToolPart from './parts/ToolPart';
 import AssistantTextPart from './parts/AssistantTextPart';
@@ -15,6 +16,9 @@ import { isInvisibleText } from '@/lib/invisibleText';
 import { FadeInOnReveal } from './FadeInOnReveal';
 import { SessionNoticeBlock } from './SessionNoticeBlock';
 import { readSessionNoticePart } from '@/lib/opencode/session-notices';
+import type { PromptOrigin } from '@/lib/opencode/prompt-origin';
+import { openSessionLink } from '@/lib/router/openSessionFromRoute';
+import { useSessionSelector } from '@/sync/sync-context';
 import { Button } from '@/components/ui/button';
 import { ErrorResponseDetails } from '@/components/chat/ErrorResponseDetails';
 import { SaveProjectPlanDialog } from '@/components/session/SaveProjectPlanDialog';
@@ -50,8 +54,8 @@ import { formatTimestampForDisplay } from './timeFormat';
 import { ToolRevealOnMount } from './parts/ToolRevealOnMount';
 import { StaticToolRow } from './parts/ProgressiveGroup';
 import { isExpandableTool } from './parts/toolRenderUtils';
-import { ShownPage } from './parts/HtmlRenderFrame';
-import { renderedPage } from '@/lib/opencode/tools';
+import { ShownToolCard } from './parts/ShownToolCard';
+import { isShownInPlace } from '@/lib/opencode/tools';
 import { LiveActivityCollapse } from '../components/LiveActivityCollapse';
 import { ActivityRowSkipContext, isActivityRowPart, isToolRowShown } from '../lib/turns/activityRows';
 import { LiveFinalActivityContext, LiveTurnHoistedPagesContext } from '../components/liveActivityContext';
@@ -286,6 +290,8 @@ interface MessageBodyProps {
     isDarkTheme?: boolean;
     /** Actions installed extensions contribute for this message's role; rendered after the built-ins. */
     extraActions?: MessageExtraAction[];
+    /** The session whose agent sent this user message, linked at the foot of the bubble. */
+    promptOrigin?: PromptOrigin;
 }
 
 /** One extension action on a message: an icon button on hover, a labelled row in the touch sheet. */
@@ -383,9 +389,10 @@ const CopyMessageLinkButton: React.FC<{ onCopyLink: () => void }> = ({ onCopyLin
     );
 };
 
-const UserMessageBody = React.memo(({ messageId, parts, messageCreatedAt, isMobile, alwaysShowActions = isMobile, hasTouchInput, hasTextContent, onCopyMessage, copiedMessage, onShowPopup, agentMention, onRevert, onFork, contextPinned, contextPinPending, onToggleContextPin, userMessagePart = 'bubble', extraActions }: {
+const UserMessageBody = React.memo(({ messageId, parts, messageCreatedAt, isMobile, alwaysShowActions = isMobile, hasTouchInput, hasTextContent, onCopyMessage, copiedMessage, onShowPopup, agentMention, onRevert, onFork, contextPinned, contextPinPending, onToggleContextPin, userMessagePart = 'bubble', extraActions, promptOrigin }: {
     messageId: string;
     parts: Part[];
+    promptOrigin?: PromptOrigin;
     messageCreatedAt?: number | null;
     isMobile: boolean;
     alwaysShowActions?: boolean;
@@ -443,6 +450,7 @@ const UserMessageBody = React.memo(({ messageId, parts, messageCreatedAt, isMobi
         });
     }, [parts]);
 
+    const sessionMentionChips = React.useMemo(() => sessionMentionChipsOf(parts), [parts]);
     const attachmentFilenames = React.useMemo(() => parts.flatMap((part) => (
         part.type === 'file' && part.filename ? [part.filename] : []
     )), [parts]);
@@ -792,28 +800,80 @@ const UserMessageBody = React.memo(({ messageId, parts, messageCreatedAt, isMobi
                                 attachmentFilenames={attachmentFilenames}
                                 attachmentFiles={attachmentFiles}
                                 onShowPopup={onShowPopup}
+                                sessionMentionChips={sessionMentionChips}
                             />
                         </React.Fragment>
                     );
                 })}
             </div>
-            {showMessageExpandToggle && (
-                // A quiet text link, not a button: the collapsed text itself is
-                // already the large tap target. Inline min sizes opt out of the
-                // mobile 36px button minimum, which turned this into a block.
-                <button
-                    type="button"
-                    onClick={toggleMessageExpanded}
-                    className="ms-auto mt-1 block py-0.5 text-end text-sm text-muted-foreground underline-offset-2 transition-colors hover:text-foreground hover:underline focus-visible:underline focus-visible:outline-none focus-visible:text-foreground"
-                    style={{ minHeight: 0, minWidth: 0 }}
-                    aria-expanded={messageExpanded}
-                >
-                    {t(messageExpanded ? 'chat.message.userText.showLess' : 'chat.message.userText.showFullMessage')}
-                </button>
+            {(showMessageExpandToggle || promptOrigin) && (
+                <div className="mt-1 flex min-w-0 items-center justify-end gap-1.5 text-sm text-muted-foreground">
+                    {promptOrigin ? <PromptOriginLink origin={promptOrigin} /> : null}
+                    {promptOrigin && showMessageExpandToggle ? <span aria-hidden="true">·</span> : null}
+                    {showMessageExpandToggle && (
+                        // A quiet text link, not a button: the collapsed text itself is
+                        // already the large tap target. Inline min sizes opt out of the
+                        // mobile 36px button minimum, which turned this into a block.
+                        <button
+                            type="button"
+                            onClick={toggleMessageExpanded}
+                            className={cn('shrink-0', USER_BUBBLE_TEXT_LINK_CLASS)}
+                            style={INLINE_TEXT_LINK_STYLE}
+                            aria-expanded={messageExpanded}
+                        >
+                            {t(messageExpanded ? 'chat.message.userText.showLess' : 'chat.message.userText.showMore')}
+                        </button>
+                    )}
+                </div>
             )}
         </div>
     );
 });
+
+const USER_BUBBLE_TEXT_LINK_CLASS = 'py-0.5 underline-offset-2 transition-colors hover:text-foreground hover:underline focus-visible:underline focus-visible:outline-none focus-visible:text-foreground';
+const INLINE_TEXT_LINK_STYLE = { minHeight: 0, minWidth: 0 };
+const TITLE_SLOT = '\u0000';
+const selectSessionTitle = (session: Session | undefined): string | undefined => session?.title?.trim() || undefined;
+
+/**
+ * "From session <title>" at the foot of a prompt another session's agent
+ * sent; the title opens that session. The live title wins over the one the
+ * prompt recorded, which stands in while the session is not loaded here.
+ */
+const PromptOriginLink: React.FC<{ origin: PromptOrigin }> = ({ origin }) => {
+    const { t } = useI18n();
+    const liveTitle = useSessionSelector(origin.sessionID, undefined, selectSessionTitle);
+    const title = liveTitle ?? origin.title;
+    const open = (event: React.MouseEvent) => {
+        event.stopPropagation();
+        void openSessionLink(origin.sessionID, null);
+    };
+    if (!title) {
+        return (
+            <button type="button" onClick={open} className={cn('min-w-0 truncate', USER_BUBBLE_TEXT_LINK_CLASS)} style={INLINE_TEXT_LINK_STYLE}>
+                {t('chat.message.userText.promptedByUnknown')}
+            </button>
+        );
+    }
+    // The title sits where each language puts it in the sentence.
+    const [before, after = ''] = t('chat.message.userText.promptedBy', { title: TITLE_SLOT }).split(TITLE_SLOT);
+    return (
+        <span className="flex min-w-0 items-center whitespace-pre">
+            {before ? <span className="shrink-0">{before}</span> : null}
+            <button
+                type="button"
+                onClick={open}
+                className={cn('min-w-0 truncate', USER_BUBBLE_TEXT_LINK_CLASS)}
+                style={INLINE_TEXT_LINK_STYLE}
+                title={title}
+                dir="auto"
+            >
+                {title}
+            </button>
+            {after ? <span className="shrink-0">{after}</span> : null}
+        </span>
+    );
+};
 
 /** Copies an assistant answer; the icon turns into a tick for a moment once it lands. */
 const AssistantCopyButton = React.memo(({
@@ -1678,7 +1738,7 @@ const AssistantMessageBody = React.memo(({
                 }
                 if (splitLiveActivity && !hasRenderedAnswerText) {
                     for (const pagePart of liveFinalActivity?.pages ?? []) {
-                        rendered.push(<ShownPage key={`page-${pagePart.id}`} part={pagePart} />);
+                        rendered.push(<ShownToolCard key={`page-${pagePart.id}`} part={pagePart} />);
                     }
                 }
                 hasRenderedAnswerText = true;
@@ -1764,11 +1824,12 @@ const AssistantMessageBody = React.memo(({
                     continue;
                 }
 
-                // A page the agent showed is drawn in place of its row. With
-                // Activity collapsed, the final answer draws it instead.
-                if (renderedPage(toolPart.tool, toolPart.state)) {
+                // A page the agent showed, or a workflow it proposed, is drawn
+                // in place of its row. With Activity collapsed, the final
+                // answer draws it instead.
+                if (isShownInPlace(toolPart.tool, toolPart.state)) {
                     if (!hoistedPages?.has(toolPart.id)) {
-                        rendered.push(<ShownPage key={`page-${toolPart.id}`} part={toolPart} />);
+                        rendered.push(<ShownToolCard key={`page-${toolPart.id}`} part={toolPart} />);
                     }
                     i++;
                     continue;
@@ -2372,6 +2433,7 @@ const MessageBody = React.memo(({ isUser, ...props }: MessageBodyProps) => {
                 onToggleContextPin={props.onToggleContextPin}
                 userMessagePart={props.userMessagePart}
                 extraActions={props.extraActions}
+                promptOrigin={props.promptOrigin}
             />
         );
     }

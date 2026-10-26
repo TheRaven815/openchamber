@@ -25,7 +25,11 @@ export function useWholeFileComment({ fileLabel, origin }: { fileLabel: string; 
   const { drafts, selection, setSelection, commentText, setCommentText, editingDraftId, saveComment, cancel, startEdit, deleteDraft } = controller;
   const fileDrafts = React.useMemo(() => drafts.filter(isWholeFileComment), [drafts]);
 
-  const open = React.useCallback(() => setSelection(WHOLE_FILE_RANGE), [setSelection]);
+  // The header button opens the editor and, pressed again, closes it unsaved.
+  const toggle = React.useCallback(() => {
+    if (selection) cancel();
+    else setSelection(WHOLE_FILE_RANGE);
+  }, [selection, cancel, setSelection]);
 
   const body = selection || fileDrafts.length > 0 ? (
     <div className="flex flex-col gap-2 px-3 py-2">
@@ -50,5 +54,5 @@ export function useWholeFileComment({ fileLabel, origin }: { fileLabel: string; 
     </div>
   ) : null;
 
-  return { open, isOpen: selection !== null, body };
+  return { toggle, isOpen: selection !== null, body };
 }

@@ -1588,7 +1588,7 @@ const MobileDiffDetail: React.FC<{
           aria-label={t('inlineComment.actions.commentOnFile')}
           aria-pressed={wholeFileComment.isOpen}
           title={t('inlineComment.actions.commentOnFile')}
-          onClick={wholeFileComment.open}
+          onClick={wholeFileComment.toggle}
         >
           <Icon name="chat-1" className="size-5" />
         </button>

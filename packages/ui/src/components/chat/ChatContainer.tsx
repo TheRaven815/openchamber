@@ -9,11 +9,9 @@ import { ChatInput } from './ChatInput';
 import { CHAT_INPUT_EDITOR_SELECTOR } from './composer/editor/dom';
 import {
     ChatColumnActionsContext,
-    ChatColumnExpandedInputContext,
     ChatColumnSessionContext,
     useChatColumnActions,
     type ChatColumnActions,
-    type ChatColumnExpandedInput,
     type ChatColumnSession,
 } from './chatColumnSession';
 import { MobileCommentComposerContext, useMobileCommentComposerOwner } from './composer/comment/MobileCommentComposerContext';
@@ -604,6 +602,8 @@ const ChatViewport = React.memo(({
                     />
                     {showPromptNavigator && promptTurnIds.length >= 2 ? (
                         <PromptNavigatorRail
+                            sessionId={currentSessionId}
+                            directory={directory}
                             turnIds={promptTurnIds}
                             previewsByTurnId={promptPreviewsByTurnId}
                             activeTurnId={railActiveTurnId}
@@ -934,13 +934,7 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({
     );
 
     // UI store
-    const globalExpandedInput = useUIStore((state) => (pinned ? false : state.isExpandedInput));
-    const [pinnedExpandedInput, setPinnedExpandedInput] = React.useState(false);
-    const isExpandedInput = pinned ? pinnedExpandedInput : globalExpandedInput;
-    const pinnedExpandedInputValue = React.useMemo<ChatColumnExpandedInput | null>(
-        () => (pinned ? { expanded: pinnedExpandedInput, setExpanded: setPinnedExpandedInput } : null),
-        [pinned, pinnedExpandedInput],
-    );
+    const isExpandedInput = useUIStore((state) => (pinned ? false : state.isExpandedInput));
     const stickyUserHeader = useUIStore((state) => state.stickyUserHeader);
     const promptNavigatorEnabled = useUIStore((state) => state.promptNavigatorEnabled);
     const allowPromptingSubagentSessions = useUIStore((state) => state.allowPromptingSubagentSessions);
@@ -1486,12 +1480,11 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({
         void navigation.scrollToTurnId(turnId, { behavior: 'auto' });
     }, [navigation]);
     const canLoadEarlierPrompts = timelineController.historySignals.canLoadEarlier;
-    // The mini chat window is too narrow to give the rail its gutter.
-    const promptRailEnabled = !isMobile
+    // The mini chat window is too narrow for the navigator's panel.
+    const showPromptNavigator = !isMobile
         && chatSurfaceMode !== 'mini-chat'
         && !isDesktopExpandedInput
-        && promptNavigatorEnabled;
-    const showPromptNavigator = promptRailEnabled
+        && promptNavigatorEnabled
         && timelineController.turnIds.length >= 2;
 
     React.useEffect(() => {
@@ -1862,7 +1855,6 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({
 		>
 		<ChatColumnSessionContext.Provider value={chatColumnSession}>
 		<ChatColumnActionsContext.Provider value={columnActions}>
-		<ChatColumnExpandedInputContext.Provider value={pinnedExpandedInputValue}>
 		{/* One mobile comment controller per column: selections in this column
 		    comment into this column's composer, never a sibling's. */}
 		<MobileCommentComposerContext.Provider value={mobileCommentComposer}>
@@ -1880,11 +1872,6 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({
 			// transcript fades out above the composer (index.css). Once the
 			// reader leaves the end, the rows slide under its glass again.
 			data-live-tail={sessionStatusForCurrent.type === 'busy' && isFollowingProgrammatically ? 'true' : undefined}
-			// The transcript and the composer keep clear of the prompt rail
-			// together (typography.css). The room is reserved whenever the
-			// rail is enabled, before the rail itself appears with the second
-			// prompt, so its arrival does not shift anything sideways.
-			data-prompt-rail={promptRailEnabled && !draftLayoutVisible ? '' : undefined}
 			className="relative flex min-w-0 flex-1 flex-col h-full bg-background"
 		>
 			{returnToParentButton}
@@ -2045,7 +2032,6 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({
         </div>
         </ChatQuoteHighlightContext.Provider>
         </MobileCommentComposerContext.Provider>
-        </ChatColumnExpandedInputContext.Provider>
         </ChatColumnActionsContext.Provider>
         </ChatColumnSessionContext.Provider>
         {/* Kept mounted while it could ever show, so it can fade out and back

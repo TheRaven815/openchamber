@@ -81,23 +81,47 @@ const render = async (initialSelection: LineRange | null = null) => {
 // Page y of the middle of a line while the editor is scrolled to the top.
 const lineY = (editor: InstanceType<typeof EditorView>, line: number) => (line - 0.5) * editor.defaultLineHeight;
 
-const pressLineNumber = async (editor: InstanceType<typeof EditorView>, line: number, init: { shiftKey?: boolean } = {}) => {
+// The dispatch helpers run synchronously on purpose, and act's thenable is
+// never returned or awaited from them. The tests read what the handlers did
+// before any timer has run; awaiting an act crosses macrotask turns (React's
+// scheduler flushes through MessageChannel), where the hook's queued timers
+// fire first and the read is no longer the one the test claims to make.
+const pressLineNumber = (editor: InstanceType<typeof EditorView>, line: number, init: { shiftKey?: boolean } = {}) => {
   const gutter = editor.dom.querySelector('.cm-gutter.cm-lineNumbers');
   if (!gutter) throw new Error('no line-number gutter');
-  await act(async () => {
+  act(() => {
     gutter.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0, clientY: lineY(editor, line), ...init }));
   });
 };
 
-const moveTo = async (clientX: number, clientY: number) => {
-  await act(async () => {
+const moveTo = (clientX: number, clientY: number) => {
+  act(() => {
     window.dispatchEvent(new MouseEvent('mousemove', { clientX, clientY, buttons: 1 }));
   });
 };
 
-const release = async () => {
-  await act(async () => {
+const release = () => {
+  act(() => {
     window.dispatchEvent(new MouseEvent('mouseup', { button: 0 }));
+  });
+};
+
+// The hook clears the release-click marker on the window's own timer queue, so
+// that queue is where its clear is settled: both timers being 0 ms, the clear
+// was queued first and must run first. A global-timer wait instead races the
+// two queues, which happy-dom and Bun keep separately.
+const settleReleaseClick = async () => {
+  await act(async () => {
+    await new Promise((resolve) => { dom.setTimeout(() => resolve(undefined), 0); });
+  });
+};
+
+// One settled tick can run one or more of the auto-scroll's queued frames, so
+// the tests below never assume one tick is one frame; they read the scroll
+// position the rounds actually produced.
+const settleScrollTicks = async (ticks: number) => {
+  await act(async () => {
+    for (let tick = 0; tick < ticks; tick += 1) await new Promise((resolve) => { setTimeout(() => resolve(undefined), 0); });
   });
 };
 
@@ -120,67 +144,82 @@ afterAll(() => dom.happyDOM.close());
 describe('useLineNumberDragSelection', () => {
   test('keeps following the pointer after it drifts off the line numbers', async () => {
     const editor = await render();
-    await pressLineNumber(editor, 3);
+    pressLineNumber(editor, 3);
     expect(selection).toEqual({ start: 3, end: 3 });
     expect(drag?.isDragging).toBe(true);
 
     // Far to the right, over the code, and then outside the editor's width.
-    await moveTo(300, lineY(editor, 6));
+    moveTo(300, lineY(editor, 6));
     expect(selection).toEqual({ start: 3, end: 6 });
-    await moveTo(900, lineY(editor, 9));
+    moveTo(900, lineY(editor, 9));
     expect(selection).toEqual({ start: 3, end: 9 });
-    await moveTo(900, lineY(editor, 1));
+    moveTo(900, lineY(editor, 1));
     expect(selection).toEqual({ start: 1, end: 3 });
 
-    await release();
+    release();
     expect(drag?.isDragging).toBe(false);
-    await moveTo(300, lineY(editor, 7));
+    moveTo(300, lineY(editor, 7));
     expect(selection).toEqual({ start: 1, end: 3 });
   });
 
   test('marks only the click that ends a drag', async () => {
     const editor = await render();
     expect(drag?.isDragReleaseClick()).toBe(false);
-    await pressLineNumber(editor, 2);
-    await moveTo(300, lineY(editor, 5));
-    await release();
+    pressLineNumber(editor, 2);
+    moveTo(300, lineY(editor, 5));
+    release();
+    // Read in the same task as the release: the click a drag-release follows
+    // lands here, and only here, the marker must stand.
     expect(drag?.isDragReleaseClick()).toBe(true);
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    await settleReleaseClick();
     expect(drag?.isDragReleaseClick()).toBe(false);
   });
 
   test('scrolls while the pointer is held below the editor and extends to the lines it reveals', async () => {
     const editor = await render();
-    await pressLineNumber(editor, 4);
-    await moveTo(20, VISIBLE_LINES * editor.defaultLineHeight + 40);
+    pressLineNumber(editor, 4);
+    moveTo(20, VISIBLE_LINES * editor.defaultLineHeight + 40);
+    // Same task as the move: the frames that would grow the range are still
+    // queued, so the range shows the pointer's line only.
     expect(selection).toEqual({ start: 4, end: VISIBLE_LINES });
 
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
-    expect(scrollTop).toBeGreaterThan(0);
-    const end = selection?.end ?? 0;
-    expect(end).toBeGreaterThan(VISIBLE_LINES);
-    expect(end).toBe(Math.floor((scrollTop + VISIBLE_LINES * editor.defaultLineHeight - 1) / editor.defaultLineHeight) + 1);
+    // The range must cover the lines the scroll reveals after every round, and
+    // every round while the pointer is held must advance the scroll — a loop
+    // that stopped rescheduling its frame would stall on the second round.
+    const revealedEnd = () => Math.floor((scrollTop + VISIBLE_LINES * editor.defaultLineHeight - 1) / editor.defaultLineHeight) + 1;
+    const scrollRound = async () => {
+      const before = scrollTop;
+      await settleScrollTicks(3);
+      expect(scrollTop).toBeGreaterThan(before);
+      expect(selection).toEqual({ start: 4, end: revealedEnd() });
+    };
+    await scrollRound();
+    await scrollRound();
+    // The scroll must still have room, so the stop check below cannot pass by
+    // running out of document (the fixture clamps the position at 90 lines).
+    expect(scrollTop).toBeLessThan(80 * editor.defaultLineHeight);
 
-    await release();
+    release();
     const stoppedAt = scrollTop;
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+    await settleScrollTicks(3);
     expect(scrollTop).toBe(stoppedAt);
   });
 
   test('a click that wobbles on the last visible line neither scrolls nor grows the range', async () => {
     const editor = await render();
-    await pressLineNumber(editor, VISIBLE_LINES);
-    await moveTo(21, lineY(editor, VISIBLE_LINES) + 1);
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
-    await release();
+    pressLineNumber(editor, VISIBLE_LINES);
+    moveTo(21, lineY(editor, VISIBLE_LINES) + 1);
+    // Give every queued frame its chance; the wobble must stay a click.
+    await settleScrollTicks(3);
+    release();
     expect(scrollTop).toBe(0);
     expect(selection).toEqual({ start: VISIBLE_LINES, end: VISIBLE_LINES });
   });
 
   test('ends the drag when the button is found released without a mouseup', async () => {
     const editor = await render();
-    await pressLineNumber(editor, 2);
-    await act(async () => {
+    pressLineNumber(editor, 2);
+    act(() => {
       window.dispatchEvent(new MouseEvent('mousemove', { clientX: 20, clientY: lineY(editor, 6), buttons: 0 }));
     });
     expect(drag?.isDragging).toBe(false);
@@ -189,14 +228,14 @@ describe('useLineNumberDragSelection', () => {
 
   test('shift+click extends the selection; a click on the only selected line clears it', async () => {
     const editor = await render({ start: 5, end: 5 });
-    await pressLineNumber(editor, 9, { shiftKey: true });
-    await release();
+    pressLineNumber(editor, 9, { shiftKey: true });
+    release();
     expect(selection).toEqual({ start: 5, end: 9 });
 
-    await pressLineNumber(editor, 7);
-    await release();
+    pressLineNumber(editor, 7);
+    release();
     expect(selection).toEqual({ start: 7, end: 7 });
-    await pressLineNumber(editor, 7);
+    pressLineNumber(editor, 7);
     expect(selection).toBeNull();
     expect(clears).toBe(1);
     expect(drag?.isDragging).toBe(false);
@@ -205,9 +244,9 @@ describe('useLineNumberDragSelection', () => {
   test('keeps the gutter config across renders', async () => {
     const editor = await render();
     const config = drag?.lineNumbersConfig;
-    await pressLineNumber(editor, 3);
-    await moveTo(20, lineY(editor, 6));
-    await release();
+    pressLineNumber(editor, 3);
+    moveTo(20, lineY(editor, 6));
+    release();
     expect(drag?.lineNumbersConfig).toBe(config);
   });
 });

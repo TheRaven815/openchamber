@@ -10,9 +10,10 @@ import { getOriginalSessionID, isReviewSession } from '@/lib/sessionReviewMetada
  * A subagent nests under the run that spawned it (`parentID`, OpenCode's own
  * lineage). A root session that grew out of another one in the same folder
  * nests under that one too, so the work they share reads as one entry: an
- * auto-review under the session it reviews, a fork (a promoted `/btw` side
- * conversation included) under its source, and a session another session's
- * agent started through the openchamber tool under that session.
+ * auto-review under the session it reviews, and a fork (a promoted `/btw` side
+ * conversation included) under its source. A session another session's agent
+ * started through the openchamber tool is the user's own conversation and
+ * stays a root; its first message links back to the sender instead.
  *
  * The folder decides first. A session that runs in another worktree or folder
  * belongs to the work of that folder and stays a root there, whatever it grew
@@ -22,20 +23,12 @@ import { getOriginalSessionID, isReviewSession } from '@/lib/sessionReviewMetada
  * server treats as a subsession (archive cascade on restore, the Archive page).
  */
 
-const originSchema = z.object({ openchamber: z.object({ originSessionID: z.string().trim().min(1) }) });
 const openchamberNamespaceSchema = z.object({ openchamber: z.record(z.string(), z.json()) });
-
-/** The session an agent dispatched this one from, as the server recorded it. */
-const getDispatchOriginSessionId = (session: Session): string | null => (
-  originSchema.safeParse(session.metadata).data?.openchamber.originSessionID ?? null
-);
 
 /** The session this root session grew out of, before checking where either lives. */
 const getSessionOriginId = (session: Session): string | null => {
   if (isReviewSession(session)) return getOriginalSessionID(session);
-  const forkSource = session.fork?.sessionID?.trim();
-  if (forkSource) return forkSource;
-  return getDispatchOriginSessionId(session);
+  return session.fork?.sessionID?.trim() || null;
 };
 
 // A present marker is enough: a fork inherits its source's marker and is still
@@ -66,7 +59,7 @@ export const resolveSessionNestingParentId = (
   if (!originId || originId === session.id) return null;
   const origin = lookup(originId);
   if (!origin || origin.time?.archived || !sameFolder(session, origin)) return null;
-  // Origins chain (a review of a fork of a dispatched session). Metadata can
+  // Origins chain (a review of a fork of a fork). Metadata can
   // record a loop, and a link that closes one back to this session is refused.
   const seen = new Set<string>([session.id]);
   let current: Session | undefined = origin;

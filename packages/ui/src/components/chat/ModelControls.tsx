@@ -1334,6 +1334,21 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         sync,
     ]);
 
+    // The picker shows the session's agent, while a send carries the app-wide
+    // one. That one drifts on its own: another session or folder sets it, an
+    // agent list reload resolves it again. Whatever moved it, it goes back to
+    // the session's agent, so the agent shown is the agent sent; the switch
+    // brings back the model this session last used with it, and keeps Auto.
+    // Both are read live: the restores above may have moved either one in
+    // this same commit.
+    React.useEffect(() => {
+        if (selection || !currentSessionId || !contextHydrated || !agentsResolved) return;
+        const sessionAgentName = useSelectionStore.getState().getSessionAgentSelection(currentSessionId);
+        if (!sessionAgentName || sessionAgentName === useConfigStore.getState().currentAgentName) return;
+        if (!agents.some((agent) => agent.name === sessionAgentName)) return;
+        setAgent(sessionAgentName, { keepModel: isAutoSelected });
+    }, [agents, agentsResolved, contextHydrated, currentAgentName, currentSessionId, isAutoSelected, selection, sessionSavedAgentName, setAgent]);
+
     React.useEffect(() => {
         if (selection || !contextHydrated) {
             return;
