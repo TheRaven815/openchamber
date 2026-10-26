@@ -23,6 +23,31 @@ COPY . .
 RUN bun run --cwd packages/sdk build
 RUN bun run build:web
 
+# Runtime install. The builder tree above holds every workspace (Electron,
+# VS Code, mobile, UI) plus their devDependencies: electron (~370 MB),
+# electron-builder, onnxruntime, and the rest. A Pi image that copies that
+# tree lands around 3.8 GB.
+#
+# Install the full frozen lockfile, then prune. --filter plus --frozen-lockfile
+# re-hoists and can put a different version in a root slot than bun.lock saved,
+# so the prune path is the one that keeps the lockfile layout. --ignore-scripts
+# skips the root postinstall, which would download Electron and rebuild
+# extensions. SDK dist is copied from the builder, not built here.
+# Every workspace package.json has to be present: a missing one fails the
+# frozen install when another workspace depends on it.
+FROM base AS prod-deps
+WORKDIR /app
+COPY package.json bun.lock ./
+COPY bun-patches ./bun-patches
+COPY packages/ui/package.json ./packages/ui/
+COPY packages/web/package.json ./packages/web/
+COPY packages/electron/package.json ./packages/electron/
+COPY packages/vscode/package.json ./packages/vscode/
+COPY packages/mobile/package.json ./packages/mobile/
+COPY packages/sdk/package.json ./packages/sdk/
+RUN bun install --frozen-lockfile --ignore-scripts \
+  && bun prune --production
+
 FROM oven/bun:1.4.4 AS runtime
 WORKDIR /home/openchamber
 
@@ -65,15 +90,15 @@ ENV LANG=C.UTF-8
 
 COPY scripts/docker-entrypoint.sh /home/openchamber/openchamber-entrypoint.sh
 
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/packages/web/node_modules ./packages/web/node_modules
-COPY --from=builder /app/package.json ./package.json
-COPY --from=builder /app/packages/web/package.json ./packages/web/package.json
-COPY --from=builder /app/packages/sdk/package.json ./packages/sdk/package.json
-COPY --from=builder /app/packages/sdk/dist ./packages/sdk/dist
-COPY --from=builder /app/packages/web/bin ./packages/web/bin
-COPY --from=builder /app/packages/web/server ./packages/web/server
-COPY --from=builder /app/packages/web/dist ./packages/web/dist
+COPY --from=prod-deps --chown=openchamber:openchamber /app/node_modules ./node_modules
+COPY --from=prod-deps --chown=openchamber:openchamber /app/packages/web/node_modules ./packages/web/node_modules
+COPY --from=prod-deps --chown=openchamber:openchamber /app/package.json ./package.json
+COPY --from=prod-deps --chown=openchamber:openchamber /app/packages/web/package.json ./packages/web/package.json
+COPY --from=prod-deps --chown=openchamber:openchamber /app/packages/sdk/package.json ./packages/sdk/package.json
+COPY --from=builder --chown=openchamber:openchamber /app/packages/sdk/dist ./packages/sdk/dist
+COPY --from=builder --chown=openchamber:openchamber /app/packages/web/bin ./packages/web/bin
+COPY --from=builder --chown=openchamber:openchamber /app/packages/web/server ./packages/web/server
+COPY --from=builder --chown=openchamber:openchamber /app/packages/web/dist ./packages/web/dist
 
 EXPOSE 3000
 

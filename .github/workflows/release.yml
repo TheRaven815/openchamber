@@ -53,7 +53,9 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # Pi 5 is linux/arm64. amd64 in the same manifest roughly doubles the
+          # published image and is unused on the board.
+          platforms: linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
